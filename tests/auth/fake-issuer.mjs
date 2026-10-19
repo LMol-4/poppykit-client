@@ -1,4 +1,4 @@
-// Independent fake Company (discovery + token endpoint + conversation resource), written from spec 3, 4.1-4.3.
+// Independent fake Company (discovery, token and authorization endpoints, conversation resource), written from spec 3, 4.1-4.5.
 import { compactVerify, decodeProtectedHeader, importJWK, calculateJwkThumbprint } from 'jose';
 import { createHash, randomUUID } from 'node:crypto';
 
@@ -8,13 +8,14 @@ const sha256 = text => createHash('sha256').update(text).digest('base64url');
 class Reject extends Error { constructor(status, error, headers = {}) { super(error); this.status = status; this.error = error; this.headers = headers; } }
 const json = (status, body, headers = {}) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } });
 
-export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPath = '/tenant' }) {
+export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPath = '/tenant', redirectUris = [], directScopes = ['poppy:read', 'poppy:write'], conversationResource }) {
   const domain = `${name}.test`;
   const issuer = `https://auth.${domain}${issuerPath}`;
   const tokenEndpoint = `${issuer}/token`;
   const endpoint = `https://api.${domain}/poppy/conversations`;
+  const authorizationEndpoint = `${issuer}/authorize`;
   const company = {
-    domain, issuer, tokenEndpoint, endpoint,
+    domain, issuer, tokenEndpoint, endpoint, authorizationEndpoint, codes: new Map(), grants: new Map(),
     behavior: { requireNonce: false, rotateNonceEveryTime: false, tokenOverride: null, tokenError: null, resourceHandler: null },
     requests: [], assertions: [], proofs: [],
     sessions: new Map(), tokens: new Map(), seenAssertionJti: new Set(), seenProofJti: new Set(), nonce: null,
@@ -62,10 +63,49 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     return thumbprint;
   }
 
+  // The User's browser at the authorization endpoint (spec 4.5 steps 2-3): approve some scopes for an account, or decline.
+  company.authorize = (authorizationUrl, { account, approve = null, deny = false }) => {
+    const url = new URL(authorizationUrl); const q = name => url.searchParams.get(name);
+    if (url.origin + url.pathname !== authorizationEndpoint || q('response_type') !== 'code' || q('client_id') !== clientId || q('code_challenge_method') !== 'S256' || !q('code_challenge') || !q('state')) throw new Error('bad authorization request');
+    if (!redirectUris.includes(q('redirect_uri'))) throw new Error('unregistered redirect_uri');
+    const requested = q('scope').split(' ');
+    if (!requested.every(scope => directScopes.includes(scope))) throw new Error('invalid_scope');
+    const callback = new URL(q('redirect_uri'));
+    if (deny) callback.searchParams.set('error', 'access_denied');
+    else {
+      const code = `code_${randomUUID()}`;
+      const scopes = (approve ?? requested).filter(scope => requested.includes(scope));
+      company.codes.set(code, { redirectUri: q('redirect_uri'), challenge: q('code_challenge'), scopes, account, resource: q('resource'), used: false });
+      callback.searchParams.set('code', code);
+    }
+    callback.searchParams.set('state', q('state')); callback.searchParams.set('iss', issuer);
+    return callback.href;
+  };
+
+  async function exchangeCode(request, form) {
+    await company.verifyAssertion(form.get('client_assertion'), 'client');
+    const jkt = await verifyProof(request);
+    const grant = company.codes.get(form.get('code'));
+    if (!grant || grant.used) throw new Reject(400, 'invalid_grant');
+    grant.used = true;
+    if (form.get('redirect_uri') !== grant.redirectUri || sha256(form.get('code_verifier') ?? '') !== grant.challenge || form.get('resource') !== grant.resource) throw new Reject(400, 'invalid_grant');
+    const session = company.sessions.get(form.get('session_id'));
+    if (!session) throw new Reject(400, 'invalid_session');
+    // A Session remembers its account forever (spec 4.4).
+    if (session.account && session.account !== grant.account) throw new Reject(400, 'account_mismatch');
+    session.account = grant.account;
+    const refreshToken = `pat_${randomUUID()}`, accessToken = `tok_${randomUUID()}`;
+    company.grants.set(refreshToken, { account: grant.account, scopes: grant.scopes, sessionId: form.get('session_id') });
+    company.tokens.set(accessToken, { jkt, sessionId: form.get('session_id'), sub: session.sub, account: grant.account, scopes: grant.scopes, resource: grant.resource, expires: now() + 3600_000 });
+    return json(200, { access_token: accessToken, token_type: 'DPoP', expires_in: 3600, refresh_token: refreshToken, refresh_token_expires_in: 2592000, scope: grant.scopes.join(' '), session_id: form.get('session_id'), signed_in: true, ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });
+  }
+
   async function token(request) {
     if (company.behavior.tokenError) return json(company.behavior.tokenError.status, company.behavior.tokenError.body);
     const form = new URLSearchParams(await request.text());
-    if (form.get('grant_type') !== JWT_BEARER || form.get('client_assertion_type') !== CLIENT_ASSERTION || form.get('client_id') !== clientId) throw new Reject(400, 'invalid_request');
+    if (form.get('client_assertion_type') !== CLIENT_ASSERTION || form.get('client_id') !== clientId) throw new Reject(400, 'invalid_request');
+    if (form.get('grant_type') === 'authorization_code') return exchangeCode(request, form);
+    if (form.get('grant_type') !== JWT_BEARER) throw new Reject(400, 'unsupported_grant_type');
     await company.verifyAssertion(form.get('client_assertion'), 'client');
     const assertion = await company.verifyAssertion(form.get('assertion'), 'session');
     const jkt = await verifyProof(request);
@@ -84,19 +124,21 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     if (!match) return challenge('invalid_token');
     const bound = company.tokens.get(match[1]);
     if (!bound || bound.expires <= now()) return challenge('invalid_token');
+    // An entry with a resource accepts only tokens issued for it (spec 4.3).
+    if (conversationResource && bound.resource !== conversationResource) return challenge('invalid_token');
     let jkt;
     try { jkt = await verifyProof(request, match[1]); } catch (error) { return challenge(error.error, error.headers); }
     if (jkt !== bound.jkt) return challenge('invalid_dpop_proof');
     if (company.behavior.resourceHandler) return company.behavior.resourceHandler(request, bound);
-    return json(200, { sub: bound.sub, session_id: bound.sessionId, method: request.method, body: await request.text() });
+    return json(200, { sub: bound.sub, session_id: bound.sessionId, account: bound.account ?? null, scopes: bound.scopes ?? [], method: request.method, body: await request.text() });
   }
 
   company.handle = async (request, options) => {
     const url = new URL(request.url);
     company.requests.push({ url: request.url, method: request.method, mode: options?.mode, authorization: request.headers.get('authorization') });
     try {
-      if (url.href === `https://${domain}/.well-known/poppy.json`) return json(200, { protocol_version: '0.2', organization: { name, domain }, auth: { issuer }, agent: { protocols: [{ type: 'other', endpoint: `https://api.${domain}/other` }, { type: 'poppy', endpoint }] } });
-      if (url.href === `https://auth.${domain}/.well-known/oauth-authorization-server${issuerPath}`) return json(200, { issuer, token_endpoint: tokenEndpoint, revocation_endpoint: `${issuer}/revoke`, poppy_domains: [domain] });
+      if (url.href === `https://${domain}/.well-known/poppy.json`) return json(200, { protocol_version: '0.2', organization: { name, domain }, auth: { issuer, direct: { scopes: directScopes } }, agent: { protocols: [{ type: 'other', endpoint: `https://api.${domain}/other` }, { type: 'poppy', endpoint, ...(conversationResource ? { resource: conversationResource } : {}) }] } });
+      if (url.href === `https://auth.${domain}/.well-known/oauth-authorization-server${issuerPath}`) return json(200, { issuer, token_endpoint: tokenEndpoint, revocation_endpoint: `${issuer}/revoke`, authorization_endpoint: authorizationEndpoint, poppy_domains: [domain] });
       if (url.href === tokenEndpoint && request.method === 'POST') return await token(request);
       if (url.origin === `https://api.${domain}`) return await resource(request);
       return json(404, { error: 'not_found' });
