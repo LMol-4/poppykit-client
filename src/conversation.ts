@@ -1,3 +1,4 @@
+import { dpopChallenge } from './auth/challenge.js';
 import { id as parseId, parseConversationRequest, parseConversationState, parseEventPage, parseMessage, parseProtocolError, retryAfterMilliseconds } from './protocol/wire.js';
 import type { ConversationRequest, ConversationState, EventPage, Message } from './protocol/wire.js';
 
@@ -66,9 +67,9 @@ export function createConversationClient(options: ConversationClientOptions) {
     try { code = parseProtocolError(await response.json()).error; } catch { /* non-protocol body */ }
     if (!knownCodes.has(code)) {
       // Token errors (spec 6) arrive in WWW-Authenticate: DPoP error="...", scope="...".
-      const challenge = response.headers.get('www-authenticate') ?? '';
-      code = /\berror="([a-z_]+)"/.exec(challenge)?.[1] ?? '';
-      scope = /\bscope="([^"]*)"/.exec(challenge)?.[1];
+      const challenge = dpopChallenge(response.headers.get('www-authenticate'));
+      code = challenge?.error ?? '';
+      scope = challenge?.scope;
     }
     if (!knownCodes.has(code)) code = 'http_error';
     return new ConversationError(code, response.status, retryAfterMilliseconds(response.headers.get('retry-after'), clock.now()), code === 'insufficient_scope' ? scope : undefined);

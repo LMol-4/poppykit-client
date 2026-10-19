@@ -283,3 +283,28 @@ test('operations are scoped to issuer as well as connection', async () => {
   await b.client.start({ ...msg, id: 'msg_u', text: 'different' });
   assert.equal(b.server.conversations.size, 1);
 });
+
+test('dpopChallenge reads only the DPoP challenge and respects quoting and case', async () => {
+  const { dpopChallenge } = await import('../dist/auth/challenge.js');
+  assert.deepEqual(dpopChallenge('Bearer scope="openid", DPoP error="insufficient_scope", scope="poppy:read poppy:write"'), { error: 'insufficient_scope', scope: 'poppy:read poppy:write' });
+  assert.deepEqual(dpopChallenge('Bearer error="invalid_token", DPoP error="use_dpop_nonce"'), { error: 'use_dpop_nonce' });
+  assert.deepEqual(dpopChallenge('DPoP error="invalid_token", Bearer error="insufficient_scope", scope="x"'), { error: 'invalid_token' });
+  assert.deepEqual(dpopChallenge('DPoP error_description="a, b error=\\"x\\"", error="invalid_token"'), { error: 'invalid_token' });
+  assert.deepEqual(dpopChallenge('dpop Error="invalid_token", SCOPE=abc'), { error: 'invalid_token', scope: 'abc' });
+  assert.equal(dpopChallenge('Bearer error="invalid_token"'), undefined);
+  assert.equal(dpopChallenge(null), undefined);
+  assert.deepEqual(dpopChallenge('!!!, ===, "unterminated'), undefined);
+});
+
+test('WWW-Authenticate with several schemes and garbage map to the right code', async () => {
+  const { client, server } = setup({ maxAttempts: 1 });
+  const with_ = header => new Response('', { status: 401, headers: { 'www-authenticate': header } });
+  server.hooks.failures.push(with_('Bearer scope="openid", DPoP error="insufficient_scope", scope="poppy:read poppy:write"'));
+  await assert.rejects(client.read('cnv_1'), e => e.code === 'insufficient_scope' && e.scope === 'poppy:read poppy:write');
+  server.hooks.failures.push(with_('Bearer error="invalid_token", DPoP error="use_dpop_nonce"'));
+  await assert.rejects(client.read('cnv_1'), e => e.code === 'use_dpop_nonce');
+  server.hooks.failures.push(with_('DPoP Error="invalid_token", error_description="x, error=\\"sign_in_required\\""'));
+  await assert.rejects(client.read('cnv_1'), e => e.code === 'invalid_token');
+  server.hooks.failures.push(with_('@@@ ,,, "'));
+  await assert.rejects(client.read('cnv_1'), e => e.code === 'http_error');
+});
