@@ -317,3 +317,35 @@ test('a reset between token issuance and activation does not attach the session'
   await assert.rejects(auth.start(company.domain), code('state_changed'));
   assert.deepEqual(store.raw.connections, {});
 });
+
+test('a renewal answered for a different session is rejected and leaves the slots unchanged', async () => {
+  const { auth, company, clock, store } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const target = await auth.target(connection.id);
+  clock.t += 3600_000;
+  const slots = structuredClone(store.raw.connections[connection.id].slots);
+  company.behavior.tokenOverride = { session_id: 'ses_someone_else' };
+  await assert.rejects(auth.authorizedFetch(connection.id, conversations(company), target), code('invalid_response'));
+  assert.deepEqual(store.raw.connections[connection.id].slots, slots);
+});
+
+test('a corrupted DPoP key fails as missing_key without quoting the secret', async () => {
+  const { auth, company, store, secrets } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const target = await auth.target(connection.id);
+  const ref = store.raw.identities[company.issuer].dpopKeyRef;
+  for (const corrupt of ['{"d":"SECRET-PREFIX', 'null', JSON.stringify({ ...JSON.parse(secrets.map.get(ref)), d: 'SECRET-PREFIX' })]) {
+    secrets.map.set(ref, corrupt);
+    const error = await auth.authorizedFetch(connection.id, conversations(company), target).catch(failure => failure);
+    assert.ok(code('missing_key')(error), corrupt); assert.equal(error.message.includes('SECRET'), false);
+  }
+});
+
+test('token expiry counts from before dispatch', async () => {
+  const { auth, company, clock, store } = await setup();
+  const original = company.handle;
+  company.handle = async (request, options) => { if (request.url === company.tokenEndpoint) clock.t += 50_000; return original(request, options); };
+  const sentAt = clock.t;
+  const { connection } = await auth.start(company.domain);
+  assert.equal(Object.values(store.raw.connections[connection.id].slots)[0].expiresAt, sentAt + 3600_000);
+});

@@ -148,9 +148,13 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   async function loadDpopKey(reference: string): Promise<DpopKey> {
     const text = await secrets.read(reference);
     if (text === null) throw new AuthFailure('missing_key');
-    const { d, ...rest } = JSON.parse(text) as Record<string, unknown>;
+    // Parse errors quote the input, so a corrupted secret must never reach an error message.
+    let parsed: Record<string, unknown> | null;
+    try { parsed = JSON.parse(text); } catch { throw new AuthFailure('missing_key'); }
+    const { d, ...rest } = parsed ?? {};
     const jwk = publicEcJwk(rest, 'missing_key');
-    const privateKey = await crypto.subtle.importKey('jwk', { ...jwk, d } as JsonWebKey, EC, false, ['sign']);
+    let privateKey: CryptoKey;
+    try { privateKey = await crypto.subtle.importKey('jwk', { ...jwk, d } as JsonWebKey, EC, false, ['sign']); } catch { throw new AuthFailure('missing_key'); }
     return { privateKey, jwk, thumbprint: await calculateJwkThumbprint(jwk) };
   }
   async function signIdentity(header: JsonObject, payload: JsonObject, dpopThumbprint: string): Promise<string> {
@@ -231,8 +235,10 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   async function renew(connection: ConnectionRecord, resource: string | null): Promise<CredentialRecord> {
     // Signed-in renewal uses the Account Token and arrives with sign-in (J09).
     if (connection.status !== 'signed_out') throw new AuthFailure('renewal_unavailable', connection.id);
+    // Expiry counts from before dispatch so a slow response never extends the token's believed lifetime.
+    const issuedAt = now();
     const token = await signedOutToken(connection.metadata, connection.userId, connection.dpopKeyRef, connection.sessionId, resource);
-    const expiresAt = now() + token.expires_in * 1000;
+    const expiresAt = issuedAt + token.expires_in * 1000;
     const secretRef = await secrets.stage(token.access_token);
     return transaction(state => {
       const current = own(state.connections, connection.id);
@@ -255,8 +261,8 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (!metadata.authorization) throw new AuthFailure('no_auth');
       const issuer = metadata.authorization.issuer;
       const { userId, dpopKeyRef } = await identityFor(issuer);
-      const token = await signedOutToken(metadata, userId, dpopKeyRef, null, null);
       const createdAt = now();
+      const token = await signedOutToken(metadata, userId, dpopKeyRef, null, null);
       const secretRef = await secrets.stage(token.access_token);
       const id = randomId('con_'), operationId = randomId('op_');
       return transaction(state => {
