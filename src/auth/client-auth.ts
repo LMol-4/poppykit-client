@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { calculateJwkThumbprint } from 'jose';
 import { parseProtocolError, parseTokenResponse } from '../protocol/wire.js';
 import type { JsonObject, TokenResponse } from '../protocol/wire.js';
@@ -48,6 +49,11 @@ export interface ClientAuth {
   get(connectionId: string): Promise<Connection | null>;
   list(): Promise<Connection[]>;
   target(connectionId: string): Promise<ConversationTarget>;
+  beginSignIn(connectionId: string, input: { scopes: string[]; redirectUri: string; browserBinding: string }): Promise<{ outcome: AuthOutcome; authorizationUrl?: string }>;
+  completeSignIn(input: { callbackUrl: string; browserBinding: string }): Promise<AuthOutcome>;
+  cancelSignIn(operationId: string): Promise<AuthOutcome>;
+  operation(operationId: string): Promise<AuthOutcome | null>;
+  recover(): Promise<AuthOutcome[]>;
   authorizedFetch(connectionId: string, request: Request, target: ConversationTarget, requiredScopes?: readonly string[]): Promise<Response>;
 }
 
@@ -62,24 +68,39 @@ export interface ConnectionRecord {
   // Key JSON.stringify([sessionId, resource ?? null]); preserves absent vs exact resource.
   slots: Record<string, CredentialRecord>;
 }
+export interface GrantRecord {
+  id: string; issuer: string; userId: string; secretRef: string;
+  scopes: string[]; expiresAt: number | null; generation: number;
+  status: 'active' | 'uncertain' | 'revoking' | 'revoked';
+  operationId: string | null;
+}
+export interface DirectRecord {
+  stateHash: string; verifierRef: string; browserHash: string;
+  redirectUri: string; issuer: string; clientId: string; sessionId: string;
+}
 export interface OperationRecord {
   epoch: string; id: string; kind: 'start' | 'renew' | 'sign_in'; connectionId: string;
   connectionGeneration: number; grantId: string | null; grantGeneration: number | null;
   phase: 'prepared' | 'dispatched' | 'staged' | 'terminal';
   status: OperationStatus; createdAt: number; expiresAt: number;
   resource: string | null; scopes: string[];
-  direct: JsonObject | null; staged: JsonObject | null;
+  // shortcut: activation commits in the same transaction as the result, so 'staged' and staged stay unused; add them if activation ever needs a second step.
+  direct: DirectRecord | null; staged: JsonObject | null;
   result: AuthOutcome | null;
+}
+// An Account Token that must be revoked remotely before its secret is deleted (revocation is J13).
+export interface CleanupRecord {
+  id: string; connectionId: string; issuer: string; revocationEndpoint: string;
+  secretRef: string; status: 'pending' | 'uncertain';
 }
 export interface ClientAuthState {
   version: 1; epoch: string;
   owner: { namespace: string; clientId: string; localUserId: string } | null;
   identities: Record<string, { userId: string; dpopKeyRef: string }>;
   connections: Record<string, ConnectionRecord>;
-  // Grant and cleanup records arrive with sign-in and sign-out (J09).
-  grants: Record<string, JsonObject>;
+  grants: Record<string, GrantRecord>;
   operations: Record<string, OperationRecord>;
-  cleanup: Record<string, JsonObject>;
+  cleanup: Record<string, CleanupRecord>;
 }
 
 export class AuthFailure extends Error {
@@ -97,6 +118,27 @@ const b64 = (data: Uint8Array | string) => Buffer.from(data).toString('base64url
 const randomId = (prefix = '') => prefix + b64(crypto.getRandomValues(new Uint8Array(16)));
 const own = <T>(record: Record<string, T>, key: string): T | undefined => Object.hasOwn(record, key) ? record[key] : undefined;
 const slotKey = (sessionId: string | null, resource: string | null) => JSON.stringify([sessionId, resource]);
+const sha256 = (text: string) => createHash('sha256').update(text).digest('base64url');
+const SIGN_IN_MS = 10 * 60_000;
+// OAuth response parameters an authorization redirect may add to the redirect URI (RFC 6749 4.1.2, RFC 9207).
+const CALLBACK_PARAMS = ['code', 'state', 'iss', 'error', 'error_description', 'error_uri'];
+const AUTHORIZE_ERRORS = new Set(['invalid_request', 'unauthorized_client', 'unsupported_response_type', 'invalid_scope', 'invalid_target', 'server_error', 'temporarily_unavailable']);
+// Redirect identity without the response parameters; origin alone would hide userinfo.
+const redirectShape = (url: URL) => JSON.stringify([url.origin, url.username, url.password, url.pathname, [...url.searchParams]]);
+
+function parseCallback(callbackUrl: unknown): { params: Record<string, string>; base: URL } {
+  if (typeof callbackUrl !== 'string' || !URL.canParse(callbackUrl)) throw new AuthFailure('invalid_callback');
+  const base = new URL(callbackUrl);
+  if (base.hash) throw new AuthFailure('invalid_callback');
+  const params: Record<string, string> = {};
+  for (const name of CALLBACK_PARAMS) {
+    const values = base.searchParams.getAll(name);
+    if (values.length > 1) throw new AuthFailure('invalid_callback');
+    if (values.length) params[name] = values[0]!;
+    base.searchParams.delete(name);
+  }
+  return { params, base };
+}
 
 export function initialClientAuthState(): ClientAuthState {
   return { version: 1, epoch: randomId(), owner: null, identities: {}, connections: {}, grants: {}, operations: {}, cleanup: {} };
@@ -140,9 +182,10 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     if (!found) throw new AuthFailure('unknown_connection');
     return found;
   }
-  function publicConnection(connection: ConnectionRecord): Connection {
-    const { id, domain, issuer, sessionId, generation, status } = connection;
-    return { id, domain, issuer, sessionId, generation, status, scopes: [] };
+  function publicConnection(state: ClientAuthState, connection: ConnectionRecord): Connection {
+    const { id, domain, issuer, sessionId, generation, status, grantId } = connection;
+    const scopes = grantId === null ? [] : [...own(state.grants, grantId)?.scopes ?? []];
+    return { id, domain, issuer, sessionId, generation, status, scopes };
   }
 
   async function loadDpopKey(reference: string): Promise<DpopKey> {
@@ -259,6 +302,33 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     return { issuer: connection.issuer, endpoint: entry.endpoint, ...(entry.resource === undefined ? {} : { resource: entry.resource }) };
   }
 
+  function outcomeOf(state: ClientAuthState, operation: OperationRecord): AuthOutcome {
+    return operation.result ?? { operationId: operation.id, status: 'pending', connection: publicConnection(state, own(state.connections, operation.connectionId)!), nextAction: 'wait' };
+  }
+  // The terminal result is recorded once and returned verbatim to duplicate callbacks.
+  function finish(state: ClientAuthState, operation: OperationRecord, status: OperationStatus, extra: { error?: string; missingScopes?: string[] } = {}): AuthOutcome {
+    operation.phase = 'terminal'; operation.status = status;
+    const result: AuthOutcome = { operationId: operation.id, status, connection: publicConnection(state, own(state.connections, operation.connectionId)!), ...extra };
+    if (status === 'failed' || status === 'expired' || status === 'uncertain') result.nextAction = 'sign_in';
+    return operation.result = result;
+  }
+  // An Account Token that will not be used stays private until it is revoked (J13).
+  function retire(state: ClientAuthState, id: string, connection: ConnectionRecord, secretRef: string): void {
+    state.cleanup[id] = { id, connectionId: connection.id, issuer: connection.issuer, revocationEndpoint: connection.metadata.authorization!.revocation_endpoint, secretRef, status: 'pending' };
+  }
+  // Records a terminal sign-in result if the exchange still owns the operation; a recovery that ran meanwhile wins.
+  async function settle(operationId: string, verifierRef: string, status: OperationStatus, extra: { error?: string; missingScopes?: string[] }, unusedGrantRef: string | null = null): Promise<AuthOutcome> {
+    const outcome = await transaction(state => {
+      const operation = own(state.operations, operationId);
+      if (!operation || operation.epoch !== state.epoch) throw new AuthFailure('state_changed');
+      if (unusedGrantRef !== null) retire(state, `cln_${operationId}`, own(state.connections, operation.connectionId)!, unusedGrantRef);
+      return operation.phase === 'dispatched' ? finish(state, operation, status, extra) : outcomeOf(state, operation);
+    });
+    // Terminal operations never read their verifier again.
+    await secrets.remove(verifierRef);
+    return outcome;
+  }
+
   return {
     async start(domain) {
       let metadata: CompanyMetadata;
@@ -278,7 +348,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
           slots: { [slotKey(token.session_id, null)]: { secretRef, tokenType: 'DPoP', dpopKeyRef, scopes: [], expiresAt: createdAt + token.expires_in * 1000, generation: 1 } },
         };
         state.connections[id] = connection;
-        const result: AuthOutcome = { operationId, status: 'completed', connection: publicConnection(connection) };
+        const result: AuthOutcome = { operationId, status: 'completed', connection: publicConnection(state, connection) };
         state.operations[operationId] = {
           epoch: state.epoch, id: operationId, kind: 'start', connectionId: id, connectionGeneration: 1, grantId: null, grantGeneration: null,
           phase: 'terminal', status: 'completed', createdAt, expiresAt: createdAt, resource: null, scopes: [], direct: null, staged: null, result,
@@ -287,11 +357,166 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       });
     },
     async get(connectionId) {
-      const found = typeof connectionId === 'string' ? own((await load()).connections, connectionId) : undefined;
-      return found ? publicConnection(found) : null;
+      const state = await load();
+      const found = typeof connectionId === 'string' ? own(state.connections, connectionId) : undefined;
+      return found ? publicConnection(state, found) : null;
     },
-    async list() { return Object.values((await load()).connections).map(publicConnection); },
+    async list() {
+      const state = await load();
+      return Object.values(state.connections).map(connection => publicConnection(state, connection));
+    },
     async target(connectionId) { return targetOf(await record(connectionId)); },
+
+    // Direct Sign-In (spec 4.5): the operation binds everything the callback must match before the URL exists.
+    async beginSignIn(connectionId, input) {
+      const connection = await record(connectionId);
+      const direct = connection.metadata.document.auth?.direct;
+      const authorizationEndpoint = connection.metadata.authorization?.authorization_endpoint;
+      if (!direct || !authorizationEndpoint) throw new AuthFailure('direct_unavailable', connectionId);
+      const { scopes, redirectUri, browserBinding } = (input ?? {}) as { scopes?: unknown; redirectUri?: unknown; browserBinding?: unknown };
+      if (!Array.isArray(scopes) || !scopes.length || new Set(scopes).size !== scopes.length || !scopes.every(scope => typeof scope === 'string' && direct.scopes.includes(scope))) throw new AuthFailure('invalid_scope', connectionId);
+      if (typeof redirectUri !== 'string' || !options.redirectUris.includes(redirectUri) || !URL.canParse(redirectUri)) throw new AuthFailure('invalid_redirect', connectionId);
+      // The host derives this from its authenticated browser session; a short value would be guessable.
+      if (typeof browserBinding !== 'string' || browserBinding.length < 22) throw new AuthFailure('invalid_binding', connectionId);
+      if ((connection.status !== 'signed_out' && connection.status !== 'signed_in') || connection.sessionId === null) throw new AuthFailure('sign_in_unavailable', connectionId);
+      const state = b64(crypto.getRandomValues(new Uint8Array(32)));
+      const verifier = b64(crypto.getRandomValues(new Uint8Array(32)));
+      // Ask for the conversation resource up front so the signed-in token is usable there (spec 4.3 "Narrower tokens").
+      const resource = connection.metadata.document.agent?.protocols.find(protocol => protocol.type === 'poppy')?.resource ?? null;
+      const verifierRef = await secrets.stage(verifier);
+      const createdAt = now(), operationId = randomId('op_');
+      const outcome = await transaction(draft => {
+        const current = own(draft.connections, connectionId);
+        // shortcut: a lost race leaves the staged verifier as an orphan secret; storage-level orphan cleanup removes it.
+        if (!current || current.generation !== connection.generation || current.status !== connection.status) throw new AuthFailure('state_changed', connectionId);
+        const operation: OperationRecord = draft.operations[operationId] = {
+          epoch: draft.epoch, id: operationId, kind: 'sign_in', connectionId, connectionGeneration: current.generation, grantId: current.grantId, grantGeneration: null,
+          phase: 'prepared', status: 'pending', createdAt, expiresAt: createdAt + SIGN_IN_MS, resource, scopes: [...scopes],
+          direct: { stateHash: sha256(state), verifierRef, browserHash: sha256(browserBinding), redirectUri, issuer: current.issuer, clientId, sessionId: connection.sessionId! },
+          staged: null, result: null,
+        };
+        return outcomeOf(draft, operation);
+      });
+      const url = new URL(authorizationEndpoint);
+      const query = { response_type: 'code', client_id: clientId, redirect_uri: redirectUri, scope: scopes.join(' '), state, code_challenge: sha256(verifier), code_challenge_method: 'S256' };
+      for (const [name, value] of Object.entries(query)) url.searchParams.set(name, value);
+      if (resource !== null) url.searchParams.set('resource', resource);
+      return { outcome, authorizationUrl: url.href };
+    },
+
+    async completeSignIn(input) {
+      const { callbackUrl, browserBinding } = (input ?? {}) as { callbackUrl?: unknown; browserBinding?: unknown };
+      const { params, base } = parseCallback(callbackUrl);
+      if (typeof browserBinding !== 'string' || params.state === undefined || (params.code === undefined) === (params.error === undefined)) throw new AuthFailure('invalid_callback');
+      const stateHash = sha256(params.state), browserHash = sha256(browserBinding);
+      const snapshot = await load();
+      const found = Object.values(snapshot.operations).find(operation => operation.kind === 'sign_in' && operation.epoch === snapshot.epoch && operation.direct?.stateHash === stateHash);
+      const direct = found?.direct;
+      // A wrong browser, redirect or issuer (mix-up, spec 4.5) leaves the operation untouched so the genuine callback still completes.
+      if (!found || !direct || direct.browserHash !== browserHash || redirectShape(base) !== redirectShape(new URL(direct.redirectUri)) || params.iss !== direct.issuer) throw new AuthFailure('invalid_callback');
+      const operationId = found.id;
+      const verifier = found.phase === 'prepared' && params.code !== undefined ? await secrets.read(direct.verifierRef) : null;
+      const at = now();
+      // Only one claimant moves prepared -> dispatched; everyone else gets the recorded progress or result.
+      const claim = await transaction(state => {
+        const operation = own(state.operations, operationId);
+        if (!operation || operation.epoch !== state.epoch) throw new AuthFailure('invalid_callback');
+        if (operation.phase !== 'prepared') return outcomeOf(state, operation);
+        const connection = own(state.connections, operation.connectionId)!;
+        if (connection.generation !== operation.connectionGeneration) return finish(state, operation, 'failed', { error: 'state_changed' });
+        if (at >= operation.expiresAt) return finish(state, operation, 'expired');
+        if (params.error !== undefined) return params.error === 'access_denied' ? finish(state, operation, 'denied', { error: 'access_denied' }) : finish(state, operation, 'failed', { error: AUTHORIZE_ERRORS.has(params.error) ? params.error : 'authorization_error' });
+        if (verifier === null) return finish(state, operation, 'failed', { error: 'missing_key' });
+        operation.phase = 'dispatched';
+        return { connection, operation };
+      });
+      if (!('operation' in claim)) {
+        if (claim.status !== 'pending') await secrets.remove(direct.verifierRef);
+        return claim;
+      }
+      const { connection, operation } = claim;
+      const fields: Record<string, string> = { grant_type: 'authorization_code', code: params.code!, redirect_uri: direct.redirectUri, code_verifier: verifier!, session_id: direct.sessionId };
+      if (operation.resource !== null) fields.resource = operation.resource;
+      const issuedAt = now();
+      let token: TokenResponse;
+      try { token = await tokenRequest(connection.metadata, connection.dpopKeyRef, fields, null); } catch (error) {
+        // A definite rejection is a failure; a lost answer may have consumed the code, so it is never resent.
+        const definite = error instanceof AuthFailure && error.code !== 'transport_error';
+        return settle(operationId, direct.verifierRef, definite ? 'failed' : 'uncertain', { error: definite ? error.code : 'lost_response' });
+      }
+      const granted = token.scope.split(' ').filter(Boolean);
+      const missingScopes = operation.scopes.filter(scope => !granted.includes(scope));
+      let problem: string | null = null;
+      if (token.token_type !== 'DPoP') problem = 'unsupported_token_type';
+      else if (token.signed_in !== true || token.session_id !== direct.sessionId || token.refresh_token === undefined || granted.some(scope => !operation.scopes.includes(scope))) problem = 'invalid_response';
+      else if (missingScopes.length) problem = 'insufficient_scope';
+      let refreshRef: string | null = null, accessRef = '';
+      try {
+        if (token.refresh_token !== undefined) refreshRef = await secrets.stage(token.refresh_token);
+        if (!problem) accessRef = await secrets.stage(token.access_token);
+      } catch {
+        return settle(operationId, direct.verifierRef, 'uncertain', { error: 'storage_error' }, refreshRef);
+      }
+      // Partial consent or a malformed grant keeps the previous credentials; the new Account Token only awaits revocation.
+      if (problem) return settle(operationId, direct.verifierRef, 'failed', problem === 'insufficient_scope' ? { error: problem, missingScopes } : { error: problem }, refreshRef);
+      const grantId = randomId('grt_');
+      const refreshExpiresAt = token.refresh_token_expires_in === undefined ? null : issuedAt + token.refresh_token_expires_in * 1000;
+      const outcome = await transaction(state => {
+        const current = own(state.operations, operationId);
+        // shortcut: after a full reset the staged secrets are orphans and the remote grant is not revoked; reset cleanup removes the secrets.
+        if (!current || current.epoch !== state.epoch) throw new AuthFailure('state_changed');
+        const target = own(state.connections, current.connectionId)!;
+        // A sign-out or recovery that ran during the exchange wins; the new grant is kept only for revocation.
+        if (current.phase !== 'dispatched' || target.generation !== current.connectionGeneration) {
+          retire(state, `cln_${operationId}`, target, refreshRef!);
+          return current.phase === 'dispatched' ? finish(state, current, 'failed', { error: 'state_changed' }) : outcomeOf(state, current);
+        }
+        const previous = target.grantId === null ? undefined : own(state.grants, target.grantId);
+        if (previous) { retire(state, `cln_${previous.id}`, target, previous.secretRef); delete state.grants[previous.id]; }
+        state.grants[grantId] = { id: grantId, issuer: target.issuer, userId: target.userId, secretRef: refreshRef!, scopes: granted, expiresAt: refreshExpiresAt, generation: 1, status: 'active', operationId: null };
+        target.grantId = grantId; target.status = 'signed_in';
+        // Older tokens for this session reflect the old authority, so only the new one stays selectable (spec 4.3).
+        target.slots = { [slotKey(direct.sessionId, current.resource)]: { secretRef: accessRef, tokenType: 'DPoP', dpopKeyRef: target.dpopKeyRef, scopes: granted, expiresAt: issuedAt + token.expires_in * 1000, generation: target.generation } };
+        return finish(state, current, 'completed');
+      });
+      await secrets.remove(direct.verifierRef);
+      return outcome;
+    },
+
+    async cancelSignIn(operationId) {
+      const { outcome, verifierRef } = await transaction(state => {
+        const operation = typeof operationId === 'string' ? own(state.operations, operationId) : undefined;
+        if (!operation?.direct || operation.epoch !== state.epoch) throw new AuthFailure('unknown_operation');
+        // Once the code is sent, cancelling cannot undo the remote exchange; its outcome stands.
+        return { outcome: operation.phase === 'prepared' ? finish(state, operation, 'cancelled') : outcomeOf(state, operation), verifierRef: operation.direct.verifierRef };
+      });
+      if (outcome.status !== 'pending') await secrets.remove(verifierRef);
+      return outcome;
+    },
+
+    async operation(operationId) {
+      const state = await load();
+      const found = typeof operationId === 'string' ? own(state.operations, operationId) : undefined;
+      return found && found.epoch === state.epoch ? outcomeOf(state, found) : null;
+    },
+
+    // Host calls this at startup; it never repeats a remote exchange.
+    async recover() {
+      const at = now();
+      const settled = await transaction(state => {
+        const results: { outcome: AuthOutcome; verifierRef: string | null }[] = [];
+        for (const operation of Object.values(state.operations)) {
+          if (operation.epoch !== state.epoch || operation.phase === 'terminal') continue;
+          const verifierRef = operation.direct?.verifierRef ?? null;
+          // The code may have reached the issuer before the crash; only a fresh sign-in is safe.
+          if (operation.phase !== 'prepared') results.push({ outcome: finish(state, operation, 'uncertain', { error: 'lost_response' }), verifierRef });
+          else if (at >= operation.expiresAt) results.push({ outcome: finish(state, operation, 'expired'), verifierRef });
+        }
+        return results;
+      });
+      for (const { verifierRef } of settled) if (verifierRef !== null) await secrets.remove(verifierRef);
+      return settled.map(item => item.outcome);
+    },
     async authorizedFetch(connectionId, request, target, requiredScopes = []) {
       let connection = await record(connectionId);
       const expected = targetOf(connection);
