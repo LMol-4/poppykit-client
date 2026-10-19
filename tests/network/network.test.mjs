@@ -142,7 +142,7 @@ test('hostile URLs and discovery-mode requests are rejected before any connectio
 test('assertion and DPoP claim codecs enforce spec shapes and keep unknown claims', () => {
   const claims = { iss: 'https://agent.example/agent.json', sub: 'usr_1', aud: 'https://auth.example.com', iat: 1790900000, exp: 1790900060, jti: 'V6vJGs2ixBAvGdaQgGaTzg', extra: 1 };
   assert.deepEqual(wire.parseAssertionClaims(claims), claims);
-  for (const bad of [{ aud: ['https://auth.example.com'] }, { exp: 1790900301 }, { exp: 1790900000 }, { jti: 'short' }, { iat: 1.5 }, { sub: undefined }]) assert.throws(() => wire.parseAssertionClaims({ ...claims, ...bad }), { name: 'ValidationError' });
+  for (const bad of [{ aud: ['https://auth.example.com'] }, { exp: 1790900301 }, { exp: 1790900000 }, { jti: 'x'.repeat(15) }, { jti: 'x'.repeat(257) }, { iat: 1.5 }, { sub: undefined }]) assert.throws(() => wire.parseAssertionClaims({ ...claims, ...bad }), { name: 'ValidationError' });
   const proof = { jti: 'e1j3V_bKic8-LAEB', htm: 'POST', htu: 'https://api.example.com/orders', iat: 1790900000, ath: 'abc', nonce: 'n' };
   assert.deepEqual(wire.parseDpopClaims(proof), proof);
   for (const bad of [{ htu: 'https://api.example.com/o?x=1' }, { htu: 'https://api.example.com/o#f' }, { htu: 'http://api.example.com/' }, { htm: 1 }, { iat: 0 }, { ath: 5 }]) assert.throws(() => wire.parseDpopClaims({ ...proof, ...bad }), { name: 'ValidationError' });
@@ -162,4 +162,8 @@ test('every blocked range has a denied sample and a public neighbour', () => {
     ['::ffff:8.8.8.8', false], ['fe80::1', false], ['fc00::1', false], ['ff02::1', false],
   ];
   for (const [address, expected] of table) assert.equal(isPublicAddress(address), expected, address);
+});
+test('assertion jti accepts standard base64 and the length edges only', () => {
+  const claims = { iss: 'i', sub: 's', aud: 'a', iat: 1790900000, exp: 1790900060 };
+  for (const jti of ['VGhpcyBpcyAxNiBieXRlcw==', 'x'.repeat(16), 'x'.repeat(256)]) assert.equal(wire.parseAssertionClaims({ ...claims, jti }).jti, jti);
 });
