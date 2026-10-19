@@ -182,41 +182,46 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     if (nonce) nonces.set(new URL(url).origin, nonce);
   }
 
-  // Signed-out Session Token via the JWT bearer grant (spec 4.2); renewal passes session_id.
-  async function signedOutToken(metadata: CompanyMetadata, userId: string, dpopKeyRef: string, sessionId: string | null, resource: string | null): Promise<TokenResponse> {
+  // Token endpoint request with client assertion and fresh DPoP proof (spec 4.1-4.3); sessionSub adds a session assertion.
+  // Throws transport_error only when the request may have reached the issuer without a readable answer.
+  async function tokenRequest(metadata: CompanyMetadata, dpopKeyRef: string, fields: Record<string, string>, sessionSub: string | null): Promise<TokenResponse> {
     const authorization = metadata.authorization!;
     const endpoint = authorization.token_endpoint;
     const key = await loadDpopKey(dpopKeyRef);
     for (let attempt = 0; ; attempt++) {
       const iat = Math.floor(now() / 1000);
       const claims = (sub: string) => ({ iss: clientId, sub, aud: authorization.issuer, iat, exp: iat + ASSERTION_SECONDS, jti: randomId() });
-      const body = new URLSearchParams({
-        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-        assertion: await signIdentity({ typ: 'JWT' }, claims(userId), key.thumbprint),
-        client_id: clientId,
-        client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
-        client_assertion: await signIdentity({ typ: 'client-authentication+jwt' }, claims(clientId), key.thumbprint),
-      });
-      if (sessionId !== null) body.set('session_id', sessionId);
-      if (resource !== null) body.set('resource', resource);
+      const body = new URLSearchParams(fields);
+      if (sessionSub !== null) body.set('assertion', await signIdentity({ typ: 'JWT' }, claims(sessionSub), key.thumbprint));
+      body.set('client_id', clientId);
+      body.set('client_assertion_type', 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer');
+      body.set('client_assertion', await signIdentity({ typ: 'client-authentication+jwt' }, claims(clientId), key.thumbprint));
       const request = new Request(endpoint, { method: 'POST', body, headers: { accept: 'application/json', dpop: await proof(key, 'POST', endpoint) } });
-      let response: Response;
-      try { response = await transport.fetch(request); } catch { throw new AuthFailure('transport_error'); }
+      let response: Response, text: string;
+      try { response = await transport.fetch(request); text = await response.text(); } catch { throw new AuthFailure('transport_error'); }
       rememberNonce(endpoint, response);
-      const json: unknown = await response.json().catch(() => undefined);
+      let json: unknown;
+      try { json = JSON.parse(text); } catch { /* reported below */ }
       if (response.status === 200) {
-        let token: TokenResponse;
-        try { token = parseTokenResponse(json); } catch { throw new AuthFailure('invalid_response'); }
-        // Only DPoP is executable; a Bearer token is never used as a fallback.
-        if (token.token_type !== 'DPoP') throw new AuthFailure('unsupported_token_type');
-        if (token.signed_in !== false || token.scope !== '' || (sessionId !== null && token.session_id !== sessionId)) throw new AuthFailure('invalid_response');
-        return token;
+        try { return parseTokenResponse(json); } catch { throw new AuthFailure('invalid_response'); }
       }
       let error = 'token_error';
       try { error = parseProtocolError(json).error; } catch { /* non-OAuth body */ }
       if (error === 'use_dpop_nonce' && response.status === 400 && attempt === 0 && response.headers.has('dpop-nonce')) continue;
       throw new AuthFailure(SAFE_ERRORS.has(error) ? error : 'token_error');
     }
+  }
+
+  // Signed-out Session Token via the JWT bearer grant (spec 4.2); renewal passes session_id.
+  async function signedOutToken(metadata: CompanyMetadata, userId: string, dpopKeyRef: string, sessionId: string | null, resource: string | null): Promise<TokenResponse> {
+    const fields: Record<string, string> = { grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer' };
+    if (sessionId !== null) fields.session_id = sessionId;
+    if (resource !== null) fields.resource = resource;
+    const token = await tokenRequest(metadata, dpopKeyRef, fields, userId);
+    // Only DPoP is executable; a Bearer token is never used as a fallback.
+    if (token.token_type !== 'DPoP') throw new AuthFailure('unsupported_token_type');
+    if (token.signed_in !== false || token.scope !== '' || (sessionId !== null && token.session_id !== sessionId)) throw new AuthFailure('invalid_response');
+    return token;
   }
 
   async function identityFor(issuer: string): Promise<{ userId: string; dpopKeyRef: string }> {
