@@ -72,7 +72,7 @@ export function createNodeTransport(options: NetworkOptions = {}): HttpTransport
       }
       let url = secureUrl(request.url);
       if (request.headers.has('host') && request.headers.get('host') !== url.host) throw new TransportError('invalid_url');
-      if (settings.mode === 'discovery' && (request.method !== 'GET' || body || ['authorization', 'dpop', 'cookie', 'proxy-authorization'].some(key => request.headers.has(key)))) throw new TransportError('invalid_url');
+      if (settings.mode === 'discovery' && (request.method !== 'GET' || body || ['authorization', 'dpop', 'cookie', 'proxy-authorization', 'host'].some(key => request.headers.has(key)))) throw new TransportError('invalid_url');
       for (let redirects = 0; ; redirects++) {
         signal.throwIfAborted();
         const hostname = normalizedAddress(url.hostname);

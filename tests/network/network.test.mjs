@@ -167,3 +167,6 @@ test('assertion jti accepts standard base64 and the length edges only', () => {
   const claims = { iss: 'i', sub: 's', aud: 'a', iat: 1790900000, exp: 1790900060 };
   for (const jti of ['VGhpcyBpcyAxNiBieXRlcw==', 'x'.repeat(16), 'x'.repeat(256)]) assert.equal(wire.parseAssertionClaims({ ...claims, jti }).jti, jti);
 });
+test('discovery mode rejects a caller-set Host header that would follow redirects', async () => {
+  await assert.rejects(createNodeTransport().fetch(new Request('https://8.8.8.8/', { headers: { host: '8.8.8.8' } }), { mode: 'discovery' }), { code: 'invalid_url' });
+});
