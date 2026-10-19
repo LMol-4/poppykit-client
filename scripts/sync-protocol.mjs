@@ -1,7 +1,7 @@
 // Copies shared protocol code (src/protocol, src/network, tests/network) into the server repo.
 // Usage: node scripts/sync-protocol.mjs <server-repo-path> [--check]
-import { cpSync, readdirSync, readFileSync, rmSync, mkdirSync, existsSync, statSync } from 'node:fs';
-import { join, dirname, resolve } from 'node:path';
+import { cpSync, readdirSync, readFileSync, rmSync, mkdirSync, existsSync } from 'node:fs';
+import { join, dirname, resolve, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const [target, flag, ...rest] = process.argv.slice(2);
@@ -10,7 +10,7 @@ const source = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const destination = resolve(target);
 if (!existsSync(join(destination, 'package.json'))) { console.error('not a repo: ' + destination); process.exit(2); }
 const shared = ['src/protocol', 'src/network', 'tests/network'];
-const list = dir => existsSync(dir) ? readdirSync(dir, { recursive: true, withFileTypes: true }).filter(e => e.isFile()).map(e => join(e.parentPath, e.name).slice(dir.length + 1).replaceAll('\', '/')).sort() : [];
+const list = dir => existsSync(dir) ? readdirSync(dir, { recursive: true, withFileTypes: true }).filter(e => e.isFile()).map(e => relative(dir, join(e.parentPath, e.name)).split(sep).join('/')).sort() : [];
 // Compare ignoring CRLF: git checkouts convert line endings per worktree.
 const text = file => readFileSync(file).toString('latin1').replaceAll('\r\n', '\n');
 
