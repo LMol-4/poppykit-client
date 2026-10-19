@@ -144,3 +144,24 @@ export function retryAfterMilliseconds(value: string | null, nowMs: number): num
   if (!/^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(value)) return undefined;
   const date = Date.parse(value); return Number.isFinite(date) ? Math.max(0, date - nowMs) : undefined;
 }
+export interface AssertionClaims { iss: string; sub: string; aud: string; iat: number; exp: number; jti: string; [key: string]: unknown }
+export interface DpopClaims { jti: string; htm: string; htu: string; iat: number; ath?: string; nonce?: string; [key: string]: unknown }
+// Session and client assertions (spec 4.1/4.2): aud is the issuer as a single string, exp - iat <= 300s.
+export function parseAssertionClaims(value: unknown): AssertionClaims {
+  const claims = object(value, 'claims');
+  for (const key of ['iss', 'sub', 'aud', 'jti']) string(claims[key], key);
+  // jti needs >=128 random bits: at least 22 base64url characters
+  if (!/^[A-Za-z0-9_-]{22,}$/.test(claims.jti as string)) throw new ValidationError('jti');
+  positive(claims.iat, 'iat'); positive(claims.exp, 'exp');
+  if ((claims.exp as number) <= (claims.iat as number) || (claims.exp as number) - (claims.iat as number) > 300) throw new ValidationError('exp');
+  return claims as AssertionClaims;
+}
+// DPoP proof payload (spec 4.3); htu carries no query or fragment.
+export function parseDpopClaims(value: unknown): DpopClaims {
+  const claims = object(value, 'claims');
+  string(claims.jti, 'jti'); string(claims.htm, 'htm'); positive(claims.iat, 'iat');
+  const htu = string(claims.htu, 'htu');
+  try { const url = new URL(htu); if (url.protocol !== 'https:' || url.search || url.hash || htu.includes('?') || htu.includes('#')) throw 0; } catch { throw new ValidationError('htu'); }
+  for (const key of ['ath', 'nonce']) if (key in claims) string(claims[key], key);
+  return claims as DpopClaims;
+}

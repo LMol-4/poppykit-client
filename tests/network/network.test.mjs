@@ -130,3 +130,20 @@ test('actual socket address mismatch aborts before handing socket to HTTP', asyn
   try { await assert.rejects(createNodeTransport().fetch(new Request('https://8.8.8.8/')), { code: 'blocked_address' }); assert.equal(destroyed, true); }
   finally { tls.connect = original; syncBuiltinESMExports(); }
 });
+test('hostile URLs and discovery-mode requests are rejected before any connection', async () => {
+  const transport = createNodeTransport();
+  for (const url of ['http://example.com/', 'https://example.com/#frag', 'https://0x7f.1/', 'https://[::ffff:7f00:1]/', 'https://localhost/', 'https://127.1/'])
+    await assert.rejects(transport.fetch(new Request(url)), { name: 'TransportError' }, url);
+  await assert.rejects(transport.fetch(new Request('https://8.8.8.8/', { headers: { authorization: 'x' } }), { mode: 'discovery' }), { code: 'invalid_url' });
+  await assert.rejects(transport.fetch(new Request('https://8.8.8.8/', { method: 'POST', body: 'x' }), { mode: 'discovery' }), { code: 'invalid_url' });
+  assert.throws(() => createNodeTransport({ timeoutMs: 0 }), TypeError);
+  for (const id of ['https://a.example', 'https://a.example/x/../y', 'https://a.example/%2E%2e/y', 'https://a.example/x\\..\\y', 'https://a.example/x#f', 'https://u@a.example/x', 'http://a.example/x']) assert.throws(() => validateClientId(id), /Error/, id);
+});
+test('assertion and DPoP claim codecs enforce spec shapes and keep unknown claims', () => {
+  const claims = { iss: 'https://agent.example/agent.json', sub: 'usr_1', aud: 'https://auth.example.com', iat: 1790900000, exp: 1790900060, jti: 'V6vJGs2ixBAvGdaQgGaTzg', extra: 1 };
+  assert.deepEqual(wire.parseAssertionClaims(claims), claims);
+  for (const bad of [{ aud: ['https://auth.example.com'] }, { exp: 1790900301 }, { exp: 1790900000 }, { jti: 'short' }, { iat: 1.5 }, { sub: undefined }]) assert.throws(() => wire.parseAssertionClaims({ ...claims, ...bad }), { name: 'ValidationError' });
+  const proof = { jti: 'e1j3V_bKic8-LAEB', htm: 'POST', htu: 'https://api.example.com/orders', iat: 1790900000, ath: 'abc', nonce: 'n' };
+  assert.deepEqual(wire.parseDpopClaims(proof), proof);
+  for (const bad of [{ htu: 'https://api.example.com/o?x=1' }, { htu: 'https://api.example.com/o#f' }, { htu: 'http://api.example.com/' }, { htm: 1 }, { iat: 0 }, { ath: 5 }]) assert.throws(() => wire.parseDpopClaims({ ...proof, ...bad }), { name: 'ValidationError' });
+});

@@ -14,6 +14,8 @@ function domain(value: unknown): string { const text = string(value, 'domain'); 
 function canonical(value: unknown): string { if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`; if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(',')}}`; return JSON.stringify(value); }
 export function authorizationMetadataUrl(issuer: string): string { const parsed = secureUrl(issuer); if (parsed.search) throw new ValidationError('issuer'); return `${parsed.origin}/.well-known/oauth-authorization-server${parsed.pathname === '/' ? '' : parsed.pathname}`; }
 export function validateClientId(clientId: string): URL {
+  // Backslashes, whitespace and control characters are normalized away by URL parsing, hiding dot segments.
+  if (/[\\\s\x00-\x1f]/.test(clientId)) throw new ValidationError('client_id');
   const raw = /^https:\/\/[^/?#]+(\/[^?#]*)(?:\?[^#]*)?$/.exec(clientId);
   if (!raw || raw[1].split('/').some(segment => /^(?:\.|%2e){1,2}$/i.test(segment))) throw new ValidationError('client_id');
   return secureUrl(clientId);
