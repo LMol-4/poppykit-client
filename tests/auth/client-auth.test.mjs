@@ -6,16 +6,20 @@ import { createClientAuth, initialClientAuthState, AuthFailure, createMetadataRe
 import { createFakeCompany, fakeTransport } from './fake-issuer.mjs';
 
 const CLIENT_ID = 'https://agent.test/agent.json';
+const REDIRECT = 'https://agent.test/oauth/callback';
 const EC = { name: 'ECDSA', namedCurve: 'P-256' };
 const ES256 = { name: 'ECDSA', hash: 'SHA-256' };
 
 function memoryStore(initial = initialClientAuthState()) {
   let state = structuredClone(initial); let chain = Promise.resolve();
-  return {
+  const store = {
+    crashNext: false,
     get raw() { return state; },
     async read() { return structuredClone(state); },
     transaction(change) {
       const run = chain.then(() => {
+        // Simulates the process dying before commit.
+        if (store.crashNext) { store.crashNext = false; throw new Error('crash'); }
         const draft = structuredClone(state); const result = change(draft);
         if (result && typeof result.then === 'function') throw new Error('async transaction');
         state = draft; return structuredClone(result);
@@ -23,6 +27,7 @@ function memoryStore(initial = initialClientAuthState()) {
       chain = run.catch(() => {}); return run;
     },
   };
+  return store;
 }
 function memorySecrets() {
   const map = new Map();
@@ -34,12 +39,12 @@ async function makeSigner(kid = 'agent-key-1') {
   const jwk = { kty, crv, x, y, kid, use: 'sig', alg: 'ES256' };
   return { kid, jwk, privateKey: pair.privateKey, publicJwk: async () => ({ ...jwk }), sign: async input => new Uint8Array(await crypto.subtle.sign(ES256, pair.privateKey, input)) };
 }
-async function setup({ localUserId = 'alice', store = memoryStore(), secrets = memorySecrets(), signer, names = ['shop'] } = {}) {
+async function setup({ localUserId = 'alice', store = memoryStore(), secrets = memorySecrets(), signer, names = ['shop'], conversationResource } = {}) {
   signer ??= await makeSigner();
   const clock = { t: 1_790_900_000_000 }; const now = () => clock.t;
-  const companies = names.map(name => createFakeCompany({ name, jwks: { keys: [signer.jwk] }, clientId: CLIENT_ID, now }));
+  const companies = names.map(name => createFakeCompany({ name, jwks: { keys: [signer.jwk] }, clientId: CLIENT_ID, now, redirectUris: [REDIRECT], conversationResource }));
   const transport = fakeTransport(...companies);
-  const options = { namespace: 'demo', localUserId, clientId: CLIENT_ID, redirectUris: [], identity: signer, store, secrets, transport, metadata: createMetadataResolver(transport, { now }), now };
+  const options = { namespace: 'demo', localUserId, clientId: CLIENT_ID, redirectUris: [REDIRECT], identity: signer, store, secrets, transport, metadata: createMetadataResolver(transport, { now }), now };
   return { auth: createClientAuth(options), options, company: companies[0], companies, transport, store, secrets, signer, clock };
 }
 const code = expected => error => error instanceof AuthFailure && error.code === expected;
@@ -348,4 +353,306 @@ test('token expiry counts from before dispatch', async () => {
   const sentAt = clock.t;
   const { connection } = await auth.start(company.domain);
   assert.equal(Object.values(store.raw.connections[connection.id].slots)[0].expiresAt, sentAt + 3600_000);
+});
+
+// Direct Sign-In (spec 4.4-4.5)
+const BROWSER = 'browser-session-0123456789abcdef';
+const OTHER_BROWSER = 'another-browser-0123456789abcdef';
+const exchanges = company => company.requests.filter(item => item.url === company.tokenEndpoint).length;
+async function beginAndApprove(auth, company, connectionId, { scopes = ['poppy:read'], account = 'acct_1', approve, deny, browserBinding = BROWSER } = {}) {
+  const { outcome, authorizationUrl } = await auth.beginSignIn(connectionId, { scopes, redirectUri: REDIRECT, browserBinding });
+  assert.equal(outcome.status, 'pending'); assert.equal(outcome.nextAction, 'wait');
+  return { begun: outcome, authorizationUrl, callbackUrl: company.authorize(authorizationUrl, { account, approve, deny }) };
+}
+async function signIn(auth, company, connectionId, options = {}) {
+  const { callbackUrl } = await beginAndApprove(auth, company, connectionId, options);
+  return auth.completeSignIn({ callbackUrl, browserBinding: options.browserBinding ?? BROWSER });
+}
+
+test('Direct Sign-In isolates two users with two connections each', async () => {
+  const signer = await makeSigner();
+  const alice = await setup({ signer }); const bob = await setup({ signer, localUserId: 'bob' });
+  const accounts = [];
+  for (const [user, account] of [[alice, 'acct_alice_personal'], [alice, 'acct_alice_business'], [bob, 'acct_bob_1'], [bob, 'acct_bob_2']]) {
+    const { connection } = await user.auth.start(user.company.domain);
+    const outcome = await signIn(user.auth, user.company, connection.id, { scopes: ['poppy:read', 'poppy:write'], account });
+    assert.equal(outcome.status, 'completed'); assert.equal(outcome.connection.status, 'signed_in');
+    assert.deepEqual(outcome.connection.scopes, ['poppy:read', 'poppy:write']); assert.equal(outcome.connection.sessionId, connection.sessionId);
+    accounts.push({ user, id: connection.id, account, sessionId: connection.sessionId });
+  }
+  for (const { user, id, account, sessionId } of accounts) {
+    const response = await user.auth.authorizedFetch(id, conversations(user.company), await user.auth.target(id), ['poppy:write']);
+    const body = await response.json();
+    assert.equal(body.account, account); assert.equal(body.session_id, sessionId);
+  }
+  assert.equal((await alice.auth.list()).length, 2); assert.equal((await bob.auth.list()).length, 2);
+  assert.equal(await alice.auth.get(accounts[2].id), null);
+  for (const user of [alice, bob]) {
+    const persisted = JSON.stringify(user.store.raw);
+    for (const secret of [...user.company.tokens.keys(), ...user.company.grants.keys(), ...user.company.codes.keys(), BROWSER]) assert.equal(persisted.includes(secret), false);
+    assert.equal(Object.keys(user.store.raw.grants).length, 2);
+  }
+  // A callback for Bob's sign-in is unknown to Alice's namespace.
+  const { connection } = await bob.auth.start(bob.company.domain);
+  const { callbackUrl } = await beginAndApprove(bob.auth, bob.company, connection.id);
+  await assert.rejects(alice.auth.completeSignIn({ callbackUrl, browserBinding: BROWSER }), code('invalid_callback'));
+});
+
+test('the authorization request and code exchange carry PKCE, state, issuer and session', async () => {
+  const { auth, company, store } = await setup();
+  const { connection } = await auth.start(company.domain);
+  let exchange;
+  const original = company.handle;
+  company.handle = async (request, options) => { if (request.url === company.tokenEndpoint) exchange = new URLSearchParams(await request.clone().text()); return original(request, options); };
+  const { authorizationUrl, callbackUrl } = await beginAndApprove(auth, company, connection.id, { scopes: ['poppy:read', 'poppy:write'] });
+  const url = new URL(authorizationUrl);
+  assert.equal(url.origin + url.pathname, company.authorizationEndpoint);
+  assert.equal(url.searchParams.get('client_id'), CLIENT_ID); assert.equal(url.searchParams.get('redirect_uri'), REDIRECT);
+  assert.equal(url.searchParams.get('scope'), 'poppy:read poppy:write'); assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
+  assert.ok(url.searchParams.get('state').length >= 43);
+  assert.equal(JSON.stringify(store.raw).includes(url.searchParams.get('state')), false);
+  await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER });
+  assert.equal(exchange.get('grant_type'), 'authorization_code'); assert.equal(exchange.get('session_id'), connection.sessionId);
+  assert.equal(exchange.get('redirect_uri'), REDIRECT); assert.equal(exchange.get('client_id'), CLIENT_ID);
+  assert.equal(exchange.has('assertion'), false); assert.ok(exchange.get('client_assertion'));
+  assert.equal(company.proofs.at(-1).thumbprint, company.proofs[0].thumbprint);
+});
+
+test('beginSignIn rejects bad input before creating an operation', async () => {
+  const { auth, company, store } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const good = { scopes: ['poppy:read'], redirectUri: REDIRECT, browserBinding: BROWSER };
+  for (const [input, expected] of [
+    [{ ...good, scopes: [] }, 'invalid_scope'],
+    [{ ...good, scopes: ['poppy:read', 'poppy:read'] }, 'invalid_scope'],
+    [{ ...good, scopes: ['admin'] }, 'invalid_scope'],
+    [{ ...good, scopes: 'poppy:read' }, 'invalid_scope'],
+    [{ ...good, redirectUri: 'https://agent.test/oauth/callback/' }, 'invalid_redirect'],
+    [{ ...good, redirectUri: 'https://evil.test/cb' }, 'invalid_redirect'],
+    [{ ...good, browserBinding: 'short' }, 'invalid_binding'],
+    [undefined, 'invalid_scope'],
+  ]) await assert.rejects(auth.beginSignIn(connection.id, input), code(expected), JSON.stringify(input));
+  await assert.rejects(auth.beginSignIn('con_missing', good), code('unknown_connection'));
+  const operations = Object.keys(store.raw.operations).length;
+  delete store.raw.connections[connection.id].metadata.document.auth.direct;
+  await assert.rejects(auth.beginSignIn(connection.id, good), code('direct_unavailable'));
+  assert.equal(Object.keys(store.raw.operations).length, operations);
+});
+
+test('wrong callbacks leave the operation untouched; duplicates return the recorded result', async () => {
+  const { auth, company } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const { begun, callbackUrl } = await beginAndApprove(auth, company, connection.id);
+  const tweak = change => { const url = new URL(callbackUrl); change(url); return url.href; };
+  for (const [url, browserBinding] of [
+    [callbackUrl, OTHER_BROWSER],
+    [tweak(url => url.searchParams.set('iss', `${company.issuer}/`)), BROWSER],
+    [tweak(url => url.searchParams.delete('iss')), BROWSER],
+    [tweak(url => url.searchParams.set('state', 'forged-state-value')), BROWSER],
+    [tweak(url => url.searchParams.append('code', 'second')), BROWSER],
+    [tweak(url => url.searchParams.set('extra', '1')), BROWSER],
+    [tweak(url => { url.pathname = '/oauth/other'; }), BROWSER],
+    [tweak(url => { url.host = 'evil.test'; }), BROWSER],
+    [tweak(url => { url.hash = 'x'; }), BROWSER],
+    [tweak(url => url.searchParams.set('error', 'access_denied')), BROWSER],
+    [tweak(url => url.searchParams.delete('code')), BROWSER],
+    ['not a url', BROWSER],
+  ]) await assert.rejects(auth.completeSignIn({ callbackUrl: url, browserBinding }), code('invalid_callback'), url);
+  assert.equal(exchanges(company), 1);
+  assert.equal((await auth.operation(begun.operationId)).status, 'pending');
+  const done = await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER });
+  assert.equal(done.status, 'completed'); assert.equal(exchanges(company), 2);
+  const again = await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER });
+  assert.deepEqual(again, done); assert.deepEqual(await auth.operation(begun.operationId), done);
+  assert.equal(exchanges(company), 2);
+  // Even after completion, another browser learns nothing.
+  await assert.rejects(auth.completeSignIn({ callbackUrl, browserBinding: OTHER_BROWSER }), code('invalid_callback'));
+  assert.equal(await auth.operation('op_missing'), null);
+});
+
+test('concurrent callbacks exchange the code exactly once', async () => {
+  const { auth, company } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const { callbackUrl } = await beginAndApprove(auth, company, connection.id);
+  const results = await Promise.all([1, 2, 3].map(() => auth.completeSignIn({ callbackUrl, browserBinding: BROWSER })));
+  assert.equal(exchanges(company), 2);
+  assert.equal(results.filter(item => item.status === 'completed').length, 1);
+  assert.ok(results.every(item => item.status === 'completed' || (item.status === 'pending' && item.nextAction === 'wait')));
+});
+
+test('denied, cancelled and expired sign-ins are terminal and keep the signed-out session', async () => {
+  const { auth, company, clock, store, secrets } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const slots = structuredClone(store.raw.connections[connection.id].slots);
+  const denied = await signIn(auth, company, connection.id, { deny: true });
+  assert.equal(denied.status, 'denied'); assert.equal(denied.error, 'access_denied'); assert.equal(denied.connection.status, 'signed_out');
+  const cancel = await beginAndApprove(auth, company, connection.id);
+  assert.equal((await auth.cancelSignIn(cancel.begun.operationId)).status, 'cancelled');
+  assert.equal((await auth.completeSignIn({ callbackUrl: cancel.callbackUrl, browserBinding: BROWSER })).status, 'cancelled');
+  await assert.rejects(auth.cancelSignIn('op_missing'), code('unknown_operation'));
+  const late = await beginAndApprove(auth, company, connection.id);
+  clock.t += 10 * 60_000;
+  const expired = await auth.completeSignIn({ callbackUrl: late.callbackUrl, browserBinding: BROWSER });
+  assert.equal(expired.status, 'expired'); assert.equal(expired.nextAction, 'sign_in');
+  const stale = await beginAndApprove(auth, company, connection.id);
+  clock.t += 10 * 60_000;
+  assert.deepEqual((await auth.recover()).map(item => [item.operationId, item.status]), [[stale.begun.operationId, 'expired']]);
+  assert.equal(exchanges(company), 1);
+  assert.deepEqual(store.raw.connections[connection.id].slots, slots);
+  assert.equal(store.raw.connections[connection.id].status, 'signed_out');
+  // Every terminal sign-in removed its verifier; only the DPoP key and session token remain.
+  assert.equal(secrets.map.size, 2);
+});
+
+test('partial consent keeps the previous grant and parks the new Account Token for revocation', async () => {
+  const { auth, company, store, secrets } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const first = await signIn(auth, company, connection.id, { scopes: ['poppy:read'] });
+  assert.equal(first.status, 'completed');
+  const before = structuredClone(store.raw.connections[connection.id]);
+  const partial = await signIn(auth, company, connection.id, { scopes: ['poppy:read', 'poppy:write'], approve: ['poppy:read'] });
+  assert.equal(partial.status, 'failed'); assert.equal(partial.error, 'insufficient_scope');
+  assert.deepEqual(partial.missingScopes, ['poppy:write']); assert.deepEqual(partial.connection.scopes, ['poppy:read']);
+  assert.deepEqual(store.raw.connections[connection.id], before);
+  const [cleanup] = Object.values(store.raw.cleanup);
+  assert.equal(cleanup.status, 'pending'); assert.equal(cleanup.revocationEndpoint, `${company.issuer}/revoke`);
+  assert.equal(secrets.map.get(cleanup.secretRef), [...company.grants.keys()].at(-1));
+  assert.equal((await auth.authorizedFetch(connection.id, conversations(company), await auth.target(connection.id), ['poppy:read'])).status, 200);
+  // A signed-out connection that gets partial consent stays signed out.
+  const other = await auth.start(company.domain);
+  const none = await signIn(auth, company, other.connection.id, { scopes: ['poppy:read', 'poppy:write'], approve: ['poppy:write'] });
+  assert.deepEqual([none.status, none.missingScopes, none.connection.status], ['failed', ['poppy:read'], 'signed_out']);
+});
+
+test('a scope upgrade replaces the grant and parks the old one; old slots stop being selectable', async () => {
+  const { auth, company, store } = await setup();
+  const { connection } = await auth.start(company.domain);
+  await signIn(auth, company, connection.id, { scopes: ['poppy:read'] });
+  const oldGrant = store.raw.connections[connection.id].grantId;
+  const upgraded = await signIn(auth, company, connection.id, { scopes: ['poppy:read', 'poppy:write'] });
+  assert.equal(upgraded.status, 'completed'); assert.deepEqual(upgraded.connection.scopes, ['poppy:read', 'poppy:write']);
+  const record = store.raw.connections[connection.id];
+  assert.notEqual(record.grantId, oldGrant); assert.equal(store.raw.grants[oldGrant], undefined);
+  assert.deepEqual(Object.keys(store.raw.cleanup), [`cln_${oldGrant}`]);
+  assert.equal(Object.keys(record.slots).length, 1);
+});
+
+test('failed replacement keeps the old connection; a different account on the same session is refused', async () => {
+  const { auth, company } = await setup();
+  const old = await auth.start(company.domain);
+  await signIn(auth, company, old.connection.id, { account: 'acct_a', scopes: ['poppy:read'] });
+  const oldAccount = async () => (await (await auth.authorizedFetch(old.connection.id, conversations(company), await auth.target(old.connection.id), ['poppy:read'])).json()).account;
+  // Same session, different account: the Company refuses and nothing changes locally.
+  const mismatch = await signIn(auth, company, old.connection.id, { account: 'acct_b', scopes: ['poppy:read'] });
+  assert.deepEqual([mismatch.status, mismatch.error, mismatch.connection.status], ['failed', 'account_mismatch', 'signed_in']);
+  assert.equal(await oldAccount(), 'acct_a');
+  const candidate = await auth.start(company.domain);
+  assert.equal((await signIn(auth, company, candidate.connection.id, { account: 'acct_b', deny: true })).status, 'denied');
+  assert.equal(await oldAccount(), 'acct_a');
+  const replaced = await signIn(auth, company, candidate.connection.id, { account: 'acct_b', scopes: ['poppy:read'] });
+  assert.equal(replaced.status, 'completed'); assert.equal(await oldAccount(), 'acct_a');
+});
+
+test('token responses that are not a usable signed-in grant fail and park any Account Token', async () => {
+  for (const [override, expected, parked] of [
+    [{ token_type: 'Bearer' }, 'unsupported_token_type', 1],
+    [{ signed_in: false }, 'invalid_response', 1],
+    [{ session_id: 'ses_other' }, 'invalid_response', 1],
+    [{ scope: 'poppy:read poppy:write' }, 'invalid_response', 1],
+    [{ refresh_token: undefined }, 'invalid_response', 0],
+    [{ expires_in: -1 }, 'invalid_response', 0],
+  ]) {
+    const { auth, company, store } = await setup();
+    const { connection } = await auth.start(company.domain);
+    company.behavior.tokenOverride = override;
+    const outcome = await signIn(auth, company, connection.id);
+    assert.deepEqual([outcome.status, outcome.error, outcome.connection.status], ['failed', expected, 'signed_out'], JSON.stringify(override));
+    assert.deepEqual(store.raw.grants, {});
+    assert.equal(Object.keys(store.raw.cleanup).length, parked, JSON.stringify(override));
+  }
+});
+
+test('a lost exchange response is uncertain and the code is never resent', async () => {
+  const { auth, company, transport, store } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const slots = structuredClone(store.raw.connections[connection.id].slots);
+  const { begun, callbackUrl } = await beginAndApprove(auth, company, connection.id);
+  const original = transport.fetch;
+  transport.fetch = async (request, options) => {
+    const response = await original(request, options);
+    if (request.url === company.tokenEndpoint) throw new Error('socket hang up');
+    return response;
+  };
+  const lost = await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER });
+  assert.deepEqual([lost.status, lost.error, lost.nextAction], ['uncertain', 'lost_response', 'sign_in']);
+  transport.fetch = original;
+  assert.deepEqual(await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER }), lost);
+  assert.deepEqual(await auth.operation(begun.operationId), lost);
+  assert.equal(exchanges(company), 2);
+  assert.deepEqual(store.raw.connections[connection.id].slots, slots); assert.equal(store.raw.connections[connection.id].status, 'signed_out');
+  assert.equal((await auth.authorizedFetch(connection.id, conversations(company), await auth.target(connection.id))).status, 200);
+  // A definite rejection is a failure, not uncertainty.
+  const reused = await beginAndApprove(auth, company, connection.id);
+  company.codes.get(new URL(reused.callbackUrl).searchParams.get('code')).used = true;
+  const rejected = await auth.completeSignIn({ callbackUrl: reused.callbackUrl, browserBinding: BROWSER });
+  assert.deepEqual([rejected.status, rejected.error], ['failed', 'invalid_grant']);
+});
+
+test('a crash during activation recovers as uncertain without replaying the code', async () => {
+  const store = memoryStore(); const secrets = memorySecrets();
+  const first = await setup({ store, secrets });
+  const { connection } = await first.auth.start(first.company.domain);
+  const slots = structuredClone(store.raw.connections[connection.id].slots);
+  const { begun, callbackUrl } = await beginAndApprove(first.auth, first.company, connection.id);
+  const original = first.company.handle;
+  first.company.handle = async (request, options) => { const response = await original(request, options); if (request.url === first.company.tokenEndpoint) store.crashNext = true; return response; };
+  await assert.rejects(first.auth.completeSignIn({ callbackUrl, browserBinding: BROWSER }), /crash/);
+  // Restart: a new client over the same durable state.
+  const restarted = createClientAuth({ ...first.options });
+  assert.equal((await restarted.operation(begun.operationId)).status, 'pending');
+  const recovered = await restarted.recover();
+  assert.deepEqual(recovered.map(item => [item.operationId, item.status, item.nextAction]), [[begun.operationId, 'uncertain', 'sign_in']]);
+  assert.deepEqual(await restarted.recover(), []);
+  assert.equal((await restarted.completeSignIn({ callbackUrl, browserBinding: BROWSER })).status, 'uncertain');
+  assert.equal(exchanges(first.company), 2);
+  assert.deepEqual(store.raw.grants, {}); assert.deepEqual(store.raw.connections[connection.id].slots, slots);
+  // The staged Account Token exists but is unreachable from state.
+  const staged = [...secrets.map].filter(([, value]) => first.company.grants.has(value)).map(([ref]) => ref);
+  assert.equal(staged.length, 1); assert.equal(JSON.stringify(store.raw).includes(staged[0]), false);
+});
+
+test('a secret store failure after the exchange is reported as uncertain', async () => {
+  const { auth, company, secrets, store } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const { callbackUrl } = await beginAndApprove(auth, company, connection.id);
+  const stage = secrets.stage;
+  secrets.stage = async secret => { if (company.grants.has(secret)) throw new Error('disk full'); return stage(secret); };
+  const outcome = await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER });
+  assert.deepEqual([outcome.status, outcome.error], ['uncertain', 'storage_error']);
+  assert.deepEqual(store.raw.grants, {}); assert.deepEqual(store.raw.cleanup, {});
+});
+
+test('recovery during an in-flight exchange wins; the late grant is parked, not activated', async () => {
+  const { auth, company, options, store } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const { callbackUrl } = await beginAndApprove(auth, company, connection.id);
+  const original = company.handle;
+  company.handle = async (request, init) => { const response = await original(request, init); if (request.url === company.tokenEndpoint) await createClientAuth(options).recover(); return response; };
+  const outcome = await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER });
+  assert.equal(outcome.status, 'uncertain');
+  assert.equal(store.raw.connections[connection.id].status, 'signed_out'); assert.deepEqual(store.raw.grants, {});
+  assert.equal(Object.keys(store.raw.cleanup).length, 1);
+});
+
+test('sign-in requests the conversation resource so the signed-in token works there', async () => {
+  const { auth, company, store } = await setup({ conversationResource: 'https://api.shop.test/poppy' });
+  const { connection } = await auth.start(company.domain);
+  const target = await auth.target(connection.id);
+  assert.equal(target.resource, 'https://api.shop.test/poppy');
+  const { authorizationUrl, callbackUrl } = await beginAndApprove(auth, company, connection.id);
+  assert.equal(new URL(authorizationUrl).searchParams.get('resource'), target.resource);
+  assert.equal((await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER })).status, 'completed');
+  assert.deepEqual(Object.keys(store.raw.connections[connection.id].slots), [JSON.stringify([connection.sessionId, target.resource])]);
+  const body = await (await auth.authorizedFetch(connection.id, conversations(company), target, ['poppy:read'])).json();
+  assert.equal(body.account, 'acct_1');
 });
