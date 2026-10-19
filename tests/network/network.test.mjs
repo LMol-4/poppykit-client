@@ -95,6 +95,8 @@ test('real TLS enforces trust, bounded bodies/time, safe redirects and exact add
   const server = createServer({ key, cert }, (request, response) => {
     requests++;
     if (request.url === '/redirect') { response.writeHead(302, { location: `https://localhost:${port}/ok` }); response.end(); }
+    else if (request.url === '/to-http') { response.writeHead(302, { location: `http://localhost:${port}/ok` }); response.end(); }
+    else if (request.url === '/to-ip') { response.writeHead(302, { location: `https://127.0.0.1:${port}/ok` }); response.end(); }
     else if (request.url === '/loop') { response.writeHead(302, { location: '/loop' }); response.end(); }
     else if (request.url === '/large') response.end('x'.repeat(2048));
     else if (request.url === '/slow') { response.writeHead(200); response.flushHeaders(); }
@@ -112,6 +114,11 @@ test('real TLS enforces trust, bounded bodies/time, safe redirects and exact add
   const before = requests;
   const redirected = await transport.fetch(new Request(`https://localhost:${port}/redirect`, { headers: { authorization: 'DPoP secret', DPoP: 'proof' } })); assert.equal(redirected.status, 302); assert.equal(requests, before + 1);
   const discovered = await transport.fetch(target('/redirect'), { mode: 'discovery' }); assert.equal(discovered.url, `https://localhost:${port}/ok`);
+  for (const [path, code] of [['/to-http', 'invalid_url'], ['/to-ip', 'blocked_address']]) {
+    const seen = requests;
+    await assert.rejects(transport.fetch(target(path), { mode: 'discovery' }), { code }, path);
+    assert.equal(requests, seen + 1, `${path}: redirect target never reached the server`);
+  }
   await assert.rejects(createNodeTransport({ ...options, maxRedirects: 1 }).fetch(target('/loop'), { mode: 'discovery' }), { code: 'redirect_limit' });
   await assert.rejects(createNodeTransport({ ...options, maxResponseBytes: 100 }).fetch(target('/large')), { code: 'body_limit' });
   await assert.rejects(createNodeTransport({ ...options, timeoutMs: 100 }).fetch(target('/slow')), { code: 'timeout' });
