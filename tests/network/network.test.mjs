@@ -177,3 +177,28 @@ test('assertion jti accepts standard base64 and the length edges only', () => {
 test('discovery mode rejects a caller-set Host header that would follow redirects', async () => {
   await assert.rejects(createNodeTransport().fetch(new Request('https://8.8.8.8/', { headers: { host: '8.8.8.8' } }), { mode: 'discovery' }), { code: 'invalid_url' });
 });
+test('zoned IPv6 addresses fail closed instead of throwing', () => {
+  assert.equal(isPublicAddress('fe80::1%eth0'), false);
+  assert.equal(isPublicAddress('2606:4700:4700::1111%eth0'), false);
+});
+test('mixed DNS answers never dial a private address; all-private fails closed', async t => {
+  const key = await readFile(new URL('./fixtures/localhost-key.pem', import.meta.url));
+  const cert = await readFile(new URL('./fixtures/localhost-cert.pem', import.meta.url));
+  const server = createServer({ key, cert }, (_request, response) => response.end('ok'));
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); const port = server.address().port;
+  const original = dns.lookup; let answers = [];
+  t.after(() => { dns.lookup = original; syncBuiltinESMExports(); server.closeAllConnections(); server.close(); });
+  dns.lookup = (_host, _options, callback) => callback(null, answers.map(address => ({ address, family: 4 })));
+  syncBuiltinESMExports();
+  const transport = createNodeTransport({ ca: cert.toString(), timeoutMs: 2000, localExceptions: [{ hostname: 'localhost', addresses: ['127.0.0.1'] }] });
+  const dialed = []; const connect = tls.connect;
+  tls.connect = (options, ...rest) => { dialed.push(options.host); return connect(options, ...rest); };
+  syncBuiltinESMExports();
+  try {
+    answers = ['10.0.0.1', '127.0.0.1'];
+    assert.equal((await transport.fetch(new Request(`https://localhost:${port}/`))).status, 200);
+    answers = ['10.0.0.1', '192.168.0.1'];
+    await assert.rejects(transport.fetch(new Request(`https://localhost:${port}/`)), { code: 'blocked_address' });
+  } finally { tls.connect = connect; syncBuiltinESMExports(); }
+  assert.equal(dialed.length, 2);
+});

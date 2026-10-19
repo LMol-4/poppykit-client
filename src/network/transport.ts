@@ -92,7 +92,7 @@ export function createNodeTransport(options: NetworkOptions = {}): HttpTransport
           const finish = (error: Error | null) => { if (settled) return; settled = true; signal.removeEventListener('abort', abort); if (error) { socket.destroy(); callback(error); } else callback(null, socket); };
           const abort = () => finish(new TransportError(controller.signal.aborted ? 'timeout' : 'network_error'));
           signal.addEventListener('abort', abort, { once: true });
-          socket.once('error', () => finish(new TransportError('network_error')));
+          socket.once('error', error => finish(error instanceof TransportError ? error : new TransportError('network_error')));
           socket.once('secureConnect', () => finish(socket.remoteAddress && allowed(hostname, socket.remoteAddress) ? null : new TransportError('blocked_address')));
           return undefined;
         }) as typeof agent.createConnection;
