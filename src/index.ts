@@ -4,3 +4,5 @@ export { createNodeTransport } from './network/transport.js';
 export type { HttpTransport, NetworkOptions } from './network/transport.js';
 export { createMetadataResolver } from './network/discovery.js';
 export type { MetadataResolver } from './network/discovery.js';
+export { createConversationClient, initialConversationClientState, ConversationError } from './conversation.js';
+export type { ConversationClientOptions, ConversationClientState, OutboundInput, OutboundRecord } from './conversation.js';
