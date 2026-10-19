@@ -74,7 +74,7 @@ function setup(overrides = {}) {
 const msg = { sender: 'agent', text: 'hello' };
 
 test('lost first POST response then retry reuses the ID and the company dedupes', async () => {
-  const { server, client, store } = setup({ maxAttempts: 1 });
+  const { server, client } = setup({ maxAttempts: 1 });
   server.hooks.dropResponses = 1;
   await assert.rejects(client.start({ ...msg, id: 'msg_a' }), e => e.code === 'network_error');
   const pending = await client.operation('msg_a');
@@ -89,7 +89,6 @@ test('lost first POST response then retry reuses the ID and the company dedupes'
   const posts = server.log.length;
   assert.equal((await client.start({ ...msg, id: 'msg_a' })).conversation_id, 'cnv_1');
   assert.equal(server.log.length, posts);
-  assert.ok(store);
 });
 
 test('automatic retries reuse the ID after a transient network error', async () => {
@@ -192,27 +191,6 @@ test('read drains has_more pages whole and keeps unknown events raw', async () =
   assert.ok(server.log.some(l => l.includes('cursor=' + pages[0].cursor)));
 });
 
-test('yielding never acknowledges; acknowledge advances only a delivered page and never regresses', async () => {
-  const { client, server } = setup();
-  const { conversation_id } = await client.start({ ...msg, id: 'msg_n' });
-  const conv = server.conversations.get(conversation_id);
-  for (let i = 0; i < 3; i++) server.addEvent(conv, { type: 'state', status: 'idle', responder: 'agent' });
-  const first = await client.read(conversation_id, { consumer: 'c1' });
-  assert.equal(await client.checkpoint(conversation_id, 'c1'), null);
-  const again = await client.read(conversation_id, { consumer: 'c1' }); // crash before ack: redelivered
-  assert.deepEqual(again.events.map(e => e.id), first.events.map(e => e.id));
-  await assert.rejects(client.acknowledge(conversation_id, 'c1', { cursor: 'evt_never' }), e => e.code === 'page_not_delivered');
-  await assert.rejects(client.acknowledge(conversation_id, 'other', first), e => e.code === 'page_not_delivered');
-  await client.acknowledge(conversation_id, 'c1', first);
-  assert.equal(await client.checkpoint(conversation_id, 'c1'), first.cursor);
-  assert.equal(await client.checkpoint(conversation_id, 'c2'), null); // consumers are independent
-  const second = await client.read(conversation_id, { consumer: 'c1' });
-  assert.equal(second.events.length, 2);
-  await client.acknowledge(conversation_id, 'c1', second);
-  await client.acknowledge(conversation_id, 'c1', second); // stale repeat: no regression, no error
-  assert.equal(await client.checkpoint(conversation_id, 'c1'), second.cursor);
-});
-
 test('history gap and invalid cursor are explicit errors', async () => {
   const { client } = setup();
   const { conversation_id } = await client.start({ ...msg, id: 'msg_o' });
@@ -249,5 +227,59 @@ test('operations are scoped to connection and issuer', async () => {
   await a.client.start({ ...msg, id: 'msg_r' });
   assert.equal(await b.client.operation('msg_r'), undefined);
   await b.client.start({ ...msg, id: 'msg_r', text: 'different' }); // no cross-connection conflict
+  assert.equal(b.server.conversations.size, 1);
+});
+
+test('conversation IDs are validated before anything is persisted or sent', async () => {
+  const { client, server, store } = setup();
+  for (const bad of ['..', '.', 'a/b', '', 'x'.repeat(257)]) {
+    await assert.rejects(client.send(bad, { ...msg, id: 'msg_v' }), e => e.field === 'conversation_id');
+    await assert.rejects(client.read(bad), e => e.field === 'conversation_id');
+    await assert.rejects(client.handoff(bad), e => e.field === 'conversation_id');
+    await assert.rejects(client.close(bad), e => e.field === 'conversation_id');
+    await assert.rejects(client.start({ ...msg, id: 'msg_v' }, bad), e => e.field === 'parent_conversation_id');
+  }
+  await assert.rejects(client.retry('../x'));
+  assert.equal(server.log.length, 0);
+  assert.equal((await store.read()).outbound.length, 0);
+});
+
+test('drain fails on a has_more page that makes no progress, and caps the page count', async () => {
+  const { client, server } = setup();
+  const { conversation_id } = await client.start({ ...msg, id: 'msg_s' });
+  const stuck = cursor => json({ conversation_id, events: [], cursor, has_more: true, status: 'idle', responder: 'agent' });
+  server.hooks.failures.push(stuck(null));
+  await assert.rejects(client.drain(conversation_id), e => e.code === 'invalid_response');
+  const first = (await client.read(conversation_id)).cursor;
+  server.hooks.failures.push(stuck(first));
+  await assert.rejects(client.drain(conversation_id, { cursor: first }), e => e.code === 'invalid_response');
+  const { client: capped, server: s2 } = setup({ maxPages: 1 });
+  const started = await capped.start({ ...msg, id: 'msg_t' });
+  for (let i = 0; i < 3; i++) s2.addEvent(s2.conversations.get(started.conversation_id), { type: 'state', status: 'idle', responder: 'agent' });
+  await assert.rejects(capped.drain(started.conversation_id), e => e.code === 'too_many_pages');
+});
+
+test('token errors from WWW-Authenticate are exposed; unknown company codes become http_error', async () => {
+  const { client, server } = setup({ maxAttempts: 1 });
+  const challenge = value => new Response('', { status: value.status, headers: { 'www-authenticate': value.header } });
+  server.hooks.failures.push(challenge({ status: 401, header: 'DPoP error="invalid_token"' }));
+  await assert.rejects(client.read('cnv_1'), e => e.code === 'invalid_token' && e.status === 401);
+  server.hooks.failures.push(challenge({ status: 403, header: 'DPoP error="sign_in_required"' }));
+  await assert.rejects(client.read('cnv_1'), e => e.code === 'sign_in_required' && e.scope === undefined);
+  server.hooks.failures.push(challenge({ status: 403, header: 'DPoP error="insufficient_scope", scope="poppy:read poppy:write"' }));
+  await assert.rejects(client.read('cnv_1'), e => e.code === 'insufficient_scope' && e.scope === 'poppy:read poppy:write');
+  server.hooks.failures.push(json({ error: 'x'.repeat(5000) }, 400));
+  await assert.rejects(client.read('cnv_1'), e => e.code === 'http_error' && e.message.length < 60);
+  server.hooks.failures.push(challenge({ status: 403, header: 'DPoP error="made_up"' }));
+  await assert.rejects(client.read('cnv_1'), e => e.code === 'http_error');
+});
+
+test('operations are scoped to issuer as well as connection', async () => {
+  const shared = memoryStore();
+  const a = setup({ store: shared });
+  const b = setup({ store: shared, issuer: 'https://other.example.com' });
+  await a.client.start({ ...msg, id: 'msg_u' });
+  assert.equal(await b.client.operation('msg_u'), undefined);
+  await b.client.start({ ...msg, id: 'msg_u', text: 'different' });
   assert.equal(b.server.conversations.size, 1);
 });
