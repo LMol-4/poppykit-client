@@ -1,4 +1,4 @@
-// Independent fake Company (discovery, token and authorization endpoints, conversation resource), written from spec 3, 4.1-4.5.
+// Independent fake Company (discovery, token, authorization and revocation endpoints, conversation resource), written from spec 3, 4.1-4.5, 4.8-4.9.
 import { compactVerify, decodeProtectedHeader, importJWK, calculateJwkThumbprint } from 'jose';
 import { createHash, randomUUID } from 'node:crypto';
 
@@ -16,7 +16,8 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
   const authorizationEndpoint = `${issuer}/authorize`;
   const company = {
     domain, issuer, tokenEndpoint, endpoint, authorizationEndpoint, codes: new Map(), grants: new Map(),
-    behavior: { requireNonce: false, rotateNonceEveryTime: false, tokenOverride: null, tokenError: null, resourceHandler: null },
+    behavior: { requireNonce: false, rotateNonceEveryTime: false, tokenOverride: null, tokenError: null, resourceHandler: null, rotate: true, revokeStatus: 200 },
+    revocations: [],
     requests: [], assertions: [], proofs: [],
     sessions: new Map(), tokens: new Map(), seenAssertionJti: new Set(), seenProofJti: new Set(), nonce: null,
   };
@@ -95,9 +96,55 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     if (session.account && session.account !== grant.account) throw new Reject(400, 'account_mismatch');
     session.account = grant.account;
     const refreshToken = `pat_${randomUUID()}`, accessToken = `tok_${randomUUID()}`;
-    company.grants.set(refreshToken, { account: grant.account, scopes: grant.scopes, sessionId: form.get('session_id') });
-    company.tokens.set(accessToken, { jkt, sessionId: form.get('session_id'), sub: session.sub, account: grant.account, scopes: grant.scopes, resource: grant.resource, expires: now() + 3600_000 });
+    company.grants.set(refreshToken, { family: refreshToken, account: grant.account, scopes: grant.scopes, revoked: false, rotated: false });
+    session.family = refreshToken;
+    company.tokens.set(accessToken, { jkt, sessionId: form.get('session_id'), sub: session.sub, account: grant.account, scopes: grant.scopes, resource: grant.resource, family: refreshToken, expires: now() + 3600_000 });
     return json(200, { access_token: accessToken, token_type: 'DPoP', expires_in: 3600, refresh_token: refreshToken, refresh_token_expires_in: 2592000, scope: grant.scopes.join(' '), session_id: form.get('session_id'), signed_in: true, ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });
+  }
+
+  // Revoking a grant signs out every Session signed in with it; they continue signed out (spec 4.9).
+  function revokeFamily(family) {
+    for (const grant of company.grants.values()) if (grant.family === family) grant.revoked = true;
+    for (const session of company.sessions.values()) if (session.family === family) session.family = null;
+    for (const token of company.tokens.values()) if (token.family === family) token.expires = 0;
+  }
+
+  // Account Token refresh (spec 4.8), rotating on success; presenting an already-rotated token is reuse and revokes the whole grant (RFC 9700 4.14.2).
+  async function refresh(request, form) {
+    await company.verifyAssertion(form.get('client_assertion'), 'client');
+    const jkt = await verifyProof(request);
+    const presented = form.get('refresh_token');
+    const grant = company.grants.get(presented);
+    if (!grant || grant.revoked) throw new Reject(400, 'invalid_grant');
+    if (grant.rotated) { revokeFamily(grant.family); throw new Reject(400, 'invalid_grant'); }
+    const sessionId = form.get('session_id');
+    const session = company.sessions.get(sessionId);
+    if (!session) throw new Reject(400, 'invalid_session');
+    if (session.account && session.account !== grant.account) throw new Reject(400, 'account_mismatch');
+    const scopes = form.has('scope') ? form.get('scope').split(' ') : grant.scopes;
+    if (!scopes.every(scope => grant.scopes.includes(scope))) throw new Reject(400, 'invalid_scope');
+    session.account = grant.account; session.family = grant.family;
+    const body = { token_type: 'DPoP', expires_in: 3600, scope: scopes.join(' '), session_id: sessionId, signed_in: true };
+    if (company.behavior.rotate) {
+      body.refresh_token = `pat_${randomUUID()}`;
+      company.grants.set(body.refresh_token, { ...grant });
+      grant.rotated = true;
+    }
+    body.access_token = `tok_${randomUUID()}`;
+    company.tokens.set(body.access_token, { jkt, sessionId, sub: session.sub, account: grant.account, scopes, resource: form.get('resource'), family: grant.family, expires: now() + 3600_000 });
+    return json(200, { ...body, ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });
+  }
+
+  // RFC 7009 revocation with client authentication; unknown tokens still get 200.
+  async function revoke(request) {
+    const form = new URLSearchParams(await request.text());
+    if (form.get('client_assertion_type') !== CLIENT_ASSERTION || form.get('client_id') !== clientId) throw new Reject(400, 'invalid_request');
+    await company.verifyAssertion(form.get('client_assertion'), 'client');
+    company.revocations.push({ token: form.get('token'), hint: form.get('token_type_hint'), dpop: request.headers.has('dpop') });
+    if (company.behavior.revokeStatus !== 200) return json(company.behavior.revokeStatus, { error: 'temporarily_unavailable' });
+    const grant = company.grants.get(form.get('token'));
+    if (grant) revokeFamily(grant.family);
+    return new Response(null, { status: 200 });
   }
 
   async function token(request) {
@@ -105,6 +152,7 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     const form = new URLSearchParams(await request.text());
     if (form.get('client_assertion_type') !== CLIENT_ASSERTION || form.get('client_id') !== clientId) throw new Reject(400, 'invalid_request');
     if (form.get('grant_type') === 'authorization_code') return exchangeCode(request, form);
+    if (form.get('grant_type') === 'refresh_token') return refresh(request, form);
     if (form.get('grant_type') !== JWT_BEARER) throw new Reject(400, 'unsupported_grant_type');
     await company.verifyAssertion(form.get('client_assertion'), 'client');
     const assertion = await company.verifyAssertion(form.get('assertion'), 'session');
@@ -140,6 +188,7 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
       if (url.href === `https://${domain}/.well-known/poppy.json`) return json(200, { protocol_version: '0.2', organization: { name, domain }, auth: { issuer, direct: { scopes: directScopes } }, agent: { protocols: [{ type: 'other', endpoint: `https://api.${domain}/other` }, { type: 'poppy', endpoint, ...(conversationResource ? { resource: conversationResource } : {}) }] } });
       if (url.href === `https://auth.${domain}/.well-known/oauth-authorization-server${issuerPath}`) return json(200, { issuer, token_endpoint: tokenEndpoint, revocation_endpoint: `${issuer}/revoke`, authorization_endpoint: authorizationEndpoint, poppy_domains: [domain] });
       if (url.href === tokenEndpoint && request.method === 'POST') return await token(request);
+      if (url.href === `${issuer}/revoke` && request.method === 'POST') return await revoke(request);
       if (url.origin === `https://api.${domain}`) return await resource(request);
       return json(404, { error: 'not_found' });
     } catch (error) {
