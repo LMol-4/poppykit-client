@@ -13,13 +13,14 @@ const ES256 = { name: 'ECDSA', hash: 'SHA-256' };
 function memoryStore(initial = initialClientAuthState()) {
   let state = structuredClone(initial); let chain = Promise.resolve();
   const store = {
-    crashNext: false,
+    crashNext: false, crashIn: 0, // crashIn = n fails the nth transaction from now
     get raw() { return state; },
     async read() { return structuredClone(state); },
     transaction(change) {
       const run = chain.then(() => {
         // Simulates the process dying before commit.
         if (store.crashNext) { store.crashNext = false; throw new Error('crash'); }
+        if (store.crashIn && --store.crashIn === 0) throw new Error('crash');
         const draft = structuredClone(state); const result = change(draft);
         if (result && typeof result.then === 'function') throw new Error('async transaction');
         state = draft; return structuredClone(result);
@@ -313,7 +314,7 @@ test('state is bound to one namespace owner', async () => {
 });
 
 test('a reset between token issuance and activation does not attach the session', async () => {
-  const { auth, company, store } = await setup();
+  const { auth, company, store, secrets } = await setup();
   await auth.start(company.domain);
   const transaction = store.transaction.bind(store);
   let reset = false;
@@ -321,6 +322,8 @@ test('a reset between token issuance and activation does not attach the session'
   company.handle = async (request, options) => { const response = await originalFetch(request, options); if (request.url === company.tokenEndpoint && !reset) { reset = true; await transaction(state => { Object.assign(state, initialClientAuthState(), { owner: state.owner }); }); } return response; };
   await assert.rejects(auth.start(company.domain), code('state_changed'));
   assert.deepEqual(store.raw.connections, {});
+  // The fenced-out session token was never referenced, so it is removed rather than orphaned.
+  assert.equal([...secrets.map.values()].filter(value => company.tokens.has(value)).length, 1);
 });
 
 test('a renewal answered for a different session is rejected and leaves the slots unchanged', async () => {
@@ -518,6 +521,11 @@ test('partial consent keeps the previous grant and parks the new Account Token f
   assert.equal(cleanup.status, 'pending'); assert.equal(cleanup.revocationEndpoint, `${company.issuer}/revoke`);
   assert.equal(secrets.map.get(cleanup.secretRef), [...company.grants.keys()].at(-1));
   assert.equal((await auth.authorizedFetch(connection.id, conversations(company), await auth.target(connection.id), ['poppy:read'])).status, 200);
+  // The parked token is revoked on request while the connection stays signed in.
+  const cleaned = await auth.retryCleanup(connection.id);
+  assert.deepEqual([cleaned.cleanup, cleaned.connection.status], ['complete', 'signed_in']);
+  assert.deepEqual(company.revocations.map(item => item.token), [[...company.grants.keys()].at(-1)]);
+  assert.deepEqual(store.raw.cleanup, {}); assert.equal(secrets.map.has(cleanup.secretRef), false);
   // A signed-out connection that gets partial consent stays signed out.
   const other = await auth.start(company.domain);
   const none = await signIn(auth, company, other.connection.id, { scopes: ['poppy:read', 'poppy:write'], approve: ['poppy:write'] });
@@ -525,16 +533,18 @@ test('partial consent keeps the previous grant and parks the new Account Token f
 });
 
 test('a scope upgrade replaces the grant and parks the old one; old slots stop being selectable', async () => {
-  const { auth, company, store } = await setup();
+  const { auth, company, store, secrets } = await setup();
   const { connection } = await auth.start(company.domain);
   await signIn(auth, company, connection.id, { scopes: ['poppy:read'] });
   const oldGrant = store.raw.connections[connection.id].grantId;
+  const oldSlots = Object.values(store.raw.connections[connection.id].slots).map(slot => slot.secretRef);
   const upgraded = await signIn(auth, company, connection.id, { scopes: ['poppy:read', 'poppy:write'] });
   assert.equal(upgraded.status, 'completed'); assert.deepEqual(upgraded.connection.scopes, ['poppy:read', 'poppy:write']);
   const record = store.raw.connections[connection.id];
   assert.notEqual(record.grantId, oldGrant); assert.equal(store.raw.grants[oldGrant], undefined);
   assert.deepEqual(Object.keys(store.raw.cleanup), [`cln_${oldGrant}`]);
   assert.equal(Object.keys(record.slots).length, 1);
+  assert.ok(oldSlots.every(ref => !secrets.map.has(ref)));
 });
 
 test('failed replacement keeps the old connection; a different account on the same session is refused', async () => {
@@ -655,4 +665,232 @@ test('sign-in requests the conversation resource so the signed-in token works th
   assert.deepEqual(Object.keys(store.raw.connections[connection.id].slots), [JSON.stringify([connection.sessionId, target.resource])]);
   const body = await (await auth.authorizedFetch(connection.id, conversations(company), target, ['poppy:read'])).json();
   assert.equal(body.account, 'acct_1');
+});
+
+async function signedIn(options = {}) {
+  const context = await setup(options);
+  const { connection } = await context.auth.start(context.company.domain);
+  assert.equal((await signIn(context.auth, context.company, connection.id, { scopes: ['poppy:read', 'poppy:write'] })).status, 'completed');
+  return { ...context, id: connection.id, sessionId: connection.sessionId, target: await context.auth.target(connection.id) };
+}
+const tokenForms = company => {
+  const forms = []; const original = company.handle;
+  company.handle = async (request, init) => { if (request.url === company.tokenEndpoint) forms.push(new URLSearchParams(await request.clone().text())); return original(request, init); };
+  return forms;
+};
+const grantOf = (store, id) => store.raw.grants[store.raw.connections[id].grantId];
+const loseTokenResponses = (transport, company) => {
+  const original = transport.fetch;
+  transport.fetch = async (request, init) => { const response = await original(request, init); if (request.url === company.tokenEndpoint) throw new Error('socket hang up'); return response; };
+  return () => { transport.fetch = original; };
+};
+
+test('refresh rotates the Account Token once for parallel requests and keeps other resources\' slots', async () => {
+  const { auth, company, store, secrets, clock, id, sessionId, target } = await signedIn();
+  const forms = tokenForms(company);
+  const other = 'https://api.shop.test/other';
+  const extra = await auth.renew(id, { resource: other, scopes: ['poppy:read'] });
+  assert.deepEqual([extra.status, extra.connection.status], ['completed', 'signed_in']);
+  assert.deepEqual([forms[0].get('grant_type'), forms[0].get('resource'), forms[0].get('scope'), forms[0].get('session_id')], ['refresh_token', other, 'poppy:read', sessionId]);
+  assert.equal(forms[0].has('assertion'), false); assert.ok(forms[0].get('client_assertion'));
+  const before = structuredClone(store.raw);
+  const grant = grantOf({ raw: before }, id);
+  const oldToken = secrets.map.get(grant.secretRef);
+  const otherKey = JSON.stringify([sessionId, other]), defaultKey = JSON.stringify([sessionId, null]);
+  clock.t += 3600_000;
+  const responses = await Promise.all([1, 2, 3, 4].map(() => auth.authorizedFetch(id, conversations(company), target, ['poppy:write'])));
+  assert.deepEqual(responses.map(response => response.status), [200, 200, 200, 200]);
+  assert.equal(forms.length, 2, 'one refresh for four parallel requests');
+  assert.equal(forms[1].get('refresh_token'), oldToken); assert.equal(forms[1].has('resource'), false); assert.equal(forms[1].has('scope'), false);
+  const after = grantOf(store, id);
+  assert.notEqual(after.secretRef, grant.secretRef); assert.equal(secrets.map.has(grant.secretRef), false);
+  assert.equal(company.grants.get(secrets.map.get(after.secretRef)).rotated, false);
+  assert.deepEqual([after.operationId, after.generation, after.status], [null, grant.generation + 1, 'active']);
+  const slots = store.raw.connections[id].slots;
+  assert.deepEqual(Object.keys(slots).sort(), [defaultKey, otherKey].sort());
+  assert.deepEqual(slots[otherKey], before.connections[id].slots[otherKey]);
+  assert.equal(secrets.map.has(before.connections[id].slots[defaultKey].secretRef), false);
+  // Completed renewals do not accumulate.
+  assert.equal(Object.values(store.raw.operations).filter(op => op.kind === 'renew').length, 1);
+});
+
+test('one rotation per grant: a second process gets the pending operation', async () => {
+  const { auth, company, options, id } = await signedIn();
+  const second = createClientAuth(options);
+  let inner; const original = company.handle;
+  company.handle = async (request, init) => { if (request.url === company.tokenEndpoint && !inner) inner = await second.renew(id); return original(request, init); };
+  const outcome = await auth.renew(id);
+  assert.equal(outcome.status, 'completed');
+  assert.deepEqual([inner.status, inner.nextAction, inner.operationId], ['pending', 'wait', outcome.operationId]);
+  assert.equal(exchanges(company), 3);
+  assert.equal((await second.renew(id)).status, 'completed');
+});
+
+test('renew validates input and a definite refusal releases the grant', async () => {
+  const { auth, company, store, id } = await signedIn();
+  for (const [input, expected] of [[{ scopes: ['admin'] }, 'invalid_scope'], [{ scopes: [] }, 'invalid_scope'], [{ scopes: 'poppy:read' }, 'invalid_scope'], [{ resource: 'not a url' }, 'invalid_target']]) {
+    await assert.rejects(auth.renew(id, input), code(expected), JSON.stringify(input));
+  }
+  await assert.rejects(auth.renew('con_missing'), code('unknown_connection'));
+  assert.equal(exchanges(company), 2);
+  company.behavior.tokenError = { status: 400, body: { error: 'invalid_session', error_description: 'secret-diagnostic' } };
+  const refused = await auth.renew(id);
+  assert.deepEqual([refused.status, refused.error, refused.connection.status], ['failed', 'invalid_session', 'signed_in']);
+  assert.equal(JSON.stringify(refused).includes('secret-diagnostic'), false);
+  assert.deepEqual([grantOf(store, id).operationId, grantOf(store, id).status], [null, 'active']);
+  company.behavior.tokenError = null;
+  assert.equal((await auth.renew(id)).status, 'completed');
+  // A signed-out connection renews with its assertion and cannot ask for account scopes.
+  const { connection } = await auth.start(company.domain);
+  const slot = Object.values(store.raw.connections[connection.id].slots)[0];
+  assert.equal((await auth.renew(connection.id)).status, 'completed');
+  assert.notEqual(Object.values(store.raw.connections[connection.id].slots)[0].secretRef, slot.secretRef);
+  await assert.rejects(auth.renew(connection.id, { scopes: ['poppy:read'] }), code('invalid_scope'));
+});
+
+test('a lost rotation response is uncertain; the old Account Token is never resent', async () => {
+  const { auth, company, transport, store, secrets, clock, id, target } = await signedIn();
+  const oldToken = secrets.map.get(grantOf(store, id).secretRef);
+  const restore = loseTokenResponses(transport, company);
+  const lost = await auth.renew(id);
+  restore();
+  assert.deepEqual([lost.status, lost.error, lost.nextAction, lost.connection.status], ['uncertain', 'lost_response', 'sign_in', 'uncertain']);
+  assert.equal(company.grants.get(oldToken).rotated, true, 'the issuer did rotate');
+  const sent = exchanges(company);
+  await assert.rejects(auth.renew(id), code('grant_uncertain'));
+  clock.t += 3600_000;
+  await assert.rejects(auth.authorizedFetch(id, conversations(company), target, ['poppy:read']), code('grant_uncertain'));
+  assert.equal(exchanges(company), sent);
+  // Only a fresh sign-in recovers; it retires the uncertain grant.
+  const fresh = await signIn(auth, company, id, { scopes: ['poppy:read'] });
+  assert.deepEqual([fresh.status, fresh.connection.status], ['completed', 'signed_in']);
+  assert.equal(Object.values(store.raw.cleanup).length, 1);
+  // Revoking the token we hold cannot prove the unseen successor is gone.
+  const out = await auth.signOut(id);
+  assert.deepEqual([out.connection.status, out.cleanup], ['disconnected', 'uncertain']);
+  assert.equal(company.revocations.length, 2); assert.ok(company.revocations.some(item => item.token === oldToken));
+});
+
+test('presenting an already-rotated Account Token revokes the grant; the session continues signed out', async () => {
+  const { auth, company, transport, store, secrets, options, id, target } = await signedIn();
+  // A copy of the state from before the rotation, as a process that missed it would hold.
+  const staleStore = memoryStore(store.raw); const staleSecrets = memorySecrets();
+  for (const [ref, value] of secrets.map) staleSecrets.map.set(ref, value);
+  const restore = loseTokenResponses(transport, company);
+  assert.equal((await auth.renew(id)).status, 'uncertain');
+  restore();
+  const stale = createClientAuth({ ...options, store: staleStore, secrets: staleSecrets });
+  const reused = await stale.renew(id);
+  assert.deepEqual([reused.status, reused.error, reused.connection.status, reused.connection.scopes], ['failed', 'invalid_grant', 'signed_out', []]);
+  assert.ok([...company.grants.values()].every(grant => grant.revoked), 'reuse revoked the successor too');
+  assert.deepEqual(staleStore.raw.grants, {}); assert.deepEqual(staleStore.raw.connections[id].slots, {});
+  const codes = company.codes.size;
+  const response = await stale.authorizedFetch(id, conversations(company), target);
+  assert.equal(response.status, 200); assert.equal((await response.json()).account, null);
+  await assert.rejects(stale.authorizedFetch(id, conversations(company), target, ['poppy:read']), code('insufficient_scope'));
+  assert.equal(company.codes.size, codes, 'no sign-in was started');
+  assert.equal((await stale.renew(id)).connection.status, 'signed_out');
+});
+
+test('sign-out disconnects first, revokes with a client assertion and never signs in again', async () => {
+  const { auth, company, store, secrets, id, target } = await signedIn();
+  const refreshToken = secrets.map.get(grantOf(store, id).secretRef);
+  const generation = store.raw.connections[id].generation;
+  const out = await auth.signOut(id);
+  assert.deepEqual([out.connection.status, out.cleanup, out.connection.generation, out.connection.scopes], ['disconnected', 'complete', generation + 1, []]);
+  assert.deepEqual(company.revocations, [{ token: refreshToken, hint: 'refresh_token', dpop: false }]);
+  const assertion = company.assertions.at(-1);
+  assert.deepEqual([assertion.kind, assertion.payload.aud, assertion.payload.sub], ['client', company.issuer, CLIENT_ID]);
+  assert.deepEqual(store.raw.grants, {}); assert.deepEqual(store.raw.cleanup, {}); assert.deepEqual(store.raw.connections[id].slots, {});
+  assert.equal(secrets.map.size, 1, 'only the DPoP key remains');
+  await assert.rejects(auth.authorizedFetch(id, conversations(company), target), code('disconnected'));
+  await assert.rejects(auth.renew(id), code('disconnected'));
+  await assert.rejects(auth.beginSignIn(id, { scopes: ['poppy:read'], redirectUri: REDIRECT, browserBinding: BROWSER }), code('sign_in_unavailable'));
+  assert.deepEqual(await auth.recover(), []);
+  const again = await auth.signOut(id);
+  assert.deepEqual(again, out); assert.equal(company.revocations.length, 1);
+  await assert.rejects(auth.signOut('con_missing'), code('unknown_connection'));
+});
+
+test('sign-out cancels a pending sign-in; its late callback cannot connect', async () => {
+  const { auth, company } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const { begun, callbackUrl } = await beginAndApprove(auth, company, connection.id);
+  assert.equal((await auth.signOut(connection.id)).cleanup, 'complete');
+  assert.equal((await auth.operation(begun.operationId)).status, 'cancelled');
+  assert.equal((await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER })).status, 'cancelled');
+  assert.equal(exchanges(company), 1);
+});
+
+test('revocation failure leaves the connection disconnected with cleanup pending until retry', async () => {
+  const { auth, company, transport, store, secrets, id } = await signedIn();
+  company.behavior.revokeStatus = 503;
+  const out = await auth.signOut(id);
+  assert.deepEqual([out.connection.status, out.cleanup], ['disconnected', 'pending']);
+  const [parked] = Object.values(store.raw.cleanup);
+  assert.equal(parked.status, 'pending'); assert.ok(secrets.map.has(parked.secretRef));
+  transport.fail = true;
+  assert.equal((await auth.retryCleanup(id)).cleanup, 'pending');
+  transport.fail = false; company.behavior.revokeStatus = 200;
+  const done = await auth.retryCleanup(id);
+  assert.deepEqual([done.connection.status, done.cleanup], ['disconnected', 'complete']);
+  assert.equal(company.revocations.length, 2); assert.equal(secrets.map.has(parked.secretRef), false);
+  // A parked token whose secret was lost can never be revoked; that is uncertain, not complete.
+  const other = await signedIn();
+  const ref = grantOf(other.store, other.id).secretRef;
+  other.company.behavior.revokeStatus = 503;
+  await other.auth.signOut(other.id);
+  other.secrets.map.delete(ref);
+  assert.equal((await other.auth.retryCleanup(other.id)).cleanup, 'uncertain');
+});
+
+test('sign-out during a refresh wins; the late rotated token is parked and revoked', async () => {
+  const { auth, company, store, secrets, id } = await signedIn();
+  let during; const original = company.handle;
+  company.handle = async (request, init) => { const response = await original(request, init); if (request.url === company.tokenEndpoint && !during) during = await auth.signOut(id); return response; };
+  const late = await auth.renew(id);
+  assert.deepEqual([late.status, late.error, late.connection.status], ['failed', 'state_changed', 'disconnected']);
+  assert.deepEqual([during.connection.status, during.cleanup], ['disconnected', 'pending']);
+  const [parked] = Object.values(store.raw.cleanup);
+  assert.ok(company.grants.has(secrets.map.get(parked.secretRef)), 'the rotated token awaits revocation');
+  assert.deepEqual(store.raw.connections[id].slots, {});
+  assert.equal((await auth.retryCleanup(id)).cleanup, 'complete');
+  assert.equal(secrets.map.size, 1);
+});
+
+test('sign-out during a code exchange wins; the late grant cannot activate', async () => {
+  const { auth, company, store, secrets } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const { callbackUrl } = await beginAndApprove(auth, company, connection.id);
+  let during; const original = company.handle;
+  company.handle = async (request, init) => { const response = await original(request, init); if (request.url === company.tokenEndpoint && !during) during = await auth.signOut(connection.id); return response; };
+  const outcome = await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER });
+  assert.deepEqual([outcome.status, outcome.error, outcome.connection.status], ['failed', 'state_changed', 'disconnected']);
+  assert.equal(during.cleanup, 'pending');
+  assert.deepEqual(store.raw.grants, {}); assert.equal(Object.keys(store.raw.cleanup).length, 1);
+  assert.equal((await auth.retryCleanup(connection.id)).cleanup, 'complete');
+  assert.equal(secrets.map.size, 1);
+});
+
+test('a crash after the refresh response: staged finishes on recovery, unstaged is uncertain', async () => {
+  for (const [crashIn, expected] of [[1, 'uncertain'], [2, 'completed']]) {
+    const store = memoryStore(); const secrets = memorySecrets();
+    const { auth, company, options, id, target } = await signedIn({ store, secrets });
+    const original = company.handle;
+    company.handle = async (request, init) => { const response = await original(request, init); if (request.url === company.tokenEndpoint) store.crashIn = crashIn; return response; };
+    await assert.rejects(auth.renew(id), /crash/);
+    company.handle = original;
+    const [operation] = Object.values(store.raw.operations).filter(op => op.kind === 'renew');
+    assert.equal(operation.phase, crashIn === 1 ? 'dispatched' : 'staged');
+    const restarted = createClientAuth(options);
+    const recovered = await restarted.recover();
+    assert.deepEqual(recovered.map(item => [item.operationId, item.status]), [[operation.id, expected]]);
+    assert.equal(exchanges(company), 3, 'recovery never refreshes again');
+    if (expected === 'completed') {
+      assert.equal(grantOf(store, id).secretRef, operation.staged.refreshRef);
+      assert.equal((await restarted.authorizedFetch(id, conversations(company), target, ['poppy:read'])).status, 200);
+    } else {
+      assert.deepEqual([grantOf(store, id).status, store.raw.connections[id].status], ['uncertain', 'uncertain']);
+    }
+  }
 });
