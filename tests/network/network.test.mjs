@@ -147,3 +147,19 @@ test('assertion and DPoP claim codecs enforce spec shapes and keep unknown claim
   assert.deepEqual(wire.parseDpopClaims(proof), proof);
   for (const bad of [{ htu: 'https://api.example.com/o?x=1' }, { htu: 'https://api.example.com/o#f' }, { htu: 'http://api.example.com/' }, { htm: 1 }, { iat: 0 }, { ath: 5 }]) assert.throws(() => wire.parseDpopClaims({ ...proof, ...bad }), { name: 'ValidationError' });
 });
+test('every blocked range has a denied sample and a public neighbour', () => {
+  const table = [
+    ['0.1.2.3', false], ['1.0.0.1', true], ['10.255.255.255', false], ['11.0.0.1', true],
+    ['100.64.0.1', false], ['100.128.0.1', true], ['127.0.0.2', false], ['128.0.0.1', true],
+    ['169.254.169.254', false], ['169.255.0.1', true], ['172.16.0.1', false], ['172.32.0.1', true],
+    ['192.0.0.9', false], ['192.0.1.1', true], ['192.0.2.7', false], ['192.88.99.1', false],
+    ['192.168.0.1', false], ['192.169.0.1', true], ['198.18.0.1', false], ['198.20.0.1', true],
+    ['198.51.100.9', false], ['198.51.101.1', true], ['203.0.113.9', false], ['203.0.114.1', true],
+    ['224.0.0.1', false], ['255.255.255.255', false], ['223.255.255.255', true],
+    ['2606:4700::1', true], ['2000::1', true], ['1fff::1', false], ['4000::1', false],
+    ['2001::1', false], ['2001:1ff::1', false], ['2001:200::1', true], ['2001:db8::1', false],
+    ['2002::1', false], ['3fff::1', false], ['3fff:1000::1', true], ['::', false], ['::1', false],
+    ['::ffff:8.8.8.8', false], ['fe80::1', false], ['fc00::1', false], ['ff02::1', false],
+  ];
+  for (const [address, expected] of table) assert.equal(isPublicAddress(address), expected, address);
+});
