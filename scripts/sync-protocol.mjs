@@ -1,6 +1,6 @@
 // Copies shared protocol code (src/protocol, src/network, tests/network) into the server repo.
 // Usage: node scripts/sync-protocol.mjs <server-repo-path> [--check]
-import { cpSync, readdirSync, readFileSync, rmSync, mkdirSync, existsSync } from 'node:fs';
+import { cpSync, readdirSync, readFileSync, rmSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
 import { join, dirname, resolve, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -8,6 +8,7 @@ const [target, flag, ...rest] = process.argv.slice(2);
 if (!target || (flag && flag !== '--check') || rest.length) { console.error('usage: sync-protocol.mjs <server-repo-path> [--check]'); process.exit(2); }
 const source = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const destination = resolve(target);
+if (existsSync(destination) && realpathSync(destination) === realpathSync(source)) { console.error('destination is the source repo'); process.exit(2); }
 if (!existsSync(join(destination, 'package.json'))) { console.error('not a repo: ' + destination); process.exit(2); }
 const shared = ['src/protocol', 'src/network', 'tests/network'];
 const list = dir => existsSync(dir) ? readdirSync(dir, { recursive: true, withFileTypes: true }).filter(e => e.isFile()).map(e => relative(dir, join(e.parentPath, e.name)).split(sep).join('/')).sort() : [];
