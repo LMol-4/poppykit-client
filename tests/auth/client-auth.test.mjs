@@ -10,6 +10,11 @@ const REDIRECT = 'https://agent.test/oauth/callback';
 const EC = { name: 'ECDSA', namedCurve: 'P-256' };
 const ES256 = { name: 'ECDSA', hash: 'SHA-256' };
 
+// Strict-JSON store check (INTERFACES v1.1): undefined values are rejected, as a SQLite/JSON store would.
+const assertJson = (value, path = '$') => {
+  if (value === undefined) throw new TypeError(`${path}: unsupported undefined`);
+  if (value && typeof value === 'object') for (const [k, v] of Object.entries(value)) assertJson(v, `${path}.${k}`);
+};
 function memoryStore(initial = initialClientAuthState()) {
   let state = structuredClone(initial); let chain = Promise.resolve();
   const store = {
@@ -23,7 +28,7 @@ function memoryStore(initial = initialClientAuthState()) {
         if (store.crashIn && --store.crashIn === 0) throw new Error('crash');
         const draft = structuredClone(state); const result = change(draft);
         if (result && typeof result.then === 'function') throw new Error('async transaction');
-        state = draft; return structuredClone(result);
+        assertJson(draft); state = draft; return structuredClone(result);
       });
       chain = run.catch(() => {}); return run;
     },

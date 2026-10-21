@@ -109,7 +109,7 @@ export function createConversationClient(options: ConversationClientOptions) {
     }
     const error = await failure(response);
     // direct_conversation_open lasts only until the Direct Conversation closes (spec 7.10), so the same message stays retryable.
-    if (definite(response.status) && error.code !== 'direct_conversation_open') await store.transaction(draft => { const r = draft.outbound.find(x => mine(x) && x.id === id)!; r.phase = 'rejected'; r.error = { code: error.code, status: response.status, conversationId: error.conversationId }; });
+    if (definite(response.status) && error.code !== 'direct_conversation_open') await store.transaction(draft => { const r = draft.outbound.find(x => mine(x) && x.id === id)!; r.phase = 'rejected'; r.error = { code: error.code, status: response.status, ...(error.conversationId === undefined ? {} : { conversationId: error.conversationId }) }; });
     throw error;
   }
 
@@ -124,7 +124,7 @@ export function createConversationClient(options: ConversationClientOptions) {
     await store.transaction(draft => {
       const existing = draft.outbound.find(r => mine(r) && r.id === message.id);
       if (!existing) {
-        draft.outbound.push({ connectionId, issuer, id: message.id, target, request, fingerprint, phase: 'pending', ...(read.wait === undefined && read.cursor === undefined ? {} : { read: { ...read } }) });
+        draft.outbound.push({ connectionId, issuer, id: message.id, target, request, fingerprint, phase: 'pending', ...(read.wait === undefined && read.cursor === undefined ? {} : { read: { ...(read.wait === undefined ? {} : { wait: read.wait }), ...(read.cursor === undefined ? {} : { cursor: read.cursor }) } }) });
         // Keep only the newest completed records (enough to dedupe a recent retry); pending ones always stay.
         let kept = 0;
         draft.outbound = draft.outbound.reverse().filter(r => r.phase === 'pending' || !mine(r) || ++kept <= keepCompleted).reverse();
