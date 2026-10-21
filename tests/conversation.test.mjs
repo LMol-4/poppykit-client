@@ -534,3 +534,11 @@ test('a definite rejection persists as strict JSON, is rejected, and is not rese
   await assert.rejects(client.retry('msg_closed'), e => e.code === 'conversation_closed');
   assert.equal(server.log.length, before);
 });
+
+test('start persists only wait and cursor as read, never parentConversationId or undefined', async () => {
+  const { client, store } = setup();
+  await client.start({ ...msg, id: 'msg_rd' }, { wait: 0, parentConversationId: undefined });
+  assert.deepEqual((await store.read()).outbound[0].read, { wait: 0 });
+  await client.start({ ...msg, id: 'msg_rd2' }, { wait: 0, parentConversationId: 'cnv_parent' });
+  assert.deepEqual((await store.read()).outbound[1].read, { wait: 0 });
+});

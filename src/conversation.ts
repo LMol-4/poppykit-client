@@ -124,7 +124,7 @@ export function createConversationClient(options: ConversationClientOptions) {
     await store.transaction(draft => {
       const existing = draft.outbound.find(r => mine(r) && r.id === message.id);
       if (!existing) {
-        draft.outbound.push({ connectionId, issuer, id: message.id, target, request, fingerprint, phase: 'pending', ...(read.wait === undefined && read.cursor === undefined ? {} : { read: { ...read } }) });
+        draft.outbound.push({ connectionId, issuer, id: message.id, target, request, fingerprint, phase: 'pending', ...(read.wait === undefined && read.cursor === undefined ? {} : { read: { ...(read.wait === undefined ? {} : { wait: read.wait }), ...(read.cursor === undefined ? {} : { cursor: read.cursor }) } }) });
         // Keep only the newest completed records (enough to dedupe a recent retry); pending ones always stay.
         let kept = 0;
         draft.outbound = draft.outbound.reverse().filter(r => r.phase === 'pending' || !mine(r) || ++kept <= keepCompleted).reverse();
