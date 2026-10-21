@@ -237,7 +237,7 @@ test('conversation IDs are validated before anything is persisted or sent', asyn
     await assert.rejects(client.read(bad), e => e.field === 'conversation_id');
     await assert.rejects(client.handoff(bad), e => e.field === 'conversation_id');
     await assert.rejects(client.close(bad), e => e.field === 'conversation_id');
-    await assert.rejects(client.start({ ...msg, id: 'msg_v' }, bad), e => e.field === 'parent_conversation_id');
+    await assert.rejects(client.start({ ...msg, id: 'msg_v' }, { parentConversationId: bad }), e => e.field === 'parent_conversation_id');
   }
   await assert.rejects(client.retry('../x'));
   assert.equal(server.log.length, 0);
@@ -307,4 +307,167 @@ test('WWW-Authenticate with several schemes and garbage map to the right code', 
   await assert.rejects(client.read('cnv_1'), e => e.code === 'invalid_token');
   server.hooks.failures.push(with_('@@@ ,,, "'));
   await assert.rejects(client.read('cnv_1'), e => e.code === 'http_error');
+});
+
+// ---- J16: consumers, checkpoints, POST wait, pruning ----
+const seed = async (client, server, n) => {
+  const { conversation_id } = await client.start({ ...msg, id: 'msg_seed' });
+  for (let i = 1; i < n; i++) server.addEvent(server.conversations.get(conversation_id), { type: 'state', status: 'idle', responder: 'agent' });
+  return conversation_id;
+};
+const ids = pages => pages.flatMap(p => p.events.map(e => e.id));
+const otherClient = (server, store, connectionId = 'conn1') => createConversationClient({ authorizedRequest: r => server.handle(r), endpoint: EP, connectionId, issuer: 'https://issuer.example.com', store, clock: { now: () => 0 }, sleep: async () => {} });
+
+test('retryAfter of a huge integer is Infinity and surfaces as the delay', async () => {
+  const { client, server, sleeps } = setup();
+  server.hooks.failures.push(json({ error: 'rate_limited' }, 429, { 'retry-after': '9'.repeat(30) }));
+  await assert.rejects(client.start({ ...msg, id: 'msg_huge' }), e => e.code === 'rate_limited' && e.retryAfterMs === Infinity);
+  assert.deepEqual(sleeps, []);
+});
+
+test('consumer checkpoint moves only on ack; reads and the iterator never acknowledge', async () => {
+  const { client, server, store } = setup();
+  const cid = await seed(client, server, 3);
+  const first = await client.read(cid, { consumer: 'worker' });
+  assert.equal(first.events.length, 2);
+  assert.deepEqual((await store.read()).consumers, []);
+  const again = await client.read(cid, { consumer: 'worker' }); // redelivery, not skipping
+  assert.deepEqual(ids([again]), ids([first]));
+  const seen = []; for await (const e of client.events(cid, { consumer: 'worker' })) seen.push(e.id);
+  assert.equal(seen.length, 3);
+  assert.deepEqual((await store.read()).consumers, []);
+  await client.ack(cid, 'worker', first);
+  assert.equal((await store.read()).consumers[0].cursor, first.cursor);
+  const next = await client.read(cid, { consumer: 'worker' });
+  assert.deepEqual(ids([next]), [seen[2]]);
+  assert.ok(server.log.at(-1).includes('cursor=' + first.cursor));
+});
+
+test('two reads before an ack: acking either delivered page works', async () => {
+  const { client, server, store } = setup();
+  const cid = await seed(client, server, 3);
+  const a = await client.read(cid, { consumer: 'w' });
+  const b = await client.read(cid, { consumer: 'w' });
+  await client.ack(cid, 'w', a);
+  await client.ack(cid, 'w', b);
+  assert.equal((await store.read()).consumers[0].cursor, b.cursor);
+});
+
+test('ack refuses pages not delivered to that consumer; cursor with consumer is rejected', async () => {
+  const { client, server, store } = setup();
+  const cid = await seed(client, server, 3);
+  const explicit = await client.read(cid);
+  await assert.rejects(client.ack(cid, 'w', explicit), e => e.code === 'invalid_request');
+  const page = await client.read(cid, { consumer: 'w' });
+  await assert.rejects(client.ack(cid, 'other', page), e => e.code === 'invalid_request');
+  await assert.rejects(client.ack(cid, 'w', { ...page }), e => e.code === 'invalid_request');
+  await assert.rejects(client.read(cid, { consumer: 'w', cursor: page.cursor }), e => e.code === 'invalid_request');
+  await assert.rejects(client.drain(cid, { consumer: 'w', cursor: page.cursor }), e => e.code === 'invalid_request');
+  await assert.rejects(client.read(cid, { consumer: 'bad name' }));
+  assert.deepEqual((await store.read()).consumers, []);
+});
+
+test('crash before ack redelivers after restart; an ack survives restart', async () => {
+  const { client, server, store } = setup();
+  const cid = await seed(client, server, 3);
+  const lost = await client.read(cid, { consumer: 'w' }); // process dies before ack
+  const second = otherClient(server, store);
+  const redelivered = await second.read(cid, { consumer: 'w' });
+  assert.deepEqual(ids([redelivered]), ids([lost]));
+  await second.ack(cid, 'w', redelivered);
+  const next = await otherClient(server, store).read(cid, { consumer: 'w' });
+  assert.equal(next.events.length, 1);
+  assert.notEqual(next.events[0].id, ids([lost])[0]);
+});
+
+test('two consumers keep independent checkpoints, also per connection', async () => {
+  const { client, server, store } = setup();
+  const cid = await seed(client, server, 3);
+  await client.ack(cid, 'a', await client.read(cid, { consumer: 'a' }));
+  assert.equal((await client.read(cid, { consumer: 'b' })).events.length, 2);
+  assert.equal((await client.read(cid, { consumer: 'a' })).events.length, 1);
+  assert.equal((await otherClient(server, store, 'conn2').read(cid, { consumer: 'a' })).events.length, 2);
+});
+
+test('cursor_expired is explicit, then resetConsumer recovers from retained history', async () => {
+  const { client, server, store } = setup();
+  const cid = await seed(client, server, 3);
+  await client.ack(cid, 'w', await client.read(cid, { consumer: 'w' }));
+  await store.transaction(d => { d.consumers[0].cursor = 'evt_gone'; });
+  await assert.rejects(client.read(cid, { consumer: 'w' }), e => e.code === 'cursor_expired');
+  await assert.rejects(client.read(cid, { consumer: 'w' }), e => e.code === 'cursor_expired'); // never silently restarted
+  await client.resetConsumer(cid, 'w');
+  assert.deepEqual((await store.read()).consumers, []);
+  assert.deepEqual(ids(await client.drain(cid, { consumer: 'w' })), ids(await client.drain(cid)));
+});
+
+test('narrow null cursor: accepted only for a first empty page, never sent, never acked', async () => {
+  const { client, server, store } = setup();
+  const empty = { conversation_id: 'cnv_1', events: [], cursor: null, has_more: false, status: 'idle', responder: 'agent' };
+  server.hooks.failures.push(json(empty));
+  const page = await client.read('cnv_1', { consumer: 'w' });
+  await client.ack('cnv_1', 'w', page);
+  assert.deepEqual((await store.read()).consumers, []);
+  assert.ok(!server.log.at(-1).includes('cursor'));
+  server.hooks.failures.push(json(empty));
+  await assert.rejects(client.read('cnv_1', { cursor: 'evt_1' }), e => e.code === 'invalid_response');
+  server.hooks.failures.push(json({ ...empty, has_more: true }));
+  await assert.rejects(client.read('cnv_1'), e => e.code === 'invalid_response');
+});
+
+test('POST wait and cursor return a page receipt; a repeat with other parameters does not resend', async () => {
+  const { client, server } = setup();
+  const { conversation_id } = await client.start({ ...msg, id: 'msg_first' });
+  const page = { conversation_id, events: [{ id: 'evt_9', type: 'state', created_at: '2026-10-19T10:00:00Z', status: 'idle', responder: 'agent' }], cursor: 'evt_9', has_more: false, status: 'idle', responder: 'agent' };
+  server.hooks.failures.push(json(page, 202));
+  const sent = await client.send(conversation_id, { ...msg, id: 'msg_w' }, { wait: 10, cursor: 'evt_1' });
+  assert.deepEqual(sent.events, page.events);
+  assert.ok(server.log.at(-1).endsWith('/messages?cursor=evt_1&wait=10'));
+  const before = server.log.length;
+  assert.deepEqual((await client.send(conversation_id, { ...msg, id: 'msg_w' }, { wait: 0 })).events, page.events);
+  assert.equal(server.log.length, before);
+  server.hooks.failures.push(json(page, 201));
+  await client.start({ ...msg, id: 'msg_sw' }, { wait: 3 });
+  assert.ok(server.log.at(-1).endsWith('/poppy/conversations?wait=3'));
+});
+
+test('POST wait: bad parameters and a non-page body are rejected', async () => {
+  const { client, server } = setup();
+  await assert.rejects(client.start({ ...msg, id: 'msg_n1' }, { wait: -1 }), e => e.code === 'invalid_request');
+  await assert.rejects(client.start({ ...msg, id: 'msg_n2' }, { wait: 1.5 }), e => e.code === 'invalid_request');
+  await assert.rejects(client.start({ ...msg, id: 'msg_n3' }, { cursor: 'a&b' }));
+  assert.equal(server.log.length, 0);
+  server.hooks.failures.push(json({ conversation_id: 'cnv_1', status: 'working', responder: 'agent' }, 201));
+  await assert.rejects(client.start({ ...msg, id: 'msg_n4' }, { wait: 2 }), e => e.code === 'invalid_response');
+  assert.equal((await client.operation('msg_n4')).phase, 'pending');
+});
+
+test('direct_conversation_open surfaces the conversation ID, also on later retry', async () => {
+  const { client, server } = setup();
+  const cid = await seed(client, server, 1);
+  server.hooks.failures.push(json({ error: 'direct_conversation_open', conversation_id: 'cnv_direct' }, 409));
+  await assert.rejects(client.send(cid, { ...msg, id: 'msg_d1' }), e => e.code === 'direct_conversation_open' && e.conversationId === 'cnv_direct');
+  await assert.rejects(client.retry('msg_d1'), e => e.code === 'direct_conversation_open' && e.conversationId === 'cnv_direct');
+  server.hooks.failures.push(json({ error: 'direct_conversation_open', conversation_id: 'bad id' }, 409));
+  await assert.rejects(client.handoff(cid), e => e.code === 'http_error' && e.conversationId === undefined);
+});
+
+test('close success returns the closed state', async () => {
+  const { client, server } = setup();
+  const cid = await seed(client, server, 1);
+  server.hooks.failures.push(json({ conversation_id: cid, status: 'closed', responder: 'agent' }));
+  assert.equal((await client.close(cid)).status, 'closed');
+  assert.ok(server.log.at(-1).startsWith('POST') && server.log.at(-1).endsWith(`/${cid}/close`));
+});
+
+test('completed outbound records are pruned to about the newest N; pending ones are kept', async () => {
+  const { client, server, store } = setup({ keepCompleted: 2 });
+  server.hooks.failures.push(json({ error: 'x' }, 500), json({ error: 'x' }, 500), json({ error: 'x' }, 500), json({ error: 'x' }, 500));
+  await assert.rejects(client.start({ ...msg, id: 'msg_pend' })); // stays pending
+  for (const i of [1, 2, 3, 4]) await client.start({ ...msg, id: `msg_p${i}` });
+  // N completed plus the one in flight at prune time
+  assert.deepEqual((await store.read()).outbound.map(r => r.id), ['msg_pend', 'msg_p2', 'msg_p3', 'msg_p4']);
+  const before = server.byMessage.size;
+  await client.start({ ...msg, id: 'msg_p4' }); // recent retry is still deduped locally
+  assert.equal(server.byMessage.size, before);
 });
