@@ -959,3 +959,30 @@ test('a 5xx or garbled code exchange answer is uncertain and the code is not res
     assert.deepEqual(store.raw.grants, {});
   }
 });
+
+// Another process settles the prepared refresh while this one reads the Account Token.
+async function interruptedRefresh(interrupt) {
+  {
+    const { auth, company, store, secrets, options, id } = await signedIn();
+    // A failed revocation keeps the Account Token's secret, so only the phase guard can stop the send.
+    company.behavior.revokeStatus = 503;
+    const read = secrets.read;
+    secrets.read = async ref => {
+      if (ref === grantOf(store, id)?.secretRef) { secrets.read = read; const other = createClientAuth(options); await (interrupt === 'recover' ? other.recover() : other.signOut(id)); }
+      return read(ref);
+    };
+    const sent = exchanges(company);
+    const outcome = await auth.renew(id);
+    assert.equal(exchanges(company), sent, `${interrupt}: no refresh sent`);
+    if (interrupt === 'recover') {
+      assert.deepEqual([outcome.status, outcome.error], ['failed', 'interrupted']);
+      assert.deepEqual([grantOf(store, id).operationId, grantOf(store, id).status, store.raw.connections[id].status], [null, 'active', 'signed_in']);
+      assert.equal((await auth.renew(id)).status, 'completed');
+    } else {
+      assert.deepEqual([outcome.status, outcome.connection.status], ['cancelled', 'disconnected']);
+      assert.equal(store.raw.connections[id].status, 'disconnected');
+    }
+  }
+}
+test('a refresh that recovery settled before dispatch is never sent', () => interruptedRefresh('recover'));
+test('a refresh that sign-out cancelled before dispatch is never sent', () => interruptedRefresh('signOut'));
