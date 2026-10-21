@@ -109,7 +109,7 @@ export function createConversationClient(options: ConversationClientOptions) {
     }
     const error = await failure(response);
     // direct_conversation_open lasts only until the Direct Conversation closes (spec 7.10), so the same message stays retryable.
-    if (definite(response.status) && error.code !== 'direct_conversation_open') await store.transaction(draft => { const r = draft.outbound.find(x => mine(x) && x.id === id)!; r.phase = 'rejected'; r.error = { code: error.code, status: response.status, conversationId: error.conversationId }; });
+    if (definite(response.status) && error.code !== 'direct_conversation_open') await store.transaction(draft => { const r = draft.outbound.find(x => mine(x) && x.id === id)!; r.phase = 'rejected'; r.error = { code: error.code, status: response.status, ...(error.conversationId === undefined ? {} : { conversationId: error.conversationId }) }; });
     throw error;
   }
 

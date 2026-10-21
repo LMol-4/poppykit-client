@@ -4,11 +4,16 @@ import { createConversationClient, initialConversationClientState, ConversationE
 
 const EP = 'https://api.example.com/poppy/conversations';
 const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } });
+// Strict-JSON store check (INTERFACES v1.1): undefined values are rejected, as a SQLite/JSON store would.
+const assertJson = (value, path = '$') => {
+  if (value === undefined) throw new TypeError(`${path}: unsupported undefined`);
+  if (value && typeof value === 'object') for (const [k, v] of Object.entries(value)) assertJson(v, `${path}.${k}`);
+};
 const memoryStore = () => {
   let state = initialConversationClientState();
   return {
     read: async () => structuredClone(state),
-    transaction: async change => { const draft = structuredClone(state); const result = change(draft); state = draft; return structuredClone(result); },
+    transaction: async change => { const draft = structuredClone(state); const result = change(draft); assertJson(draft); state = draft; return structuredClone(result); },
   };
 };
 const sorted = value => Array.isArray(value) ? value.map(sorted) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(k => [k, sorted(value[k])])) : value;
@@ -518,4 +523,14 @@ test('completed outbound records are pruned to about the newest N; pending ones 
   const before = server.byMessage.size;
   await client.start({ ...msg, id: 'msg_p4' }); // recent retry is still deduped locally
   assert.equal(server.byMessage.size, before);
+});
+
+test('a definite rejection persists as strict JSON, is rejected, and is not resent', async () => {
+  const { server, client, store } = setup();
+  server.hooks.failures.push(json({ error: 'conversation_closed' }, 409));
+  await assert.rejects(client.send('cnv_1', { ...msg, id: 'msg_closed' }), e => e.code === 'conversation_closed' && e.status === 409);
+  assert.equal((await store.read()).outbound[0].phase, 'rejected');
+  const before = server.log.length;
+  await assert.rejects(client.retry('msg_closed'), e => e.code === 'conversation_closed');
+  assert.equal(server.log.length, before);
 });
