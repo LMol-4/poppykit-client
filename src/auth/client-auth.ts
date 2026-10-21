@@ -132,6 +132,9 @@ const own = <T>(record: Record<string, T>, key: string): T | undefined => Object
 const slotKey = (sessionId: string | null, resource: string | null) => JSON.stringify([sessionId, resource]);
 const sha256 = (text: string) => createHash('sha256').update(text).digest('base64url');
 const SIGN_IN_MS = 10 * 60_000;
+const KEEP_OPERATIONS = 100;
+// shortcut: a longer wait is still sent as asked, but we stop waiting after this hold; raise it if Companies honour longer polls.
+const MAX_WAIT_SECONDS = 300;
 // OAuth response parameters an authorization redirect may add to the redirect URI (RFC 6749 4.1.2, RFC 9207).
 const CALLBACK_PARAMS = ['code', 'state', 'iss', 'error', 'error_description', 'error_uri'];
 const AUTHORIZE_ERRORS = new Set(['invalid_request', 'unauthorized_client', 'unsupported_response_type', 'invalid_scope', 'invalid_target', 'server_error', 'temporarily_unavailable']);
@@ -304,6 +307,12 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     for (const ref of drop) await secrets.remove(ref);
     return result;
   }
+  // Credentials of an ended Session are unusable for every resource, so all of its slots go with it.
+  function switchSession(connection: ConnectionRecord, sessionId: string, drop: string[]): void {
+    if (connection.sessionId === sessionId) return;
+    drop.push(...Object.values(connection.slots).map(slot => slot.secretRef));
+    connection.slots = {}; connection.sessionId = sessionId;
+  }
   function replaceSlot(connection: ConnectionRecord, resource: string | null, credential: CredentialRecord, drop: string[]): void {
     const key = slotKey(connection.sessionId, resource);
     const old = own(connection.slots, key);
@@ -313,6 +322,12 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   // Completed renewals are only history; uncertain ones stay because they decide the cleanup status.
   function pruneRenewals(state: ClientAuthState, connectionId: string): void {
     for (const op of Object.values(state.operations)) if (op.kind === 'renew' && op.connectionId === connectionId && op.phase === 'terminal' && op.status !== 'uncertain') delete state.operations[op.id];
+  }
+  // Terminal start/sign-in results only answer late duplicate callbacks, so keep the newest few; uncertain ones decide the cleanup status.
+  function pruneHistory(state: ClientAuthState): void {
+    // Newest first; reverse() keeps insertion order as the tie-break for equal timestamps.
+    const done = Object.values(state.operations).reverse().filter(op => op.kind !== 'renew' && op.phase === 'terminal' && op.status !== 'uncertain').sort((a, b) => b.createdAt - a.createdAt);
+    for (const op of done.slice(KEEP_OPERATIONS)) delete state.operations[op.id];
   }
   function renewOperation(state: ClientAuthState, id: string, connection: ConnectionRecord, grant: GrantRecord | null, at: number, resource: string | null, scopes: string[]): OperationRecord {
     pruneRenewals(state, connection.id);
@@ -325,11 +340,17 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   async function signedOutRenewal(connection: ConnectionRecord, resource: string | null): Promise<AuthOutcome> {
     // Expiry counts from before dispatch so a slow response never extends the token's believed lifetime.
     const issuedAt = now(), operationId = randomId('op_');
-    const token = await signedOutToken(connection.metadata, connection.userId, connection.dpopKeyRef, connection.sessionId, resource);
+    let token: TokenResponse;
+    try { token = await signedOutToken(connection.metadata, connection.userId, connection.dpopKeyRef, connection.sessionId, resource); } catch (error) {
+      // The Session ended (spec 4.2): start a new signed-out one. Signed-out renewal never touches an account.
+      if (!(error instanceof AuthFailure && error.code === 'invalid_session')) throw error;
+      token = await signedOutToken(connection.metadata, connection.userId, connection.dpopKeyRef, null, resource);
+    }
     const secretRef = await secrets.stage(token.access_token);
     return commit([secretRef], (state, drop) => {
       const current = own(state.connections, connection.id);
       if (!current || current.generation !== connection.generation || current.status !== 'signed_out' || current.sessionId !== connection.sessionId) throw new AuthFailure('state_changed', connection.id);
+      switchSession(current, token.session_id, drop);
       replaceSlot(current, resource, { secretRef, tokenType: 'DPoP', dpopKeyRef: current.dpopKeyRef, scopes: [], expiresAt: issuedAt + token.expires_in * 1000, generation: current.generation }, drop);
       return finish(state, renewOperation(state, operationId, current, null, issuedAt, resource, []), 'completed');
     });
@@ -368,8 +389,17 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     });
     if (!dispatched) return endRefresh(operationId, 'failed', 'state_changed');
     const issuedAt = now();
-    let token: TokenResponse;
-    try { token = await tokenRequest(claim.connection.metadata, claim.connection.dpopKeyRef, fields, null); } catch (error) {
+    const send = () => tokenRequest(claim.connection.metadata, claim.connection.dpopKeyRef, fields, null);
+    let token: TokenResponse, newSession = false;
+    try {
+      try { token = await send(); } catch (error) {
+        // A definite invalid_session (a 4xx OAuth code) left the Account Token unused, so this is a new request, not a resend:
+        // without session_id the Company starts a new Session signed in to the same account (spec 4.8).
+        if (!(error instanceof AuthFailure && error.code === 'invalid_session')) throw error;
+        delete fields.session_id; newSession = true;
+        token = await send();
+      }
+    } catch (error) {
       const code = error instanceof AuthFailure ? error.code : 'local_error'; // non-AuthFailure errors come from local signing before dispatch
       // A lost, unreadable or non-OAuth answer may follow a rotation, so the old Account Token is never resent (IMPLEMENTATION 4).
       if (AMBIGUOUS.has(code)) return endRefresh(operationId, 'uncertain', 'lost_response');
@@ -378,13 +408,13 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     const granted = token.scope.split(' ').filter(Boolean);
     let problem: string | null = null;
     if (token.token_type !== 'DPoP') problem = 'unsupported_token_type';
-    else if (token.signed_in !== true || token.session_id !== sessionId || granted.some(scope => !claim.requested.includes(scope))) problem = 'invalid_response';
+    else if (token.signed_in !== true || (newSession ? token.session_id === sessionId : token.session_id !== sessionId) || granted.some(scope => !claim.requested.includes(scope))) problem = 'invalid_response';
     let refreshRef: string | null = null, accessRef: string | null = null;
     try { if (token.refresh_token !== undefined) refreshRef = await secrets.stage(token.refresh_token); } catch { return endRefresh(operationId, 'uncertain', 'storage_error'); }
     if (!problem) try { accessRef = await secrets.stage(token.access_token); } catch { problem = 'storage_error'; }
     if (problem || accessRef === null) return endRefresh(operationId, 'failed', problem ?? 'storage_error', refreshRef);
     const staged: StagedRefresh = {
-      accessRef, refreshRef, sessionId, scopes: granted, signedIn: true, expiresAt: issuedAt + token.expires_in * 1000,
+      accessRef, refreshRef, sessionId: token.session_id, scopes: granted, signedIn: true, expiresAt: issuedAt + token.expires_in * 1000,
       refreshExpiresAt: token.refresh_token_expires_in === undefined ? null : issuedAt + token.refresh_token_expires_in * 1000,
     };
     // Its own commit, so a crash before activation leaves the new Account Token referenced for recover (interface 4).
@@ -447,6 +477,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       drop.push(grant.secretRef); grant.secretRef = staged.refreshRef;
       if (staged.refreshExpiresAt !== null) grant.expiresAt = staged.refreshExpiresAt;
     }
+    switchSession(connection, staged.sessionId, drop);
     // Only this resource's credential changes; other resources' credentials survive (IMPLEMENTATION 3).
     replaceSlot(connection, operation.resource, { secretRef: staged.accessRef, tokenType: 'DPoP', dpopKeyRef: connection.dpopKeyRef, scopes: staged.scopes, expiresAt: staged.expiresAt, generation: connection.generation }, drop);
     return finish(state, operation, 'completed');
@@ -571,6 +602,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
           slots: { [slotKey(token.session_id, null)]: { secretRef, tokenType: 'DPoP', dpopKeyRef, scopes: [], expiresAt: createdAt + token.expires_in * 1000, generation: 1 } },
         };
         state.connections[id] = connection;
+        pruneHistory(state);
         const result: AuthOutcome = { operationId, status: 'completed', connection: publicConnection(state, connection) };
         state.operations[operationId] = {
           epoch: state.epoch, id: operationId, kind: 'start', connectionId: id, connectionGeneration: 1, grantId: null, grantGeneration: null,
@@ -592,26 +624,34 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
 
     // Direct Sign-In (spec 4.5): the operation binds everything the callback must match before the URL exists.
     async beginSignIn(connectionId, input) {
-      const connection = await record(connectionId);
-      const direct = connection.metadata.document.auth?.direct;
-      const authorizationEndpoint = connection.metadata.authorization?.authorization_endpoint;
+      const found = await record(connectionId);
+      const direct = found.metadata.document.auth?.direct;
+      const authorizationEndpoint = found.metadata.authorization?.authorization_endpoint;
       if (!direct || !authorizationEndpoint) throw new AuthFailure('direct_unavailable', connectionId);
       const { scopes, redirectUri, browserBinding } = (input ?? {}) as { scopes?: unknown; redirectUri?: unknown; browserBinding?: unknown };
       if (!Array.isArray(scopes) || !scopes.length || new Set(scopes).size !== scopes.length || !scopes.every(scope => typeof scope === 'string' && direct.scopes.includes(scope))) throw new AuthFailure('invalid_scope', connectionId);
       if (typeof redirectUri !== 'string' || !options.redirectUris.includes(redirectUri) || !URL.canParse(redirectUri)) throw new AuthFailure('invalid_redirect', connectionId);
       // The host derives this from its authenticated browser session; a short value would be guessable.
       if (typeof browserBinding !== 'string' || browserBinding.length < 22) throw new AuthFailure('invalid_binding', connectionId);
+      // Ask for the conversation resource up front so the signed-in token is usable there (spec 4.3 "Narrower tokens").
+      const resource = found.metadata.document.agent?.protocols.find(protocol => protocol.type === 'poppy')?.resource ?? null;
+      // The code exchange names this Session (spec 4.5). A stale credential means it may have ended, so renew first,
+      // which replaces an ended Session; a failed renewal leaves the Session as it was for the issuer to judge.
+      const renew = () => credentialFor(connectionId, resource, null).catch(error => { if (!(error instanceof AuthFailure)) throw error; });
+      if (found.status === 'signed_out' || found.status === 'signed_in') await renew();
+      let connection = await record(connectionId);
+      // An expired Account Token ends the refresh as invalid_grant, leaving the connection signed out on a possibly ended Session.
+      if (found.status === 'signed_in' && connection.status === 'signed_out') { await renew(); connection = await record(connectionId); }
       // An uncertain grant recovers only through a fresh sign-in; a disconnected connection never signs in again (spec 4.9).
       if (connection.status === 'disconnected' || connection.sessionId === null) throw new AuthFailure('sign_in_unavailable', connectionId);
       const state = b64(crypto.getRandomValues(new Uint8Array(32)));
       const verifier = b64(crypto.getRandomValues(new Uint8Array(32)));
-      // Ask for the conversation resource up front so the signed-in token is usable there (spec 4.3 "Narrower tokens").
-      const resource = connection.metadata.document.agent?.protocols.find(protocol => protocol.type === 'poppy')?.resource ?? null;
       const verifierRef = await secrets.stage(verifier);
       const createdAt = now(), operationId = randomId('op_');
       const outcome = await commit([verifierRef], draft => {
         const current = own(draft.connections, connectionId);
-        if (!current || current.generation !== connection.generation || current.status !== connection.status) throw new AuthFailure('state_changed', connectionId);
+        if (!current || current.generation !== connection.generation || current.status !== connection.status || current.sessionId !== connection.sessionId) throw new AuthFailure('state_changed', connectionId);
+        pruneHistory(draft);
         const operation: OperationRecord = draft.operations[operationId] = {
           epoch: draft.epoch, id: operationId, kind: 'sign_in', connectionId, connectionGeneration: current.generation, grantId: current.grantId, grantGeneration: null,
           phase: 'prepared', status: 'pending', createdAt, expiresAt: createdAt + SIGN_IN_MS, resource, scopes: [...scopes],
@@ -689,8 +729,8 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         // shortcut: after a full reset there is no connection to park the new grant on, so its secrets are removed and it is not revoked remotely; revoke here if resets during sign-in matter.
         if (!current || current.epoch !== state.epoch) throw new AuthFailure('state_changed');
         const target = own(state.connections, current.connectionId)!;
-        // A sign-out or recovery that ran during the exchange wins; the new grant is kept only for revocation.
-        if (current.phase !== 'dispatched' || target.generation !== current.connectionGeneration) {
+        // A sign-out, recovery or Session replacement that ran during the exchange wins; the new grant is kept only for revocation.
+        if (current.phase !== 'dispatched' || target.generation !== current.connectionGeneration || target.sessionId !== direct.sessionId) {
           retire(state, `cln_${operationId}`, target, refreshRef!);
           drop.push(accessRef);
           return current.phase === 'dispatched' ? finish(state, current, 'failed', { error: 'state_changed' }) : outcomeOf(state, current);
@@ -785,6 +825,9 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const base = endpoint.pathname.replace(/\/$/, '');
       if (url.protocol !== 'https:' || url.hash || url.username || url.password || url.origin !== endpoint.origin || (url.pathname !== endpoint.pathname && !url.pathname.startsWith(`${base}/`))) throw new AuthFailure('invalid_target', connectionId);
       const resource = expected.resource ?? null;
+      // A conversation long poll is held up to `wait` seconds (spec 7.3, 7.5); that hold must not count as a network timeout.
+      const wait = url.searchParams.get('wait');
+      const waitMs = wait !== null && /^\d+$/.test(wait) ? Math.min(Number(wait), MAX_WAIT_SECONDS) * 1000 : 0;
       let credential = await credentialFor(connectionId, resource, null);
       let nonceRetried = false, renewed = false;
       for (;;) {
@@ -800,7 +843,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         headers.set('authorization', `DPoP ${token}`);
         headers.set('dpop', await proof(await loadDpopKey(credential.dpopKeyRef), request.method, request.url, token));
         // Clone per attempt so the original body stays available for a bounded retry.
-        const response = await transport.fetch(new Request(request.clone(), { headers }));
+        const response = await transport.fetch(new Request(request.clone(), { headers }), { waitMs });
         rememberNonce(request.url, response);
         if (response.status !== 401) return response;
         const error = dpopChallenge(response.headers.get('www-authenticate'))?.error;
