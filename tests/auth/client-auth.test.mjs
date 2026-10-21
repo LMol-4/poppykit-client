@@ -914,3 +914,14 @@ test('a non-OAuth refresh answer after the issuer rotated is uncertain and never
   }
 });
 
+test('a secret store read failure releases the refresh claim before anything is sent', async () => {
+  const { auth, company, store, secrets, id } = await signedIn();
+  const read = secrets.read;
+  secrets.read = async ref => { if (ref === grantOf(store, id).secretRef) throw new Error('vault locked'); return read(ref); };
+  const outcome = await auth.renew(id);
+  assert.deepEqual([outcome.status, outcome.error, outcome.connection.status], ['failed', 'storage_error', 'signed_in']);
+  assert.deepEqual([grantOf(store, id).operationId, grantOf(store, id).status], [null, 'active']);
+  assert.equal(exchanges(company), 2);
+  secrets.read = read;
+  assert.equal((await auth.renew(id)).status, 'completed');
+});

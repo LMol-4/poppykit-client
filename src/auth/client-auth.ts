@@ -350,7 +350,8 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       return { running: null, connection: current, secretRef: grant.secretRef, requested: operation.scopes };
     });
     if (claim.running) return claim.running;
-    const refreshToken = await secrets.read(claim.secretRef);
+    let refreshToken: string | null;
+    try { refreshToken = await secrets.read(claim.secretRef); } catch { return endRefresh(operationId, 'failed', 'storage_error'); }
     if (refreshToken === null) return endRefresh(operationId, 'failed', 'missing_credential');
     const sessionId = claim.connection.sessionId!;
     const fields: Record<string, string> = { grant_type: 'refresh_token', refresh_token: refreshToken, session_id: sessionId };
