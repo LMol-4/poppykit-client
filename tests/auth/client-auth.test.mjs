@@ -894,3 +894,23 @@ test('a crash after the refresh response: staged finishes on recovery, unstaged 
     }
   }
 });
+
+test('a non-OAuth refresh answer after the issuer rotated is uncertain and never resent', async () => {
+  for (const reply of [
+    () => new Response('<html>Bad Gateway</html>', { status: 502 }),
+    () => new Response(JSON.stringify({ error: 'server_error' }), { status: 500, headers: { 'content-type': 'application/json' } }),
+    () => new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 503, headers: { 'content-type': 'application/json' } }),
+    () => new Response(JSON.stringify({ error: 'proxy_said_no' }), { status: 400, headers: { 'content-type': 'application/json' } }),
+  ]) {
+    const { auth, company, store, secrets, id } = await signedIn();
+    const oldToken = secrets.map.get(grantOf(store, id).secretRef);
+    const original = company.handle;
+    company.handle = async (request, init) => { const response = await original(request, init); return request.url === company.tokenEndpoint ? reply() : response; };
+    const outcome = await auth.renew(id);
+    assert.deepEqual([outcome.status, outcome.error, outcome.connection.status], ['uncertain', 'lost_response', 'uncertain'], String(reply()));
+    assert.equal(company.grants.get(oldToken).rotated, true);
+    await assert.rejects(auth.renew(id), code('grant_uncertain'));
+    assert.equal(exchanges(company), 3, 'no second refresh');
+  }
+});
+

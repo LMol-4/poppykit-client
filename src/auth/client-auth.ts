@@ -259,7 +259,8 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       let error = 'token_error';
       try { error = parseProtocolError(json).error; } catch { /* non-OAuth body */ }
       if (error === 'use_dpop_nonce' && response.status === 400 && attempt === 0 && response.headers.has('dpop-nonce')) continue;
-      throw new AuthFailure(SAFE_ERRORS.has(error) ? error : 'token_error');
+      // Only a recognised OAuth code on a 4xx is a definite rejection; a 5xx or proxy page may follow a completed exchange.
+      throw new AuthFailure(response.status >= 400 && response.status < 500 && SAFE_ERRORS.has(error) ? error : 'token_error');
     }
   }
 
@@ -358,9 +359,9 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     const issuedAt = now();
     let token: TokenResponse;
     try { token = await tokenRequest(claim.connection.metadata, claim.connection.dpopKeyRef, fields, null); } catch (error) {
-      const code = error instanceof AuthFailure ? error.code : 'token_error';
-      // A lost or unreadable answer may have rotated the Account Token, so it is never resent (IMPLEMENTATION 4).
-      if (code === 'transport_error' || code === 'invalid_response') return endRefresh(operationId, 'uncertain', 'lost_response');
+      const code = error instanceof AuthFailure ? error.code : 'local_error'; // non-AuthFailure errors come from local signing before dispatch
+      // A lost, unreadable or non-OAuth answer may follow a rotation, so the old Account Token is never resent (IMPLEMENTATION 4).
+      if (code === 'transport_error' || code === 'invalid_response' || code === 'token_error') return endRefresh(operationId, 'uncertain', 'lost_response');
       return endRefresh(operationId, 'failed', code);
     }
     const granted = token.scope.split(' ').filter(Boolean);
