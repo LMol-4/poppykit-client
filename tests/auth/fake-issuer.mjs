@@ -8,6 +8,9 @@ const sha256 = text => createHash('sha256').update(text).digest('base64url');
 class Reject extends Error { constructor(status, error, headers = {}) { super(error); this.status = status; this.error = error; this.headers = headers; } }
 const json = (status, body, headers = {}) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } });
 
+// Sessions end after this long without a token issued for them (spec 4.2: the Company decides how long a Session lasts).
+const SESSION_IDLE_MS = 86_400_000;
+
 export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPath = '/tenant', redirectUris = [], directScopes = ['poppy:read', 'poppy:write'], conversationResource }) {
   const domain = `${name}.test`;
   const issuer = `https://auth.${domain}${issuerPath}`;
@@ -23,6 +26,14 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
   };
   const seconds = () => Math.floor(now() / 1000);
   const newNonce = () => (company.nonce = `n-${randomUUID()}`);
+  // A live Session for this User, or invalid_session (spec 4.2, 4.8); issuing a token for it keeps it alive.
+  const liveSession = (sessionId, sub) => {
+    const session = company.sessions.get(sessionId);
+    if (!session || session.expires <= now() || (sub !== undefined && session.sub !== sub)) throw new Reject(400, 'invalid_session');
+    session.expires = now() + SESSION_IDLE_MS;
+    return session;
+  };
+  const newSession = (sub, account = null) => { const id = `ses_${randomUUID()}`; company.sessions.set(id, { sub, account, expires: now() + SESSION_IDLE_MS }); return id; };
 
   // Verifies a client or session assertion; aud is compared character for character with the issuer.
   company.verifyAssertion = async (jwt, kind) => {
@@ -90,13 +101,12 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     if (!grant || grant.used) throw new Reject(400, 'invalid_grant');
     grant.used = true;
     if (form.get('redirect_uri') !== grant.redirectUri || sha256(form.get('code_verifier') ?? '') !== grant.challenge || form.get('resource') !== grant.resource) throw new Reject(400, 'invalid_grant');
-    const session = company.sessions.get(form.get('session_id'));
-    if (!session) throw new Reject(400, 'invalid_session');
+    const session = liveSession(form.get('session_id'));
     // A Session remembers its account forever (spec 4.4).
     if (session.account && session.account !== grant.account) throw new Reject(400, 'account_mismatch');
     session.account = grant.account;
     const refreshToken = `pat_${randomUUID()}`, accessToken = `tok_${randomUUID()}`;
-    company.grants.set(refreshToken, { family: refreshToken, account: grant.account, scopes: grant.scopes, revoked: false, rotated: false });
+    company.grants.set(refreshToken, { family: refreshToken, sub: session.sub, account: grant.account, scopes: grant.scopes, revoked: false, rotated: false });
     session.family = refreshToken;
     company.tokens.set(accessToken, { jkt, sessionId: form.get('session_id'), sub: session.sub, account: grant.account, scopes: grant.scopes, resource: grant.resource, family: refreshToken, expires: now() + 3600_000 });
     return json(200, { access_token: accessToken, token_type: 'DPoP', expires_in: 3600, refresh_token: refreshToken, refresh_token_expires_in: 2592000, scope: grant.scopes.join(' '), session_id: form.get('session_id'), signed_in: true, ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });
@@ -109,7 +119,7 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     for (const token of company.tokens.values()) if (token.family === family) token.expires = 0;
   }
 
-  // Account Token refresh (spec 4.8), rotating on success; presenting an already-rotated token is reuse and revokes the whole grant (RFC 9700 4.14.2).
+  // Account Token refresh (spec 4.8), rotating on success; without session_id it starts a new signed-in Session; presenting an already-rotated token is reuse and revokes the whole grant (RFC 9700 4.14.2).
   async function refresh(request, form) {
     await company.verifyAssertion(form.get('client_assertion'), 'client');
     const jkt = await verifyProof(request);
@@ -117,9 +127,8 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     const grant = company.grants.get(presented);
     if (!grant || grant.revoked) throw new Reject(400, 'invalid_grant');
     if (grant.rotated) { revokeFamily(grant.family); throw new Reject(400, 'invalid_grant'); }
-    const sessionId = form.get('session_id');
-    const session = company.sessions.get(sessionId);
-    if (!session) throw new Reject(400, 'invalid_session');
+    const sessionId = form.has('session_id') ? form.get('session_id') : newSession(grant.sub, grant.account);
+    const session = liveSession(sessionId, grant.sub);
     if (session.account && session.account !== grant.account) throw new Reject(400, 'account_mismatch');
     const scopes = form.has('scope') ? form.get('scope').split(' ') : grant.scopes;
     if (!scopes.every(scope => grant.scopes.includes(scope))) throw new Reject(400, 'invalid_scope');
@@ -158,8 +167,8 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     const assertion = await company.verifyAssertion(form.get('assertion'), 'session');
     const jkt = await verifyProof(request);
     let sessionId = form.get('session_id');
-    if (sessionId === null) { sessionId = `ses_${randomUUID()}`; company.sessions.set(sessionId, { sub: assertion.sub }); }
-    else if (company.sessions.get(sessionId)?.sub !== assertion.sub) throw new Reject(400, 'invalid_session');
+    if (sessionId === null) sessionId = newSession(assertion.sub);
+    else liveSession(sessionId, assertion.sub);
     const accessToken = `tok_${randomUUID()}`;
     company.tokens.set(accessToken, { jkt, sessionId, sub: assertion.sub, resource: form.get('resource'), expires: now() + 3600_000 });
     return json(200, { access_token: accessToken, token_type: 'DPoP', expires_in: 3600, scope: '', session_id: sessionId, signed_in: false, ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });

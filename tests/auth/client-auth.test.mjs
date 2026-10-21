@@ -49,6 +49,11 @@ async function setup({ localUserId = 'alice', store = memoryStore(), secrets = m
   return { auth: createClientAuth(options), options, company: companies[0], companies, transport, store, secrets, signer, clock };
 }
 const code = expected => error => error instanceof AuthFailure && error.code === expected;
+const tokenForms = company => {
+  const forms = []; const original = company.handle;
+  company.handle = async (request, init) => { if (request.url === company.tokenEndpoint) forms.push(new URLSearchParams(await request.clone().text())); return original(request, init); };
+  return forms;
+};
 const conversations = (company, path = '') => new Request(`${company.endpoint}${path}`, { method: 'POST', body: JSON.stringify({ hello: 'world' }), headers: { 'content-type': 'application/json' } });
 
 test('start creates a signed-out session with verified assertions and a separate DPoP key', async () => {
@@ -274,18 +279,47 @@ test('invalid_token renews the signed-out session once and retries', { timeout: 
   assert.equal(rejected.status, 401); assert.equal(tokenCalls() - before, 1);
 });
 
-test('expired credentials renew before dispatch; ended sessions surface invalid_session', async () => {
-  const { auth, company, clock, store } = await setup();
+test('expired credentials renew before dispatch; an idle-expired signed-out Session is replaced by a new one', async () => {
+  const { auth, company, clock, store, secrets } = await setup();
   const { connection } = await auth.start(company.domain);
   const target = await auth.target(connection.id);
   const tokenCalls = () => company.requests.filter(item => item.url === company.tokenEndpoint).length;
   clock.t += 3600_000;
   assert.equal((await auth.authorizedFetch(connection.id, conversations(company), target)).status, 200);
   assert.equal(tokenCalls(), 2);
-  clock.t += 3600_000; company.sessions.clear();
-  const slots = structuredClone(store.raw.connections[connection.id].slots);
-  await assert.rejects(auth.authorizedFetch(connection.id, conversations(company), target), code('invalid_session'));
-  assert.deepEqual(store.raw.connections[connection.id].slots, slots);
+  const extra = await auth.renew(connection.id, { resource: 'https://api.shop.test/other' });
+  const oldRefs = Object.values(store.raw.connections[connection.id].slots).map(slot => slot.secretRef);
+  assert.equal(oldRefs.length, 2); assert.equal(extra.status, 'completed');
+  const forms = tokenForms(company);
+  clock.t += 25 * 3600_000; // past the issuer's 24 h idle limit
+  const response = await auth.authorizedFetch(connection.id, conversations(company), target);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(forms.map(form => [form.get('grant_type'), form.get('session_id')]), [['urn:ietf:params:oauth:grant-type:jwt-bearer', connection.sessionId], ['urn:ietf:params:oauth:grant-type:jwt-bearer', null]]);
+  const current = store.raw.connections[connection.id];
+  assert.notEqual(current.sessionId, connection.sessionId); assert.equal(body.session_id, current.sessionId); assert.equal(body.account, null);
+  assert.deepEqual([current.status, current.generation, current.grantId], ['signed_out', connection.generation, null]);
+  // The ended Session's credentials are gone, for every resource.
+  assert.deepEqual(Object.keys(current.slots), [JSON.stringify([current.sessionId, null])]);
+  for (const ref of oldRefs) assert.equal(secrets.map.has(ref), false);
+  assert.equal((await auth.get(connection.id)).sessionId, current.sessionId);
+});
+
+test('a refused replacement Session surfaces its error and keeps the slots', async () => {
+  const { auth, company, clock, store } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const target = await auth.target(connection.id);
+  clock.t += 25 * 3600_000;
+  let calls = 0; const original = company.handle;
+  company.handle = async (request, init) => request.url === company.tokenEndpoint && ++calls === 2 ? new Response('{"error":"invalid_client"}', { status: 401 }) : original(request, init);
+  const before = structuredClone(store.raw.connections[connection.id]);
+  await assert.rejects(auth.authorizedFetch(connection.id, conversations(company), target), code('invalid_client'));
+  assert.deepEqual(store.raw.connections[connection.id], before);
+  // Any other refusal of the renewal is not a reason to start a new Session.
+  calls = 0;
+  company.handle = async (request, init) => request.url === company.tokenEndpoint && ++calls ? new Response('{"error":"invalid_grant"}', { status: 400 }) : original(request, init);
+  await assert.rejects(auth.renew(connection.id), code('invalid_grant'));
+  assert.equal(calls, 1);
 });
 
 test('application errors and transport failures are not retried', async () => {
@@ -672,11 +706,6 @@ async function signedIn(options = {}) {
   assert.equal((await signIn(context.auth, context.company, connection.id, { scopes: ['poppy:read', 'poppy:write'] })).status, 'completed');
   return { ...context, id: connection.id, sessionId: connection.sessionId, target: await context.auth.target(connection.id) };
 }
-const tokenForms = company => {
-  const forms = []; const original = company.handle;
-  company.handle = async (request, init) => { if (request.url === company.tokenEndpoint) forms.push(new URLSearchParams(await request.clone().text())); return original(request, init); };
-  return forms;
-};
 const grantOf = (store, id) => store.raw.grants[store.raw.connections[id].grantId];
 const loseTokenResponses = (transport, company) => {
   const original = transport.fetch;
@@ -745,6 +774,52 @@ test('renew validates input and a definite refusal releases the grant', async ()
   assert.equal((await auth.renew(connection.id)).status, 'completed');
   assert.notEqual(Object.values(store.raw.connections[connection.id].slots)[0].secretRef, slot.secretRef);
   await assert.rejects(auth.renew(connection.id, { scopes: ['poppy:read'] }), code('invalid_scope'));
+});
+
+test('an idle-expired signed-in Session is replaced by refreshing without session_id, never by a new sign-in', async () => {
+  const { auth, company, store, secrets, clock, id, sessionId, target } = await signedIn();
+  const forms = tokenForms(company);
+  const grant = grantOf(store, id), oldToken = secrets.map.get(grant.secretRef);
+  const oldSlots = Object.values(store.raw.connections[id].slots).map(slot => slot.secretRef);
+  const codes = company.codes.size;
+  clock.t += 25 * 3600_000; // past the issuer's 24 h idle limit
+  const response = await auth.authorizedFetch(id, conversations(company), target, ['poppy:write']);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(forms.map(form => [form.get('grant_type'), form.get('session_id'), form.get('refresh_token')]), [['refresh_token', sessionId, oldToken], ['refresh_token', null, oldToken]]);
+  const current = store.raw.connections[id];
+  assert.notEqual(current.sessionId, sessionId);
+  assert.deepEqual([body.session_id, body.account, current.status], [current.sessionId, 'acct_1', 'signed_in']);
+  assert.equal(company.sessions.get(current.sessionId).account, 'acct_1', 'the new Session is bound to the same account');
+  assert.deepEqual(Object.keys(current.slots), [JSON.stringify([current.sessionId, null])]);
+  for (const ref of oldSlots) assert.equal(secrets.map.has(ref), false);
+  const after = grantOf(store, id);
+  assert.deepEqual([after.status, after.operationId, after.generation], ['active', null, grant.generation + 1]);
+  assert.notEqual(secrets.map.get(after.secretRef), oldToken);
+  assert.equal(company.codes.size, codes, 'no sign-in was started');
+});
+
+test('replacement-Session refresh: only a definite invalid_session retries, and a lost answer is never resent', async () => {
+  const { auth, company, clock, id } = await signedIn();
+  clock.t += 25 * 3600_000;
+  // A 5xx is not a definite refusal: the Account Token may have been used, so nothing is retried.
+  company.behavior.tokenError = { status: 500, body: { error: 'invalid_session' } };
+  const forms = tokenForms(company);
+  assert.deepEqual([(await auth.renew(id)).status, forms.length], ['uncertain', 1]);
+  const other = await signedIn();
+  other.clock.t += 25 * 3600_000;
+  let calls = 0; const original = other.transport.fetch;
+  other.transport.fetch = async (request, init) => { const response = await original(request, init); if (request.url === other.company.tokenEndpoint && ++calls === 2) throw new Error('socket hang up'); return response; };
+  const lost = await other.auth.renew(other.id);
+  assert.deepEqual([lost.status, lost.error, lost.connection.status, lost.connection.sessionId, calls], ['uncertain', 'lost_response', 'uncertain', other.sessionId, 2]);
+  await assert.rejects(other.auth.renew(other.id), code('grant_uncertain'));
+  assert.equal(calls, 2);
+  // A replacement answered for the ended Session is malformed.
+  const third = await signedIn();
+  third.clock.t += 25 * 3600_000;
+  third.company.behavior.tokenOverride = { session_id: third.sessionId };
+  const bad = await third.auth.renew(third.id);
+  assert.deepEqual([bad.status, bad.error, third.store.raw.connections[third.id].sessionId], ['failed', 'invalid_response', third.sessionId]);
 });
 
 test('a lost rotation response is uncertain; the old Account Token is never resent', async () => {

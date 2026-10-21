@@ -304,6 +304,12 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     for (const ref of drop) await secrets.remove(ref);
     return result;
   }
+  // Credentials of an ended Session are unusable for every resource, so all of its slots go with it.
+  function switchSession(connection: ConnectionRecord, sessionId: string, drop: string[]): void {
+    if (connection.sessionId === sessionId) return;
+    drop.push(...Object.values(connection.slots).map(slot => slot.secretRef));
+    connection.slots = {}; connection.sessionId = sessionId;
+  }
   function replaceSlot(connection: ConnectionRecord, resource: string | null, credential: CredentialRecord, drop: string[]): void {
     const key = slotKey(connection.sessionId, resource);
     const old = own(connection.slots, key);
@@ -325,11 +331,17 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   async function signedOutRenewal(connection: ConnectionRecord, resource: string | null): Promise<AuthOutcome> {
     // Expiry counts from before dispatch so a slow response never extends the token's believed lifetime.
     const issuedAt = now(), operationId = randomId('op_');
-    const token = await signedOutToken(connection.metadata, connection.userId, connection.dpopKeyRef, connection.sessionId, resource);
+    let token: TokenResponse;
+    try { token = await signedOutToken(connection.metadata, connection.userId, connection.dpopKeyRef, connection.sessionId, resource); } catch (error) {
+      // The Session ended (spec 4.2): start a new signed-out one. Signed-out renewal never touches an account.
+      if (!(error instanceof AuthFailure && error.code === 'invalid_session')) throw error;
+      token = await signedOutToken(connection.metadata, connection.userId, connection.dpopKeyRef, null, resource);
+    }
     const secretRef = await secrets.stage(token.access_token);
     return commit([secretRef], (state, drop) => {
       const current = own(state.connections, connection.id);
       if (!current || current.generation !== connection.generation || current.status !== 'signed_out' || current.sessionId !== connection.sessionId) throw new AuthFailure('state_changed', connection.id);
+      switchSession(current, token.session_id, drop);
       replaceSlot(current, resource, { secretRef, tokenType: 'DPoP', dpopKeyRef: current.dpopKeyRef, scopes: [], expiresAt: issuedAt + token.expires_in * 1000, generation: current.generation }, drop);
       return finish(state, renewOperation(state, operationId, current, null, issuedAt, resource, []), 'completed');
     });
@@ -368,8 +380,17 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     });
     if (!dispatched) return endRefresh(operationId, 'failed', 'state_changed');
     const issuedAt = now();
-    let token: TokenResponse;
-    try { token = await tokenRequest(claim.connection.metadata, claim.connection.dpopKeyRef, fields, null); } catch (error) {
+    const send = () => tokenRequest(claim.connection.metadata, claim.connection.dpopKeyRef, fields, null);
+    let token: TokenResponse, newSession = false;
+    try {
+      try { token = await send(); } catch (error) {
+        // A definite invalid_session (a 4xx OAuth code) left the Account Token unused, so this is a new request, not a resend:
+        // without session_id the Company starts a new Session signed in to the same account (spec 4.8).
+        if (!(error instanceof AuthFailure && error.code === 'invalid_session')) throw error;
+        delete fields.session_id; newSession = true;
+        token = await send();
+      }
+    } catch (error) {
       const code = error instanceof AuthFailure ? error.code : 'local_error'; // non-AuthFailure errors come from local signing before dispatch
       // A lost, unreadable or non-OAuth answer may follow a rotation, so the old Account Token is never resent (IMPLEMENTATION 4).
       if (AMBIGUOUS.has(code)) return endRefresh(operationId, 'uncertain', 'lost_response');
@@ -378,13 +399,13 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     const granted = token.scope.split(' ').filter(Boolean);
     let problem: string | null = null;
     if (token.token_type !== 'DPoP') problem = 'unsupported_token_type';
-    else if (token.signed_in !== true || token.session_id !== sessionId || granted.some(scope => !claim.requested.includes(scope))) problem = 'invalid_response';
+    else if (token.signed_in !== true || (newSession ? token.session_id === sessionId : token.session_id !== sessionId) || granted.some(scope => !claim.requested.includes(scope))) problem = 'invalid_response';
     let refreshRef: string | null = null, accessRef: string | null = null;
     try { if (token.refresh_token !== undefined) refreshRef = await secrets.stage(token.refresh_token); } catch { return endRefresh(operationId, 'uncertain', 'storage_error'); }
     if (!problem) try { accessRef = await secrets.stage(token.access_token); } catch { problem = 'storage_error'; }
     if (problem || accessRef === null) return endRefresh(operationId, 'failed', problem ?? 'storage_error', refreshRef);
     const staged: StagedRefresh = {
-      accessRef, refreshRef, sessionId, scopes: granted, signedIn: true, expiresAt: issuedAt + token.expires_in * 1000,
+      accessRef, refreshRef, sessionId: token.session_id, scopes: granted, signedIn: true, expiresAt: issuedAt + token.expires_in * 1000,
       refreshExpiresAt: token.refresh_token_expires_in === undefined ? null : issuedAt + token.refresh_token_expires_in * 1000,
     };
     // Its own commit, so a crash before activation leaves the new Account Token referenced for recover (interface 4).
@@ -447,6 +468,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       drop.push(grant.secretRef); grant.secretRef = staged.refreshRef;
       if (staged.refreshExpiresAt !== null) grant.expiresAt = staged.refreshExpiresAt;
     }
+    switchSession(connection, staged.sessionId, drop);
     // Only this resource's credential changes; other resources' credentials survive (IMPLEMENTATION 3).
     replaceSlot(connection, operation.resource, { secretRef: staged.accessRef, tokenType: 'DPoP', dpopKeyRef: connection.dpopKeyRef, scopes: staged.scopes, expiresAt: staged.expiresAt, generation: connection.generation }, drop);
     return finish(state, operation, 'completed');
