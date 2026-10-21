@@ -132,6 +132,7 @@ const own = <T>(record: Record<string, T>, key: string): T | undefined => Object
 const slotKey = (sessionId: string | null, resource: string | null) => JSON.stringify([sessionId, resource]);
 const sha256 = (text: string) => createHash('sha256').update(text).digest('base64url');
 const SIGN_IN_MS = 10 * 60_000;
+const KEEP_OPERATIONS = 100;
 // OAuth response parameters an authorization redirect may add to the redirect URI (RFC 6749 4.1.2, RFC 9207).
 const CALLBACK_PARAMS = ['code', 'state', 'iss', 'error', 'error_description', 'error_uri'];
 const AUTHORIZE_ERRORS = new Set(['invalid_request', 'unauthorized_client', 'unsupported_response_type', 'invalid_scope', 'invalid_target', 'server_error', 'temporarily_unavailable']);
@@ -319,6 +320,12 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   // Completed renewals are only history; uncertain ones stay because they decide the cleanup status.
   function pruneRenewals(state: ClientAuthState, connectionId: string): void {
     for (const op of Object.values(state.operations)) if (op.kind === 'renew' && op.connectionId === connectionId && op.phase === 'terminal' && op.status !== 'uncertain') delete state.operations[op.id];
+  }
+  // Terminal start/sign-in results only answer late duplicate callbacks, so keep the newest few; uncertain ones decide the cleanup status.
+  function pruneHistory(state: ClientAuthState): void {
+    // Newest first; reverse() keeps insertion order as the tie-break for equal timestamps.
+    const done = Object.values(state.operations).reverse().filter(op => op.kind !== 'renew' && op.phase === 'terminal' && op.status !== 'uncertain').sort((a, b) => b.createdAt - a.createdAt);
+    for (const op of done.slice(KEEP_OPERATIONS)) delete state.operations[op.id];
   }
   function renewOperation(state: ClientAuthState, id: string, connection: ConnectionRecord, grant: GrantRecord | null, at: number, resource: string | null, scopes: string[]): OperationRecord {
     pruneRenewals(state, connection.id);
@@ -593,6 +600,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
           slots: { [slotKey(token.session_id, null)]: { secretRef, tokenType: 'DPoP', dpopKeyRef, scopes: [], expiresAt: createdAt + token.expires_in * 1000, generation: 1 } },
         };
         state.connections[id] = connection;
+        pruneHistory(state);
         const result: AuthOutcome = { operationId, status: 'completed', connection: publicConnection(state, connection) };
         state.operations[operationId] = {
           epoch: state.epoch, id: operationId, kind: 'start', connectionId: id, connectionGeneration: 1, grantId: null, grantGeneration: null,
@@ -634,6 +642,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const outcome = await commit([verifierRef], draft => {
         const current = own(draft.connections, connectionId);
         if (!current || current.generation !== connection.generation || current.status !== connection.status) throw new AuthFailure('state_changed', connectionId);
+        pruneHistory(draft);
         const operation: OperationRecord = draft.operations[operationId] = {
           epoch: draft.epoch, id: operationId, kind: 'sign_in', connectionId, connectionGeneration: current.generation, grantId: current.grantId, grantGeneration: null,
           phase: 'prepared', status: 'pending', createdAt, expiresAt: createdAt + SIGN_IN_MS, resource, scopes: [...scopes],

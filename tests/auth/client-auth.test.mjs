@@ -742,6 +742,26 @@ test('refresh rotates the Account Token once for parallel requests and keeps oth
   assert.equal(Object.values(store.raw.operations).filter(op => op.kind === 'renew').length, 1);
 });
 
+test('terminal start and sign-in operations are pruned beyond a bound; uncertain and pending ones stay', async () => {
+  const { auth, company, transport, store, clock, id } = await signedIn();
+  const signedInOp = Object.values(store.raw.operations).find(op => op.kind === 'sign_in').id;
+  const { callbackUrl } = await beginAndApprove(auth, company, id);
+  const restore = loseTokenResponses(transport, company);
+  const uncertain = await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER });
+  restore();
+  assert.equal(uncertain.status, 'uncertain');
+  const { outcome: pending } = await auth.beginSignIn(id, { scopes: ['poppy:read'], redirectUri: REDIRECT, browserBinding: BROWSER });
+  const starts = [];
+  for (let i = 0; i < 103; i++) { clock.t += 2000; starts.push((await auth.start(company.domain)).operationId); } // paced under the discovery fetch limit
+  const kept = Object.values(store.raw.operations).filter(op => op.kind !== 'renew');
+  assert.equal(kept.filter(op => op.phase === 'terminal' && op.status !== 'uncertain').length, 101, 'the bound, plus the operation just added');
+  assert.equal(await auth.operation(signedInOp), null); assert.equal(await auth.operation(starts[0]), null);
+  assert.equal((await auth.operation(starts.at(-1))).status, 'completed');
+  assert.equal((await auth.operation(uncertain.operationId)).status, 'uncertain');
+  assert.equal((await auth.operation(pending.operationId)).status, 'pending');
+  assert.equal((await auth.signOut(id)).cleanup, 'uncertain', 'pruning never hides an uncertain exchange');
+});
+
 test('one rotation per grant: a second process gets the pending operation', async () => {
   const { auth, company, options, id } = await signedIn();
   const second = createClientAuth(options);
