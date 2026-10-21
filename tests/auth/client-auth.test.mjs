@@ -570,7 +570,6 @@ test('token responses that are not a usable signed-in grant fail and park any Ac
     [{ session_id: 'ses_other' }, 'invalid_response', 1],
     [{ scope: 'poppy:read poppy:write' }, 'invalid_response', 1],
     [{ refresh_token: undefined }, 'invalid_response', 0],
-    [{ expires_in: -1 }, 'invalid_response', 0],
   ]) {
     const { auth, company, store } = await setup();
     const { connection } = await auth.start(company.domain);
@@ -940,4 +939,23 @@ test('a crash before the refresh is sent recovers as failed and keeps the grant 
   assert.deepEqual([grantOf(store, id).operationId, grantOf(store, id).status, store.raw.connections[id].status], [null, 'active', 'signed_in']);
   assert.equal(exchanges(company), 2, 'nothing was sent');
   assert.equal((await restarted.renew(id)).status, 'completed');
+});
+
+test('a 5xx or garbled code exchange answer is uncertain and the code is not resent', async () => {
+  for (const reply of [
+    () => new Response('<html>Bad Gateway</html>', { status: 502 }),
+    () => new Response('{"access_token": tok', { status: 200, headers: { 'content-type': 'application/json' } }),
+    () => new Response(JSON.stringify({ access_token: 'tok_x', token_type: 'DPoP', expires_in: -1, scope: 'poppy:read', session_id: 'ses_x', signed_in: true }), { status: 200, headers: { 'content-type': 'application/json' } }),
+  ]) {
+    const { auth, company, store } = await setup();
+    const { connection } = await auth.start(company.domain);
+    const { callbackUrl } = await beginAndApprove(auth, company, connection.id);
+    const original = company.handle;
+    company.handle = async (request, init) => { const response = await original(request, init); return request.url === company.tokenEndpoint ? reply() : response; };
+    const outcome = await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER });
+    assert.deepEqual([outcome.status, outcome.error, outcome.connection.status], ['uncertain', 'lost_response', 'signed_out']);
+    assert.deepEqual(await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER }), outcome);
+    assert.equal(exchanges(company), 2, 'exactly one exchange');
+    assert.deepEqual(store.raw.grants, {});
+  }
 });

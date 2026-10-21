@@ -119,6 +119,8 @@ export class AuthFailure extends Error {
 const EC = { name: 'ECDSA', namedCurve: 'P-256' } as const;
 const ES256 = { name: 'ECDSA', hash: 'SHA-256' } as const;
 const SKEW_MS = 30_000;
+// Token endpoint failures after which the Company may have acted: lost, unreadable or non-OAuth answers.
+const AMBIGUOUS = new Set(['transport_error', 'invalid_response', 'token_error']);
 const CLIENT_ASSERTION = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
 const ASSERTION_SECONDS = 60;
 // OAuth codes the token endpoint may return (spec 4.2, RFC 6749/8707); anything else is reported as token_error.
@@ -370,7 +372,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     try { token = await tokenRequest(claim.connection.metadata, claim.connection.dpopKeyRef, fields, null); } catch (error) {
       const code = error instanceof AuthFailure ? error.code : 'local_error'; // non-AuthFailure errors come from local signing before dispatch
       // A lost, unreadable or non-OAuth answer may follow a rotation, so the old Account Token is never resent (IMPLEMENTATION 4).
-      if (code === 'transport_error' || code === 'invalid_response' || code === 'token_error') return endRefresh(operationId, 'uncertain', 'lost_response');
+      if (AMBIGUOUS.has(code)) return endRefresh(operationId, 'uncertain', 'lost_response');
       return endRefresh(operationId, 'failed', code);
     }
     const granted = token.scope.split(' ').filter(Boolean);
@@ -661,8 +663,8 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const issuedAt = now();
       let token: TokenResponse;
       try { token = await tokenRequest(connection.metadata, connection.dpopKeyRef, fields, null); } catch (error) {
-        // A definite rejection is a failure; a lost answer may have consumed the code, so it is never resent.
-        const definite = error instanceof AuthFailure && error.code !== 'transport_error';
+        // A definite rejection is a failure; a lost or non-OAuth answer may have consumed the code, so it is never resent.
+        const definite = error instanceof AuthFailure && !AMBIGUOUS.has(error.code);
         return settle(operationId, direct.verifierRef, definite ? 'failed' : 'uncertain', { error: definite ? error.code : 'lost_response' });
       }
       const granted = token.scope.split(' ').filter(Boolean);
