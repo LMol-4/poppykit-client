@@ -624,26 +624,30 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
 
     // Direct Sign-In (spec 4.5): the operation binds everything the callback must match before the URL exists.
     async beginSignIn(connectionId, input) {
-      const connection = await record(connectionId);
-      const direct = connection.metadata.document.auth?.direct;
-      const authorizationEndpoint = connection.metadata.authorization?.authorization_endpoint;
+      const found = await record(connectionId);
+      const direct = found.metadata.document.auth?.direct;
+      const authorizationEndpoint = found.metadata.authorization?.authorization_endpoint;
       if (!direct || !authorizationEndpoint) throw new AuthFailure('direct_unavailable', connectionId);
       const { scopes, redirectUri, browserBinding } = (input ?? {}) as { scopes?: unknown; redirectUri?: unknown; browserBinding?: unknown };
       if (!Array.isArray(scopes) || !scopes.length || new Set(scopes).size !== scopes.length || !scopes.every(scope => typeof scope === 'string' && direct.scopes.includes(scope))) throw new AuthFailure('invalid_scope', connectionId);
       if (typeof redirectUri !== 'string' || !options.redirectUris.includes(redirectUri) || !URL.canParse(redirectUri)) throw new AuthFailure('invalid_redirect', connectionId);
       // The host derives this from its authenticated browser session; a short value would be guessable.
       if (typeof browserBinding !== 'string' || browserBinding.length < 22) throw new AuthFailure('invalid_binding', connectionId);
+      // Ask for the conversation resource up front so the signed-in token is usable there (spec 4.3 "Narrower tokens").
+      const resource = found.metadata.document.agent?.protocols.find(protocol => protocol.type === 'poppy')?.resource ?? null;
+      // The code exchange names this Session (spec 4.5). A stale credential means it may have ended, so renew first,
+      // which replaces an ended Session; a failed renewal leaves the Session as it was for the issuer to judge.
+      if (found.status === 'signed_out' || found.status === 'signed_in') await credentialFor(connectionId, resource, null).catch(error => { if (!(error instanceof AuthFailure)) throw error; });
+      const connection = await record(connectionId);
       // An uncertain grant recovers only through a fresh sign-in; a disconnected connection never signs in again (spec 4.9).
       if (connection.status === 'disconnected' || connection.sessionId === null) throw new AuthFailure('sign_in_unavailable', connectionId);
       const state = b64(crypto.getRandomValues(new Uint8Array(32)));
       const verifier = b64(crypto.getRandomValues(new Uint8Array(32)));
-      // Ask for the conversation resource up front so the signed-in token is usable there (spec 4.3 "Narrower tokens").
-      const resource = connection.metadata.document.agent?.protocols.find(protocol => protocol.type === 'poppy')?.resource ?? null;
       const verifierRef = await secrets.stage(verifier);
       const createdAt = now(), operationId = randomId('op_');
       const outcome = await commit([verifierRef], draft => {
         const current = own(draft.connections, connectionId);
-        if (!current || current.generation !== connection.generation || current.status !== connection.status) throw new AuthFailure('state_changed', connectionId);
+        if (!current || current.generation !== connection.generation || current.status !== connection.status || current.sessionId !== connection.sessionId) throw new AuthFailure('state_changed', connectionId);
         pruneHistory(draft);
         const operation: OperationRecord = draft.operations[operationId] = {
           epoch: draft.epoch, id: operationId, kind: 'sign_in', connectionId, connectionGeneration: current.generation, grantId: current.grantId, grantGeneration: null,

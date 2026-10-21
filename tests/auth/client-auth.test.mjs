@@ -446,6 +446,24 @@ test('Direct Sign-In isolates two users with two connections each', async () => 
   await assert.rejects(alice.auth.completeSignIn({ callbackUrl, browserBinding: BROWSER }), code('invalid_callback'));
 });
 
+test('Direct Sign-In after the Session idle-expired binds to a replacement Session and succeeds', async () => {
+  const { auth, company, store, clock } = await setup();
+  const { connection } = await auth.start(company.domain);
+  // A fresh credential proves a live Session: beginSignIn sends nothing.
+  const sent = exchanges(company);
+  await auth.beginSignIn(connection.id, { scopes: ['poppy:read'], redirectUri: REDIRECT, browserBinding: BROWSER });
+  assert.equal(exchanges(company), sent);
+  clock.t += 25 * 3600_000;
+  const forms = tokenForms(company);
+  const outcome = await signIn(auth, company, connection.id);
+  assert.deepEqual([outcome.status, outcome.connection.status], ['completed', 'signed_in']);
+  const sessionId = store.raw.connections[connection.id].sessionId;
+  assert.notEqual(sessionId, connection.sessionId); assert.equal(outcome.connection.sessionId, sessionId);
+  assert.deepEqual(forms.map(form => [form.get('grant_type'), form.get('session_id')]), [
+    ['urn:ietf:params:oauth:grant-type:jwt-bearer', connection.sessionId], ['urn:ietf:params:oauth:grant-type:jwt-bearer', null], ['authorization_code', sessionId]]);
+  assert.equal(company.sessions.get(sessionId).account, 'acct_1');
+});
+
 test('the authorization request and code exchange carry PKCE, state, issuer and session', async () => {
   const { auth, company, store } = await setup();
   const { connection } = await auth.start(company.domain);
