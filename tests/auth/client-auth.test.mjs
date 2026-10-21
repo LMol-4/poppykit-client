@@ -925,3 +925,19 @@ test('a secret store read failure releases the refresh claim before anything is 
   secrets.read = read;
   assert.equal((await auth.renew(id)).status, 'completed');
 });
+
+test('a crash before the refresh is sent recovers as failed and keeps the grant usable', async () => {
+  const store = memoryStore(); const secrets = memorySecrets();
+  const { auth, company, options, id } = await signedIn({ store, secrets });
+  const read = secrets.read;
+  secrets.read = async ref => { if (ref === grantOf(store, id).secretRef) store.crashIn = 1; return read(ref); };
+  await assert.rejects(auth.renew(id), /crash/);
+  secrets.read = read;
+  const [operation] = Object.values(store.raw.operations).filter(op => op.kind === 'renew');
+  assert.equal(operation.phase, 'prepared');
+  const restarted = createClientAuth(options);
+  assert.deepEqual((await restarted.recover()).map(item => [item.operationId, item.status, item.error]), [[operation.id, 'failed', 'interrupted']]);
+  assert.deepEqual([grantOf(store, id).operationId, grantOf(store, id).status, store.raw.connections[id].status], [null, 'active', 'signed_in']);
+  assert.equal(exchanges(company), 2, 'nothing was sent');
+  assert.equal((await restarted.renew(id)).status, 'completed');
+});

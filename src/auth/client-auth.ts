@@ -316,7 +316,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     pruneRenewals(state, connection.id);
     return state.operations[id] = {
       epoch: state.epoch, id, kind: 'renew', connectionId: connection.id, connectionGeneration: connection.generation, grantId: grant?.id ?? null, grantGeneration: grant?.generation ?? null,
-      phase: 'dispatched', status: 'pending', createdAt: at, expiresAt: at, resource, scopes, direct: null, staged: null, result: null,
+      phase: 'prepared', status: 'pending', createdAt: at, expiresAt: at, resource, scopes, direct: null, staged: null, result: null,
     };
   }
 
@@ -357,6 +357,14 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     const fields: Record<string, string> = { grant_type: 'refresh_token', refresh_token: refreshToken, session_id: sessionId };
     if (resource !== null) fields.resource = resource;
     if (scopes) fields.scope = scopes.join(' ');
+    // The last local step before the send; a crash before it sent nothing, so recover just releases the grant.
+    const dispatched = await transaction(state => {
+      const operation = own(state.operations, operationId);
+      if (!operation || operation.epoch !== state.epoch || operation.phase !== 'prepared') return false;
+      operation.phase = 'dispatched';
+      return true;
+    });
+    if (!dispatched) return endRefresh(operationId, 'failed', 'state_changed');
     const issuedAt = now();
     let token: TokenResponse;
     try { token = await tokenRequest(claim.connection.metadata, claim.connection.dpopKeyRef, fields, null); } catch (error) {
@@ -723,7 +731,10 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         for (const operation of Object.values(state.operations)) {
           if (operation.epoch !== state.epoch || operation.phase === 'terminal') continue;
           // A fully staged refresh finishes locally; its fences still decide whether it activates.
-          if (operation.kind === 'renew') results.push(operation.phase === 'staged' ? activateRefresh(state, operation, drop) : closeRefresh(state, operation, 'uncertain', 'lost_response', false, drop));
+          if (operation.kind === 'renew') {
+            if (operation.phase === 'staged') results.push(activateRefresh(state, operation, drop));
+            else results.push(operation.phase === 'prepared' ? closeRefresh(state, operation, 'failed', 'interrupted', false, drop) : closeRefresh(state, operation, 'uncertain', 'lost_response', false, drop));
+          }
           // The code may have reached the issuer before the crash; only a fresh sign-in is safe.
           else if (operation.phase !== 'prepared') results.push(finish(state, operation, 'uncertain', { error: 'lost_response' }));
           else if (at >= operation.expiresAt) results.push(finish(state, operation, 'expired'));
