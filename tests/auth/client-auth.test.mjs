@@ -1008,6 +1008,24 @@ test('sign-out during a code exchange wins; the late grant cannot activate', asy
   assert.equal(secrets.map.size, 1);
 });
 
+test('a Session replaced during a code exchange wins; the late grant cannot activate', async () => {
+  const { auth, company, store, clock } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const { callbackUrl } = await beginAndApprove(auth, company, connection.id);
+  let during, raced = false; const original = company.handle;
+  company.handle = async (request, init) => {
+    const response = await original(request, init);
+    // The answer arrives after the old Session ended and a renewal replaced it (flag first: the renewal comes through here too).
+    if (request.url === company.tokenEndpoint && !raced) { raced = true; clock.t += 25 * 3600_000; during = await auth.renew(connection.id); }
+    return response;
+  };
+  const outcome = await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER });
+  assert.equal(during.status, 'completed'); assert.notEqual(during.connection.sessionId, connection.sessionId);
+  assert.deepEqual([outcome.status, outcome.error, outcome.connection.status], ['failed', 'state_changed', 'signed_out']);
+  assert.deepEqual(store.raw.grants, {}); assert.equal(Object.keys(store.raw.cleanup).length, 1, 'the late grant is parked for revocation');
+  assert.equal(store.raw.connections[connection.id].sessionId, during.connection.sessionId);
+});
+
 test('a crash after the refresh response: staged finishes on recovery, unstaged is uncertain', async () => {
   for (const [crashIn, expected] of [[1, 'uncertain'], [2, 'completed']]) {
     const store = memoryStore(); const secrets = memorySecrets();

@@ -729,8 +729,8 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         // shortcut: after a full reset there is no connection to park the new grant on, so its secrets are removed and it is not revoked remotely; revoke here if resets during sign-in matter.
         if (!current || current.epoch !== state.epoch) throw new AuthFailure('state_changed');
         const target = own(state.connections, current.connectionId)!;
-        // A sign-out or recovery that ran during the exchange wins; the new grant is kept only for revocation.
-        if (current.phase !== 'dispatched' || target.generation !== current.connectionGeneration) {
+        // A sign-out, recovery or Session replacement that ran during the exchange wins; the new grant is kept only for revocation.
+        if (current.phase !== 'dispatched' || target.generation !== current.connectionGeneration || target.sessionId !== direct.sessionId) {
           retire(state, `cln_${operationId}`, target, refreshRef!);
           drop.push(accessRef);
           return current.phase === 'dispatched' ? finish(state, current, 'failed', { error: 'state_changed' }) : outcomeOf(state, current);
