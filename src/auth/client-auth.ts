@@ -637,8 +637,11 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const resource = found.metadata.document.agent?.protocols.find(protocol => protocol.type === 'poppy')?.resource ?? null;
       // The code exchange names this Session (spec 4.5). A stale credential means it may have ended, so renew first,
       // which replaces an ended Session; a failed renewal leaves the Session as it was for the issuer to judge.
-      if (found.status === 'signed_out' || found.status === 'signed_in') await credentialFor(connectionId, resource, null).catch(error => { if (!(error instanceof AuthFailure)) throw error; });
-      const connection = await record(connectionId);
+      const renew = () => credentialFor(connectionId, resource, null).catch(error => { if (!(error instanceof AuthFailure)) throw error; });
+      if (found.status === 'signed_out' || found.status === 'signed_in') await renew();
+      let connection = await record(connectionId);
+      // An expired Account Token ends the refresh as invalid_grant, leaving the connection signed out on a possibly ended Session.
+      if (found.status === 'signed_in' && connection.status === 'signed_out') { await renew(); connection = await record(connectionId); }
       // An uncertain grant recovers only through a fresh sign-in; a disconnected connection never signs in again (spec 4.9).
       if (connection.status === 'disconnected' || connection.sessionId === null) throw new AuthFailure('sign_in_unavailable', connectionId);
       const state = b64(crypto.getRandomValues(new Uint8Array(32)));

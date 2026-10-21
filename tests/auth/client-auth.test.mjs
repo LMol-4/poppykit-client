@@ -464,6 +464,19 @@ test('Direct Sign-In after the Session idle-expired binds to a replacement Sessi
   assert.equal(company.sessions.get(sessionId).account, 'acct_1');
 });
 
+test('Direct Sign-In after both the Session and the Account Token ended binds to a new signed-out Session', async () => {
+  const { auth, company, store, clock, id, sessionId } = await signedIn();
+  clock.t += 25 * 3600_000;
+  for (const grant of company.grants.values()) grant.revoked = true;
+  const forms = tokenForms(company);
+  const outcome = await signIn(auth, company, id);
+  assert.deepEqual([outcome.status, outcome.connection.status], ['completed', 'signed_in']);
+  const current = store.raw.connections[id].sessionId;
+  assert.notEqual(current, sessionId);
+  assert.deepEqual(forms.map(form => [form.get('grant_type'), form.get('session_id')]), [
+    ['refresh_token', sessionId], ['urn:ietf:params:oauth:grant-type:jwt-bearer', sessionId], ['urn:ietf:params:oauth:grant-type:jwt-bearer', null], ['authorization_code', current]]);
+});
+
 test('the authorization request and code exchange carry PKCE, state, issuer and session', async () => {
   const { auth, company, store } = await setup();
   const { connection } = await auth.start(company.domain);
