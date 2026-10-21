@@ -223,6 +223,17 @@ test('authorizedFetch sends DPoP with a fresh proof bound to method, URL and tok
   assert.notEqual(company.proofs.at(-1).payload.jti, proof.payload.jti);
 });
 
+test('authorizedFetch adds a long poll\'s wait to the transport timeout, so a 30 s read is not aborted', async () => {
+  const { auth, company, transport } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const target = await auth.target(connection.id);
+  const seen = []; const original = transport.fetch;
+  transport.fetch = (request, options) => { if (request.url.startsWith(company.endpoint)) seen.push(options?.waitMs); return original(request, options); };
+  for (const query of ['/cnv_1/events?wait=30', '/cnv_1/messages?cursor=evt_1&wait=10', '/cnv_1/events?wait=86400', '/cnv_1/events', '/cnv_1/events?wait=-5', '/cnv_1/events?wait=1e3'])
+    assert.equal((await auth.authorizedFetch(connection.id, conversations(company, query), target)).status, 200, query);
+  assert.deepEqual(seen, [30_000, 10_000, 300_000, 0, 0, 0]);
+});
+
 test('authorizedFetch refuses foreign targets, URLs and handles before sending anything', async () => {
   const { auth, company, transport } = await setup();
   const { connection } = await auth.start(company.domain);

@@ -133,6 +133,8 @@ const slotKey = (sessionId: string | null, resource: string | null) => JSON.stri
 const sha256 = (text: string) => createHash('sha256').update(text).digest('base64url');
 const SIGN_IN_MS = 10 * 60_000;
 const KEEP_OPERATIONS = 100;
+// shortcut: a longer wait is still sent as asked, but we stop waiting after this hold; raise it if Companies honour longer polls.
+const MAX_WAIT_SECONDS = 300;
 // OAuth response parameters an authorization redirect may add to the redirect URI (RFC 6749 4.1.2, RFC 9207).
 const CALLBACK_PARAMS = ['code', 'state', 'iss', 'error', 'error_description', 'error_uri'];
 const AUTHORIZE_ERRORS = new Set(['invalid_request', 'unauthorized_client', 'unsupported_response_type', 'invalid_scope', 'invalid_target', 'server_error', 'temporarily_unavailable']);
@@ -816,6 +818,9 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const base = endpoint.pathname.replace(/\/$/, '');
       if (url.protocol !== 'https:' || url.hash || url.username || url.password || url.origin !== endpoint.origin || (url.pathname !== endpoint.pathname && !url.pathname.startsWith(`${base}/`))) throw new AuthFailure('invalid_target', connectionId);
       const resource = expected.resource ?? null;
+      // A conversation long poll is held up to `wait` seconds (spec 7.3, 7.5); that hold must not count as a network timeout.
+      const wait = url.searchParams.get('wait');
+      const waitMs = wait !== null && /^\d+$/.test(wait) ? Math.min(Number(wait), MAX_WAIT_SECONDS) * 1000 : 0;
       let credential = await credentialFor(connectionId, resource, null);
       let nonceRetried = false, renewed = false;
       for (;;) {
@@ -831,7 +836,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         headers.set('authorization', `DPoP ${token}`);
         headers.set('dpop', await proof(await loadDpopKey(credential.dpopKeyRef), request.method, request.url, token));
         // Clone per attempt so the original body stays available for a bounded retry.
-        const response = await transport.fetch(new Request(request.clone(), { headers }));
+        const response = await transport.fetch(new Request(request.clone(), { headers }), { waitMs });
         rememberNonce(request.url, response);
         if (response.status !== 401) return response;
         const error = dpopChallenge(response.headers.get('www-authenticate'))?.error;
