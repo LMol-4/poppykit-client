@@ -480,12 +480,22 @@ test('an old v1 state without consumers works for read, ack and reset', async ()
   await client.resetConsumer(cid, 'w');
 });
 
-test('direct_conversation_open surfaces the conversation ID, also on later retry', async () => {
+test('direct_conversation_open surfaces the conversation ID and stays retryable until the Direct Conversation closes', async () => {
   const { client, server } = setup();
   const cid = await seed(client, server, 1);
-  server.hooks.failures.push(json({ error: 'direct_conversation_open', conversation_id: 'cnv_direct' }, 409));
+  const open = () => json({ error: 'direct_conversation_open', conversation_id: 'cnv_direct' }, 409);
+  server.hooks.failures.push(open());
   await assert.rejects(client.send(cid, { ...msg, id: 'msg_d1' }), e => e.code === 'direct_conversation_open' && e.conversationId === 'cnv_direct');
+  assert.equal((await client.operation('msg_d1')).phase, 'pending');
+  server.hooks.failures.push(open());
+  const sent = server.log.length;
   await assert.rejects(client.retry('msg_d1'), e => e.code === 'direct_conversation_open' && e.conversationId === 'cnv_direct');
+  assert.equal(server.log.length, sent + 1, 'the retry was sent, not answered from a stored rejection');
+  // The Direct Conversation closed: the parent takes messages again (spec 7.10), with the same ID and content.
+  const state = await client.retry('msg_d1');
+  assert.equal(state.conversation_id, cid);
+  assert.equal((await client.operation('msg_d1')).phase, 'accepted');
+  assert.equal(server.byMessage.get('msg_d1').target, cid);
   server.hooks.failures.push(json({ error: 'direct_conversation_open', conversation_id: 'bad id' }, 409));
   await assert.rejects(client.handoff(cid), e => e.code === 'http_error' && e.conversationId === undefined);
 });
