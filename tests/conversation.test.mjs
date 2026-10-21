@@ -325,7 +325,7 @@ test('retryAfter of a huge integer is Infinity and surfaces as the delay', async
   assert.deepEqual(sleeps, []);
 });
 
-test('consumer checkpoint moves only on ack; reads and the iterator never acknowledge', async () => {
+test('consumer checkpoint moves only on ack; reads and drain never acknowledge', async () => {
   const { client, server, store } = setup();
   const cid = await seed(client, server, 3);
   const first = await client.read(cid, { consumer: 'worker' });
@@ -333,7 +333,7 @@ test('consumer checkpoint moves only on ack; reads and the iterator never acknow
   assert.deepEqual((await store.read()).consumers, []);
   const again = await client.read(cid, { consumer: 'worker' }); // redelivery, not skipping
   assert.deepEqual(ids([again]), ids([first]));
-  const seen = []; for await (const e of client.events(cid, { consumer: 'worker' })) seen.push(e.id);
+  const seen = ids(await client.drain(cid, { consumer: 'worker' }));
   assert.equal(seen.length, 3);
   assert.deepEqual((await store.read()).consumers, []);
   await client.ack(cid, 'worker', first);
@@ -431,15 +431,53 @@ test('POST wait and cursor return a page receipt; a repeat with other parameters
   assert.ok(server.log.at(-1).endsWith('/poppy/conversations?wait=3'));
 });
 
-test('POST wait: bad parameters and a non-page body are rejected', async () => {
+test('POST wait: bad parameters and a malformed body are rejected', async () => {
   const { client, server } = setup();
   await assert.rejects(client.start({ ...msg, id: 'msg_n1' }, { wait: -1 }), e => e.code === 'invalid_request');
   await assert.rejects(client.start({ ...msg, id: 'msg_n2' }, { wait: 1.5 }), e => e.code === 'invalid_request');
   await assert.rejects(client.start({ ...msg, id: 'msg_n3' }, { cursor: 'a&b' }));
   assert.equal(server.log.length, 0);
-  server.hooks.failures.push(json({ conversation_id: 'cnv_1', status: 'working', responder: 'agent' }, 201));
+  await assert.rejects(client.start({ ...msg, id: 'msg_n5' }, { cursor: 'evt_1' }), e => e.code === 'invalid_request'); // cursor only alongside wait
+  assert.equal(server.log.length, 0);
+  assert.equal((await client.operation('msg_n5')), undefined);
+  server.hooks.failures.push(json({ conversation_id: 'cnv_1', status: 'working' }, 201));
   await assert.rejects(client.start({ ...msg, id: 'msg_n4' }, { wait: 2 }), e => e.code === 'invalid_response');
   assert.equal((await client.operation('msg_n4')).phase, 'pending');
+});
+
+test('a waited POST answered with a plain state is accepted, not stuck pending', async () => {
+  const { client, server } = setup();
+  server.hooks.failures.push(json({ conversation_id: 'cnv_1', status: 'working', responder: 'agent' }, 201));
+  const r = await client.start({ ...msg, id: 'msg_st' }, { wait: 2 });
+  assert.equal(r.conversation_id, 'cnv_1');
+  assert.equal((await client.operation('msg_st')).phase, 'accepted');
+});
+
+test('stale acks cannot regress the checkpoint, across a drain chain or a reset', async () => {
+  const { client, server, store } = setup();
+  const cid = await seed(client, server, 3);
+  const [p1, p2] = await client.drain(cid, { consumer: 'w' });
+  await client.ack(cid, 'w', p2);
+  await client.ack(cid, 'w', p1);
+  assert.equal((await store.read()).consumers[0].cursor, p2.cursor);
+  const pages = await client.drain(cid, { consumer: 'w' }); // from p2: one event
+  const old = await client.read(cid, { consumer: 'w' });
+  await client.resetConsumer(cid, 'w');
+  await client.ack(cid, 'w', old);
+  await client.ack(cid, 'w', pages[0]);
+  assert.deepEqual((await store.read()).consumers, []);
+});
+
+test('an old v1 state without consumers works for read, ack and reset', async () => {
+  const { client, server, store } = setup();
+  const cid = await seed(client, server, 1);
+  await store.transaction(d => { delete d.consumers; });
+  const page = await client.read(cid, { consumer: 'w' });
+  await client.ack(cid, 'w', page);
+  assert.equal((await store.read()).consumers[0].cursor, page.cursor);
+  await client.resetConsumer(cid, 'w');
+  await store.transaction(d => { delete d.consumers; });
+  await client.resetConsumer(cid, 'w');
 });
 
 test('direct_conversation_open surfaces the conversation ID, also on later retry', async () => {

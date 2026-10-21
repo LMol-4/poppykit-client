@@ -1,6 +1,6 @@
 import { dpopChallenge } from './auth/challenge.js';
 import { id as parseId, parseConversationRequest, parseConversationState, parseEventPage, parseMessage, parseProtocolError, retryAfterMilliseconds } from './protocol/wire.js';
-import type { ConversationEvent, ConversationRequest, ConversationState, EventPage, Message } from './protocol/wire.js';
+import type { ConversationRequest, ConversationState, EventPage, Message } from './protocol/wire.js';
 
 export interface StateStore<State> { read(): Promise<State>; transaction<Result>(change: (draft: State) => Result): Promise<Result> }
 export interface OutboundRecord {
@@ -81,7 +81,7 @@ export function createConversationClient(options: ConversationClientOptions) {
   }
 
   // Pages handed to a consumer in this process; the checkpoint moves only when one of them is acked.
-  const delivered = new WeakMap<EventPage, { conversationId: string; consumer: string }>();
+  const delivered = new WeakMap<EventPage, { conversationId: string; consumer: string; chain: (string | undefined)[] }>();
   async function checkpoint(conversationId: string, consumer: string): Promise<string | undefined> {
     parseId(consumer, 'consumer');
     return ((await store.read()).consumers ?? []).find(c => mine(c) && c.conversationId === conversationId && c.name === consumer)?.cursor;
@@ -99,7 +99,11 @@ export function createConversationClient(options: ConversationClientOptions) {
     const response = await call(() => new Request(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(record.request) }));
     if (response.status >= 200 && response.status < 300) {
       let state: ConversationState | EventPage;
-      try { state = record.read ? parseEventPage(await response.json(), record.read.cursor) : parseConversationState(await response.json()); } catch { throw new ConversationError('invalid_response', response.status); }
+      try {
+        const body = await response.json();
+        // A 2xx means accepted; a company that ignores wait answers with a plain state.
+        try { state = record.read ? parseEventPage(body, record.read.cursor) : parseConversationState(body); } catch { state = parseConversationState(body); }
+      } catch { throw new ConversationError('invalid_response', response.status); }
       await store.transaction(draft => { const r = draft.outbound.find(x => mine(x) && x.id === id)!; r.phase = 'accepted'; r.response = state; });
       return state;
     }
@@ -112,7 +116,7 @@ export function createConversationClient(options: ConversationClientOptions) {
   async function submit(input: OutboundInput, target: string | null, read: ReadParams, parent?: string): Promise<(ConversationState | EventPage) & { messageId: string }> {
     if (target !== null) parseId(target, 'conversation_id');
     if (read.wait !== undefined && (!Number.isSafeInteger(read.wait) || read.wait < 0)) throw new ConversationError('invalid_request');
-    if (read.cursor !== undefined) parseId(read.cursor, 'cursor');
+    if (read.cursor !== undefined) { parseId(read.cursor, 'cursor'); if (read.wait === undefined) throw new ConversationError('invalid_request'); } // spec 7.3 adds cursor alongside wait
     const message = parseMessage({ ...input, id: input.id ?? newId() }) as Message;
     const request = parseConversationRequest({ message, ...(parent === undefined ? {} : { parent_conversation_id: parent }) });
     const fingerprint = canonical({ target, request });
@@ -155,7 +159,7 @@ export function createConversationClient(options: ConversationClientOptions) {
       if (!response.ok) throw await failure(response); // cursor_expired (410) is the explicit history gap: see resetConsumer
       let page: EventPage;
       try { page = parseEventPage(await response.json(), cursor); } catch { throw new ConversationError('invalid_response', response.status); }
-      if (opts.consumer !== undefined) delivered.set(page, { conversationId, consumer: opts.consumer });
+      if (opts.consumer !== undefined) delivered.set(page, { conversationId, consumer: opts.consumer, chain: [cursor] });
       return page;
     },
     /** Reads pages until has_more is false. Pages are returned whole, never acknowledged. */
@@ -163,20 +167,17 @@ export function createConversationClient(options: ConversationClientOptions) {
       if (opts.consumer !== undefined && opts.cursor !== undefined) throw new ConversationError('invalid_request');
       const pages: EventPage[] = [];
       let cursor = opts.consumer === undefined ? opts.cursor : await checkpoint(conversationId, opts.consumer);
+      const chain = [cursor]; // checkpoints this page may legitimately advance from
       for (; pages.length < maxPages; ) {
         const page = await client.read(conversationId, { cursor, wait: pages.length ? 0 : opts.wait });
-        if (opts.consumer !== undefined) delivered.set(page, { conversationId, consumer: opts.consumer });
+        if (opts.consumer !== undefined) delivered.set(page, { conversationId, consumer: opts.consumer, chain: [...chain] });
         pages.push(page);
         if (!page.has_more) return pages;
         // has_more with no new events or an unchanged cursor can never finish.
         if (!page.events.length || page.cursor === null || page.cursor === cursor) throw new ConversationError('invalid_response');
-        cursor = page.cursor;
+        cursor = page.cursor; chain.push(cursor);
       }
       throw new ConversationError('too_many_pages');
-    },
-    /** Convenience iterator over events from a cursor or consumer checkpoint. It never acknowledges; call ack with the pages you processed. */
-    async *events(conversationId: string, opts: ReadOptions = {}): AsyncGenerator<ConversationEvent> {
-      for (const page of await client.drain(conversationId, opts)) yield* page.events;
     },
     /** Durably advances the consumer to the page's cursor, after the application processed that page. A page never delivered to this consumer by this client instance is refused. */
     async ack(conversationId: string, consumer: string, page: EventPage): Promise<void> {
@@ -185,10 +186,11 @@ export function createConversationClient(options: ConversationClientOptions) {
       if (from?.conversationId !== conversationId || from.consumer !== consumer) throw new ConversationError('invalid_request');
       if (page.cursor === null) return; // empty foreign page: nothing to advance past
       const cursor = page.cursor;
-      // shortcut: acking an older delivered page after a newer one moves the checkpoint back (safe redelivery), callers ack in order.
+      // Compare-and-set: cursors are opaque, so a page advances only from a checkpoint it was read from; stale acks do nothing.
       await store.transaction(draft => {
         const list = draft.consumers ??= [];
         const row = list.find(c => mine(c) && c.conversationId === conversationId && c.name === consumer);
+        if (!from.chain.includes(row?.cursor)) return;
         if (row) row.cursor = cursor; else list.push({ connectionId, issuer, conversationId, name: consumer, cursor });
       });
     },
