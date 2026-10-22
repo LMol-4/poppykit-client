@@ -37,20 +37,23 @@ if (mode === 'prepare') {
     const { connection } = await auth.start(company.domain);
     const begun = await auth.beginSignIn(connection.id, { scopes: ['poppy:read'], redirectUri, browserBinding });
     const callbackUrl = company.authorize(begun.authorizationUrl, { account: 'account' });
+    if (mode === 'rotation') await auth.completeSignIn({ callbackUrl, browserBinding });
     const handle = company.handle;
     company.handle = async (request, options) => {
       const response = await handle(request, options);
       if (request.url === company.tokenEndpoint) {
+        const active = Object.values((await store.read({ connectionId: connection.id })).operations).find(record => record.phase === 'dispatched');
         // Synthetic external side effect commits independently of SDK completion.
         const external = new DatabaseSync(path + '.external');
         external.exec('CREATE TABLE IF NOT EXISTS effects (id TEXT PRIMARY KEY)');
-        external.prepare('INSERT INTO effects VALUES (?)').run(begun.outcome.operationId);
+        external.prepare('INSERT INTO effects VALUES (?)').run(active.id);
         external.close();
-        process.send({ ready: true, operationId: begun.outcome.operationId });
+        process.send({ ready: true, operationId: active.id });
         await pause();
       }
       return response;
     };
-    await auth.completeSignIn({ callbackUrl, browserBinding });
+    if (mode === 'rotation') await auth.renew(connection.id);
+    else await auth.completeSignIn({ callbackUrl, browserBinding });
   }
 }

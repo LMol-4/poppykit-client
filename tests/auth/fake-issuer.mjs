@@ -11,7 +11,7 @@ const json = (status, body, headers = {}) => new Response(JSON.stringify(body), 
 // Sessions end after this long without a token issued for them (spec 4.2: the Company decides how long a Session lasts).
 const SESSION_IDLE_MS = 86_400_000;
 
-export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPath = '/tenant', redirectUris = [], directScopes = ['poppy:read', 'poppy:write'], conversationResource }) {
+export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPath = '/tenant', redirectUris = [], directScopes = ['poppy:read', 'poppy:write'], conversationResource, method = 'direct' }) {
   const domain = `${name}.test`;
   const issuer = `https://auth.${domain}${issuerPath}`;
   const tokenEndpoint = `${issuer}/token`;
@@ -23,6 +23,7 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     revocations: [],
     requests: [], assertions: [], proofs: [],
     sessions: new Map(), tokens: new Map(), seenAssertionJti: new Set(), seenProofJti: new Set(), nonce: null,
+    devices: new Map(), challenges: new Map(), signInBehavior: { status: 'approved', scopes: directScopes, account: 'acct_1', code: '123456', codeRequired: false, attempts: 0 },
   };
   const seconds = () => Math.floor(now() / 1000);
   const newNonce = () => (company.nonce = `n-${randomUUID()}`);
@@ -101,15 +102,18 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     if (!grant || grant.used) throw new Reject(400, 'invalid_grant');
     grant.used = true;
     if (form.get('redirect_uri') !== grant.redirectUri || sha256(form.get('code_verifier') ?? '') !== grant.challenge || form.get('resource') !== grant.resource) throw new Reject(400, 'invalid_grant');
-    const session = liveSession(form.get('session_id'));
+    return issueSignedIn(form.get('session_id'), jkt, grant.account, grant.scopes, grant.resource);
+  }
+  function issueSignedIn(sessionId, jkt, account, scopes, resource) {
+    const session = liveSession(sessionId);
     // A Session remembers its account forever (spec 4.4).
-    if (session.account && session.account !== grant.account) throw new Reject(400, 'account_mismatch');
-    session.account = grant.account;
+    if (session.account && session.account !== account) throw new Reject(400, 'account_mismatch');
+    session.account = account;
     const refreshToken = `pat_${randomUUID()}`, accessToken = `tok_${randomUUID()}`;
-    company.grants.set(refreshToken, { family: refreshToken, sub: session.sub, account: grant.account, scopes: grant.scopes, revoked: false, rotated: false });
+    company.grants.set(refreshToken, { family: refreshToken, sub: session.sub, account, scopes, revoked: false, rotated: false });
     session.family = refreshToken;
-    company.tokens.set(accessToken, { jkt, sessionId: form.get('session_id'), sub: session.sub, account: grant.account, scopes: grant.scopes, resource: grant.resource, family: refreshToken, expires: now() + 3600_000 });
-    return json(200, { access_token: accessToken, token_type: 'DPoP', expires_in: 3600, refresh_token: refreshToken, refresh_token_expires_in: 2592000, scope: grant.scopes.join(' '), session_id: form.get('session_id'), signed_in: true, ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });
+    company.tokens.set(accessToken, { jkt, sessionId, sub: session.sub, account, scopes, resource, family: refreshToken, expires: now() + 3600_000 });
+    return json(200, { access_token: accessToken, token_type: 'DPoP', expires_in: 3600, refresh_token: refreshToken, refresh_token_expires_in: 2592000, scope: scopes.join(' '), session_id: sessionId, signed_in: true, ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });
   }
 
   // Revoking a grant signs out every Session signed in with it; they continue signed out (spec 4.9).
@@ -161,6 +165,15 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     const form = new URLSearchParams(await request.text());
     if (form.get('client_assertion_type') !== CLIENT_ASSERTION || form.get('client_id') !== clientId) throw new Reject(400, 'invalid_request');
     if (form.get('grant_type') === 'authorization_code') return exchangeCode(request, form);
+    if (form.get('grant_type') === 'urn:ietf:params:oauth:grant-type:device_code') {
+      await company.verifyAssertion(form.get('client_assertion'), 'client'); const jkt = await verifyProof(request);
+      const device = company.devices.get(form.get('device_code'));
+      if (!device || device.used) throw new Reject(400, 'invalid_grant');
+      const behavior = company.signInBehavior;
+      if (behavior.status !== 'approved') throw new Reject(400, behavior.status);
+      device.used = true;
+      return issueSignedIn(form.get('session_id'), jkt, behavior.account, behavior.scopes.filter(scope => device.scopes.includes(scope)), form.get('resource'));
+    }
     if (form.get('grant_type') === 'refresh_token') return refresh(request, form);
     if (form.get('grant_type') !== JWT_BEARER) throw new Reject(400, 'unsupported_grant_type');
     await company.verifyAssertion(form.get('client_assertion'), 'client');
@@ -194,8 +207,35 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     const url = new URL(request.url);
     company.requests.push({ url: request.url, method: request.method, mode: options?.mode, authorization: request.headers.get('authorization') });
     try {
-      if (url.href === `https://${domain}/.well-known/poppy.json`) return json(200, { protocol_version: '0.2', organization: { name, domain }, auth: { issuer, direct: { scopes: directScopes } }, agent: { protocols: [{ type: 'other', endpoint: `https://api.${domain}/other` }, { type: 'poppy', endpoint, ...(conversationResource ? { resource: conversationResource } : {}) }] } });
-      if (url.href === `https://auth.${domain}/.well-known/oauth-authorization-server${issuerPath}`) return json(200, { issuer, token_endpoint: tokenEndpoint, revocation_endpoint: `${issuer}/revoke`, authorization_endpoint: authorizationEndpoint, poppy_domains: [domain] });
+      if (url.href === `https://${domain}/.well-known/poppy.json`) return json(200, { protocol_version: '0.2', organization: { name, domain }, auth: { issuer, [method]: { scopes: directScopes, ...(method === 'mediated' ? { endpoint: `${issuer}/sign-in`, fields: [{ name: 'password', label: 'Password', secret: true }] } : {}) } }, agent: { protocols: [{ type: 'other', endpoint: `https://api.${domain}/other` }, { type: 'poppy', endpoint, ...(conversationResource ? { resource: conversationResource } : {}) }] } });
+      if (url.href === `https://auth.${domain}/.well-known/oauth-authorization-server${issuerPath}`) return json(200, { issuer, token_endpoint: tokenEndpoint, revocation_endpoint: `${issuer}/revoke`, ...(method === 'direct' ? { authorization_endpoint: authorizationEndpoint } : {}), ...(method === 'device' ? { device_authorization_endpoint: `${issuer}/device` } : {}), poppy_domains: [domain] });
+      if (url.href === `${issuer}/device`) {
+        const form = new URLSearchParams(await request.text()); await company.verifyAssertion(form.get('client_assertion'), 'client');
+        const code = randomUUID(); company.devices.set(code, { scopes: form.get('scope').split(' '), used: false });
+        return json(200, { device_code: code, user_code: 'ABCD-EFGH', verification_uri: `${issuer}/approve`, expires_in: 600, interval: 5 });
+      }
+      if (url.href === `${issuer}/sign-in` || url.href.startsWith(`${issuer}/sign-in/`)) {
+        const access = /^DPoP (\S+)$/.exec(request.headers.get('authorization') ?? '')?.[1], bound = company.tokens.get(access);
+        if (!bound) throw new Reject(401, 'invalid_token');
+        const jkt = await verifyProof(request, access); const input = await request.json(), behavior = company.signInBehavior;
+        const challengeId = url.href.split('/sign-in/')[1];
+        if (challengeId) {
+          const challenge = company.challenges.get(challengeId);
+          if (!challenge || challenge.sessionId !== bound.sessionId) throw new Reject(404, 'sign_in_not_found');
+          if (++behavior.attempts >= 3) return json(200, { status: 'failed' });
+          if (input.code !== behavior.code) return json(200, { status: 'code_required', sign_in_id: challengeId, code: { sent_to: 'Your phone' }, expires_at: new Date(now() + 60_000).toISOString() });
+        } else {
+          if (!input.credentials.password) return json(200, { status: 'failed' });
+          if (behavior.status === 'access_denied') return json(200, { status: 'failed' });
+          if (behavior.codeRequired) {
+            const id = randomUUID(); company.challenges.set(id, { sessionId: bound.sessionId, scopes: input.scope.split(' ') });
+            return json(200, { status: 'code_required', sign_in_id: id, code: { sent_to: 'Your phone' }, expires_at: new Date(now() + 60_000).toISOString() });
+          }
+        }
+        const requested = challengeId ? company.challenges.get(challengeId).scopes : input.scope.split(' ');
+        const result = await issueSignedIn(bound.sessionId, jkt, behavior.account, behavior.scopes.filter(scope => requested.includes(scope)), bound.resource);
+        return json(200, { status: 'complete', ...await result.json() });
+      }
       if (url.href === tokenEndpoint && request.method === 'POST') return await token(request);
       if (url.href === `${issuer}/revoke` && request.method === 'POST') return await revoke(request);
       if (url.origin === `https://api.${domain}`) return await resource(request);

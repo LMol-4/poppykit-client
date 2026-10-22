@@ -23,10 +23,42 @@ export interface IdentitySigner {
   // Exactly 64-byte IEEE-P1363 signature over the input, not DER.
   sign(input: Uint8Array): Promise<Uint8Array>;
 }
+export type AssertionRequest = { operationId: string; issuer: string } & (
+  | { purpose: 'client-authentication' } | { purpose: 'session' }
+  | { purpose: 'browser'; sessionId: string; returnTo: string }
+);
+export interface AssertionProvider {
+  assert(request: AssertionRequest): Promise<{ assertion: string; expiresAt: number }>;
+}
+export interface ProviderIdentity {
+  // Authenticated, issuer-specific identity from the bound enrollment adapter.
+  identity(issuer: string): Promise<{ clientId: string; userId: string }>;
+}
+export type SignInMethod = 'direct' | 'device' | 'mediated';
+export interface AuthorizationRequirement {
+  requiredScopes: string[]; grantedScopes: string[]; missingScopes: string[]; sufficient: boolean;
+  methods: { method: SignInMethod; scopes: string[] }[];
+  organization: { name: string; domain: string };
+}
+export interface TrustedInput {
+  // Invoke only in trusted UI code. Never expose this adapter as a model tool.
+  collect(request: { operationId: string; issuer: string; organization: { name: string; domain: string }; fields: { name: string; label: string; secret: boolean }[]; challenge?: { id: string; sentTo: string; expiresAt: number } }): Promise<Record<string, string> | null>;
+}
+export interface SignInInput {
+  method?: SignInMethod; scopes: string[]; redirectUri?: string; browserBinding?: string;
+  force?: boolean; // An explicit user request to sign in again, even when the grant suffices.
+  // Explicitly permit replacing a grant while dropping unneeded old scopes. Default: preserve all old scopes.
+  requiredExistingScopes?: string[];
+}
+export interface SignInStart {
+  outcome: AuthOutcome; authorizationUrl?: string;
+  device?: { verificationUri: string; verificationUriComplete?: string; userCode: string; organization: { name: string; domain: string }; nextPollAt: number };
+}
 export interface ClientAuthOptions {
   namespace: string; localUserId: string; clientId: string;
   redirectUris: readonly string[]; // used by Direct Sign-In (J09)
-  identity: IdentitySigner;
+  identity?: IdentitySigner;
+  assertions?: AssertionProvider; providerIdentity?: ProviderIdentity; trustedInput?: TrustedInput;
   store: AuthStore; secrets: SecretStore;
   transport: HttpTransport; metadata: MetadataResolver;
   now?: () => number;
@@ -44,17 +76,19 @@ export interface Connection {
 export type OperationStatus = 'pending' | 'completed' | 'denied' | 'expired' | 'cancelled' | 'failed' | 'uncertain';
 export interface AuthOutcome {
   operationId: string; status: OperationStatus; connection: Connection;
-  error?: string; missingScopes?: string[]; retryAfterMs?: number;
+  error?: string; grantedScopes?: string[]; missingScopes?: string[]; retryAfterMs?: number;
   nextAction?: 'wait' | 'sign_in' | 'retry_cleanup';
 }
 export interface SignOutOutcome { connection: Connection; cleanup: 'complete' | 'pending' | 'uncertain' }
 export interface ConversationTarget { issuer: string; endpoint: string; resource?: string }
 export interface ClientAuth {
-  start(domain: string): Promise<AuthOutcome>;
+  start(domain: string, input?: { anonymous?: boolean }): Promise<AuthOutcome>;
   get(connectionId: string): Promise<Connection | null>;
   list(): Promise<Connection[]>;
   target(connectionId: string): Promise<ConversationTarget>;
-  beginSignIn(connectionId: string, input: { scopes: string[]; redirectUri: string; browserBinding: string }): Promise<{ outcome: AuthOutcome; authorizationUrl?: string }>;
+  authorization(connectionId: string, requiredScopes: readonly string[]): Promise<AuthorizationRequirement>;
+  beginSignIn(connectionId: string, input: SignInInput): Promise<SignInStart>;
+  continueSignIn(operationId: string): Promise<AuthOutcome>;
   completeSignIn(input: { callbackUrl: string; browserBinding: string }): Promise<AuthOutcome>;
   cancelSignIn(operationId: string): Promise<AuthOutcome>;
   operation(operationId: string): Promise<AuthOutcome | null>;
@@ -75,6 +109,7 @@ export interface ConnectionRecord {
   generation: number; status: ConnectionStatus; grantId: string | null;
   // Key JSON.stringify([sessionId, resource ?? null]); preserves absent vs exact resource.
   slots: Record<string, CredentialRecord>;
+  anonymous?: boolean; notBefore?: string;
 }
 export interface GrantRecord {
   id: string; issuer: string; userId: string; secretRef: string;
@@ -96,6 +131,10 @@ export interface OperationRecord {
   // Sign-in activates in one transaction with its result; only refresh records staged refs first.
   direct: DirectRecord | null; staged: StagedRefresh | null;
   result: AuthOutcome | null;
+  method?: SignInMethod; requiredExistingScopes?: string[]; signInSessionId?: string;
+  device?: { codeRef: string; intervalMs: number; nextPollAt: number };
+  mediated?: { challengeId: string; sentTo: string };
+  cancelRequested?: boolean;
 }
 export interface StagedRefresh {
   accessRef: string; refreshRef: string | null; sessionId: string; scopes: string[];
@@ -105,6 +144,7 @@ export interface StagedRefresh {
 export interface CleanupRecord {
   id: string; connectionId: string; issuer: string; revocationEndpoint: string;
   secretRef: string; status: 'pending' | 'uncertain';
+  notBefore?: string;
 }
 export interface ClientAuthState {
   version: 1; epoch: string;
@@ -117,7 +157,7 @@ export interface ClientAuthState {
 }
 
 export class AuthFailure extends Error {
-  constructor(readonly code: string, readonly connectionId?: string, readonly retryAfterMs?: number) { super(`Auth ${code}`); this.name = 'AuthFailure'; }
+  constructor(readonly code: string, readonly connectionId?: string, readonly retryAfterMs?: number, readonly retryAt?: string) { super(`Auth ${code}`); this.name = 'AuthFailure'; }
 }
 
 const EC = { name: 'ECDSA', namedCurve: 'P-256' } as const;
@@ -142,6 +182,14 @@ const MAX_WAIT_SECONDS = 300;
 // OAuth response parameters an authorization redirect may add to the redirect URI (RFC 6749 4.1.2, RFC 9207).
 const CALLBACK_PARAMS = ['code', 'state', 'iss', 'error', 'error_description', 'error_uri'];
 const AUTHORIZE_ERRORS = new Set(['invalid_request', 'unauthorized_client', 'unsupported_response_type', 'invalid_scope', 'invalid_target', 'server_error', 'temporarily_unavailable']);
+function safeHttps(value: string): boolean {
+  try { const url = new URL(value); return url.protocol === 'https:' && !url.username && !url.password && !url.hash && !/[\\\s\x00-\x1f]/.test(value); } catch { return false; }
+}
+function allowedHost(value: string, hosts: readonly string[]): boolean {
+  if (!safeHttps(value)) return false;
+  const hostname = new URL(value).hostname.toLowerCase();
+  return hosts.some(host => hostname === host.toLowerCase() || hostname.endsWith(`.${host.toLowerCase()}`));
+}
 // Redirect identity without the response parameters; origin alone would hide userinfo.
 const redirectShape = (url: URL) => JSON.stringify([url.origin, url.username, url.password, url.pathname, [...url.searchParams]]);
 
@@ -189,6 +237,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   const now = options.now ?? Date.now;
   if (typeof namespace !== 'string' || !namespace || typeof localUserId !== 'string' || !localUserId) throw new AuthFailure('invalid_options');
   try { validateClientId(clientId); } catch { throw new AuthFailure('invalid_options'); }
+  if ((!identity && !options.assertions) || (!!options.assertions !== !!options.providerIdentity)) throw new AuthFailure('invalid_options');
   const owner = { namespace, clientId, localUserId };
   // shortcut: nonces live in memory per origin, so a restart costs one extra use_dpop_nonce round trip.
   const nonces = new Map<string, string>();
@@ -204,6 +253,25 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     const found = typeof connectionId === 'string' ? own((await load({ connectionId })).connections, connectionId) : undefined;
     if (!found) throw new AuthFailure('unknown_connection');
     return found;
+  }
+  function destinations(metadata: CompanyMetadata): string {
+    const auth = metadata.authorization;
+    return JSON.stringify([auth?.issuer, auth?.token_endpoint, auth?.revocation_endpoint, auth?.authorization_endpoint, auth?.device_authorization_endpoint,
+      metadata.document.auth?.mediated?.endpoint, metadata.document.agent?.protocols]);
+  }
+  async function verified(metadata: CompanyMetadata): Promise<CompanyMetadata> {
+    let fresh: CompanyMetadata;
+    try { fresh = await options.metadata.resolveCompany(new URL(metadata.url).hostname); } catch { throw new AuthFailure('discovery_failed'); }
+    if (destinations(fresh) !== destinations(metadata)) throw new AuthFailure('metadata_changed');
+    return fresh;
+  }
+  async function currentConnection(id: string): Promise<ConnectionRecord> {
+    const found = await record(id), metadata = await verified(found.metadata);
+    return await transaction({ connectionId: id }, state => {
+      const current = own(state.connections, id)!;
+      if (destinations(current.metadata) !== destinations(metadata)) throw new AuthFailure('state_changed', id);
+      current.metadata = metadata; return current;
+    });
   }
   function publicConnection(state: ClientAuthState, connection: ConnectionRecord): Connection {
     const { id, domain, issuer, sessionId, generation, status, grantId } = connection;
@@ -224,6 +292,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     return { privateKey, jwk, thumbprint: await calculateJwkThumbprint(jwk) };
   }
   async function signIdentity(header: JsonObject, payload: JsonObject, dpopThumbprint: string): Promise<string> {
+    if (!identity) throw new AuthFailure('invalid_signer');
     const jwk = publicEcJwk(await identity.publicJwk(), 'invalid_signer');
     if (await calculateJwkThumbprint(jwk) === dpopThumbprint) throw new AuthFailure('key_separation');
     let key: CryptoKey;
@@ -252,21 +321,37 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     const iat = Math.floor(now() / 1000);
     return { iss: clientId, sub, aud, iat, exp: iat + ASSERTION_SECONDS, jti: randomId() };
   }
+  async function assertion(purpose: 'session' | 'client-authentication', issuer: string, key: DpopKey, sub = clientId, operationId = randomId('op_')): Promise<string> {
+    if (!options.assertions) return signIdentity({ typ: purpose === 'session' ? 'JWT' : 'client-authentication+jwt' }, assertionClaims(sub, issuer), key.thumbprint);
+    try {
+      const result = await options.assertions.assert({ operationId, issuer, purpose });
+      if (typeof result.assertion !== 'string' || !result.assertion || !Number.isFinite(result.expiresAt) || result.expiresAt * 1000 <= now() || result.expiresAt * 1000 > now() + ASSERTION_SECONDS * 1000) throw 0;
+      return result.assertion;
+    } catch { throw new AuthFailure('provider_unavailable'); }
+  }
+  function responseFailure(response: Response, code: string): AuthFailure {
+    const value = response.headers.get('retry-after');
+    const delay = retryAfterMilliseconds(value, now());
+    const deadline = value && /^\d+$/.test(value) ? (BigInt(Math.floor(now())) + BigInt(value) * 1000n).toString()
+      : delay === undefined ? undefined : String(Math.floor(now() + delay));
+    return new AuthFailure(code, undefined, delay, deadline);
+  }
   // Token endpoint request with client assertion and fresh DPoP proof (spec 4.1-4.3); sessionSub adds a session assertion.
   // Throws transport_error only when the request may have reached the issuer without a readable answer.
-  async function tokenRequest(metadata: CompanyMetadata, dpopKeyRef: string, fields: Record<string, string>, sessionSub: string | null): Promise<TokenResponse> {
-    const authorization = metadata.authorization!;
+  async function tokenRequest(metadata: CompanyMetadata, dpopKeyRef: string, fields: Record<string, string>, sessionSub: string | null, localIdentity = false): Promise<TokenResponse> {
+    const authorization = (await verified(metadata)).authorization!;
     const endpoint = authorization.token_endpoint;
     const key = await loadDpopKey(dpopKeyRef);
     for (let attempt = 0; ; attempt++) {
       const body = new URLSearchParams(fields);
-      if (sessionSub !== null) body.set('assertion', await signIdentity({ typ: 'JWT' }, assertionClaims(sessionSub, authorization.issuer), key.thumbprint));
+      if (sessionSub !== null) body.set('assertion', localIdentity ? await signIdentity({ typ: 'JWT' }, assertionClaims(sessionSub, authorization.issuer), key.thumbprint) : await assertion('session', authorization.issuer, key, sessionSub));
       body.set('client_id', clientId);
       body.set('client_assertion_type', CLIENT_ASSERTION);
-      body.set('client_assertion', await signIdentity({ typ: 'client-authentication+jwt' }, assertionClaims(clientId, authorization.issuer), key.thumbprint));
+      body.set('client_assertion', localIdentity ? await signIdentity({ typ: 'client-authentication+jwt' }, assertionClaims(clientId, authorization.issuer), key.thumbprint) : await assertion('client-authentication', authorization.issuer, key));
       const request = new Request(endpoint, { method: 'POST', body, headers: { accept: 'application/json', dpop: await proof(key, 'POST', endpoint) } });
       let response: Response, text: string;
-      try { response = await transport.fetch(request); text = await response.text(); } catch { throw new AuthFailure('transport_error'); }
+      try { response = await transport.fetch(request); } catch { throw new AuthFailure('transport_error'); }
+      try { text = await response.text(); } catch { throw responseFailure(response, 'transport_error'); }
       rememberNonce(endpoint, response);
       let json: unknown;
       try { json = parseJson(text); } catch { /* reported below */ }
@@ -277,30 +362,36 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       try { if (response.status !== 429) error = parseProtocolError(json).error; } catch { /* non-OAuth body */ }
       if (error === 'use_dpop_nonce' && response.status === 400 && attempt === 0 && response.headers.has('dpop-nonce')) continue;
       // Only a recognised OAuth code on a 4xx is a definite rejection; a 5xx or proxy page may follow a completed exchange.
-      throw new AuthFailure(response.status >= 400 && response.status < 500 && (SAFE_ERRORS.has(error) || response.status === 429) ? error : 'token_error', undefined, retryAfterMilliseconds(response.headers.get('retry-after'), now())); // spec 4.3: the agent waits
+      throw responseFailure(response, response.status >= 400 && response.status < 500 && (SAFE_ERRORS.has(error) || ['authorization_pending', 'slow_down', 'access_denied', 'expired_token'].includes(error) || response.status === 429) ? error : 'token_error');
     }
   }
 
   // Signed-out Session Token via the JWT bearer grant (spec 4.2); renewal passes session_id.
-  async function signedOutToken(metadata: CompanyMetadata, userId: string, dpopKeyRef: string, sessionId: string | null, resource: string | null): Promise<TokenResponse> {
+  async function signedOutToken(metadata: CompanyMetadata, userId: string, dpopKeyRef: string, sessionId: string | null, resource: string | null, anonymous = false): Promise<TokenResponse> {
     const fields: Record<string, string> = { grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer' };
     if (sessionId !== null) fields.session_id = sessionId;
     if (resource !== null) fields.resource = resource;
-    const token = await tokenRequest(metadata, dpopKeyRef, fields, userId);
+    const token = await tokenRequest(metadata, dpopKeyRef, fields, userId, anonymous);
     // Only DPoP is executable; a Bearer token is never used as a fallback.
     if (token.token_type !== 'DPoP') throw new AuthFailure('unsupported_token_type');
     if (token.signed_in !== false || token.scope !== '' || (sessionId !== null && token.session_id !== sessionId)) throw new AuthFailure('invalid_response');
     return token;
   }
 
-  async function identityFor(issuer: string): Promise<{ userId: string; dpopKeyRef: string }> {
-    const existing = own((await load({ issuer })).identities, issuer);
+  async function identityFor(issuer: string, anonymous = false): Promise<{ userId: string; dpopKeyRef: string }> {
+    if (anonymous && !identity) throw new AuthFailure('anonymous_unavailable');
+    const existing = anonymous ? undefined : own((await load({ issuer })).identities, issuer);
     if (existing) return existing;
     // shortcut: extractable key, because the SecretStore holds the private JWK as a string and Node cannot persist a non-extractable CryptoKey; move to a KMS/OS-keystore signer when the host platform offers one.
     const pair = await crypto.subtle.generateKey(EC, true, ['sign', 'verify']);
     const { kty, crv, x, y, d } = await crypto.subtle.exportKey('jwk', pair.privateKey);
     const dpopKeyRef = await secrets.stage(JSON.stringify({ kty, crv, x, y, d }));
-    const userId = randomId('usr_');
+    let userId = randomId('usr_');
+    if (options.providerIdentity && !anonymous) {
+      try { const bound = await options.providerIdentity.identity(issuer); if (bound.clientId !== clientId || typeof bound.userId !== 'string' || !bound.userId) throw 0; userId = bound.userId; }
+      catch { await secrets.remove(dpopKeyRef); throw new AuthFailure('provider_unavailable'); }
+    }
+    if (anonymous) return { userId, dpopKeyRef };
     const winner = await transaction({ issuer }, state => own(state.identities, issuer) ?? (state.identities[issuer] = { userId, dpopKeyRef }));
     // A concurrent start won; our staged key was never referenced by any record.
     if (winner.dpopKeyRef !== dpopKeyRef) await secrets.remove(dpopKeyRef);
@@ -354,10 +445,10 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     // Expiry counts from before dispatch so a slow response never extends the token's believed lifetime.
     const issuedAt = now(), operationId = randomId('op_');
     let token: TokenResponse;
-    try { token = await signedOutToken(connection.metadata, connection.userId, connection.dpopKeyRef, connection.sessionId, resource); } catch (error) {
+    try { token = await signedOutToken(connection.metadata, connection.userId, connection.dpopKeyRef, connection.sessionId, resource, connection.anonymous); } catch (error) {
       // The Session ended (spec 4.2): start a new signed-out one. Signed-out renewal never touches an account.
       if (!(error instanceof AuthFailure && error.code === 'invalid_session')) throw error;
-      token = await signedOutToken(connection.metadata, connection.userId, connection.dpopKeyRef, null, resource);
+      token = await signedOutToken(connection.metadata, connection.userId, connection.dpopKeyRef, null, resource, connection.anonymous);
     }
     const secretRef = await stageSessionToken(token.access_token);
     return commit({ connectionId: connection.id }, [secretRef], (state, drop) => {
@@ -416,7 +507,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         token = await send();
       }
     } catch (error) {
-      if (error instanceof AuthFailure && error.retryAfterMs !== undefined) retryAfter.set(operationId, error.retryAfterMs);
+      if (error instanceof AuthFailure && error.retryAfterMs !== undefined) await holdOff(connection.id, error);
       const code = error instanceof AuthFailure ? error.code : 'local_error'; // non-AuthFailure errors come from local signing before dispatch
       // A lost, unreadable or non-OAuth answer may follow a rotation, so the old Account Token is never resent (IMPLEMENTATION 4).
       if (AMBIGUOUS.has(code)) return await endRefresh(operationId, 'uncertain', 'lost_response');
@@ -500,31 +591,33 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     replaceSlot(connection, operation.resource, { secretRef: staged.accessRef, tokenType: 'DPoP', dpopKeyRef: connection.dpopKeyRef, scopes: staged.scopes, expiresAt: staged.expiresAt, generation: connection.generation }, drop);
     return finish(state, operation, 'completed');
   }
-  // Retry-After from the issuer (spec 4.3: the agent MUST wait). In memory: a restart forgets it, which costs at most one early request.
-  const retryAfter = new Map<string, number>(); // operation id -> ms, handed from refresh() to renewal()
-  const notBefore = new Map<string, number>(); // connection id -> earliest next token request
-  const MAX_RETRY_AFTER_MS = 3_600_000; // a huge or Infinity Retry-After must not block a connection until restart
-  function holdOff(connectionId: string, ms: number): number {
-    const clamped = Math.min(ms, MAX_RETRY_AFTER_MS);
-    notBefore.set(connectionId, now() + clamped);
-    return clamped;
+  // Decimal absolute milliseconds preserve even Retry-After values beyond safe JS integers.
+  async function holdOff(connectionId: string, error: AuthFailure): Promise<void> {
+    if (error.retryAt === undefined) return;
+    await transaction({ connectionId }, state => {
+      const connection = own(state.connections, connectionId)!;
+      if (BigInt(error.retryAt!) > BigInt(connection.notBefore ?? '0')) connection.notBefore = error.retryAt;
+    });
+  }
+  function checkCooldown(connection: ConnectionRecord): void {
+    const wait = BigInt(connection.notBefore ?? '0') - BigInt(Math.floor(now()));
+    if (wait > 0n) throw new AuthFailure('rate_limited', connection.id, Number(wait), connection.notBefore);
   }
   // Every token-request path (internal refresh and public renew) goes through here, so all honour Retry-After.
   async function renewal(connection: ConnectionRecord, resource: string | null, scopes: string[] | null): Promise<AuthOutcome> {
     // Local failures first: a wait is only meaningful for a connection that can still send a token request.
     if (connection.status === 'signed_out' && scopes?.length) throw new AuthFailure('invalid_scope', connection.id);
     if (connection.status !== 'signed_out' && connection.status !== 'signed_in') throw new AuthFailure(connection.status === 'disconnected' ? 'disconnected' : 'grant_uncertain', connection.id);
-    const wait = (notBefore.get(connection.id) ?? 0) - now();
-    if (wait > 0) throw new AuthFailure('rate_limited', connection.id, wait);
+    checkCooldown(await record(connection.id));
     let outcome: AuthOutcome;
     try {
       outcome = connection.status === 'signed_out' ? await signedOutRenewal(connection, resource) : await refresh(connection, resource, scopes);
     } catch (error) {
-      if (error instanceof AuthFailure && error.retryAfterMs !== undefined) throw new AuthFailure(error.code, error.connectionId, holdOff(connection.id, error.retryAfterMs));
+      if (error instanceof AuthFailure && error.retryAfterMs !== undefined) await holdOff(connection.id, error);
       throw error;
     }
-    const ms = retryAfter.get(outcome.operationId); retryAfter.delete(outcome.operationId);
-    return ms === undefined ? outcome : { ...outcome, retryAfterMs: holdOff(connection.id, ms) };
+    const deadline = (await record(connection.id)).notBefore;
+    return deadline === undefined ? outcome : { ...outcome, retryAfterMs: Math.max(0, Number(BigInt(deadline) - BigInt(Math.floor(now())))) };
   }
 
   // In-process single flight: parallel requests on one stale slot share one renewal; the grant claim covers other processes.
@@ -562,9 +655,18 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   // RFC 7009 revocation with a fresh client assertion (spec 4.9). Replay is safe, so anything but 200 stays pending.
   async function revoke(connection: ConnectionRecord, item: CleanupRecord, token: string): Promise<boolean> {
     try {
+      if (BigInt(item.notBefore ?? '0') > BigInt(Math.floor(now()))) return false;
       const key = await loadDpopKey(connection.dpopKeyRef);
-      const body = new URLSearchParams({ token, token_type_hint: 'refresh_token', client_id: clientId, client_assertion_type: CLIENT_ASSERTION, client_assertion: await signIdentity({ typ: 'client-authentication+jwt' }, assertionClaims(clientId, item.issuer), key.thumbprint) });
+      await verified(connection.metadata);
+      const body = new URLSearchParams({ token, token_type_hint: 'refresh_token', client_id: clientId, client_assertion_type: CLIENT_ASSERTION, client_assertion: await assertion('client-authentication', item.issuer, key) });
       const response = await transport.fetch(new Request(item.revocationEndpoint, { method: 'POST', body, headers: { accept: 'application/json' } }));
+      if (response.status === 429 || response.status === 503) {
+        const deadline = responseFailure(response, 'rate_limited').retryAt;
+        if (deadline) await transaction({ connectionId: connection.id }, state => {
+          const current = own(state.cleanup, item.id);
+          if (current?.secretRef === item.secretRef && BigInt(deadline) > BigInt(current.notBefore ?? '0')) current.notBefore = deadline;
+        });
+      }
       await response.body?.cancel();
       return response.status === 200;
     } catch { return false; }
@@ -596,7 +698,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     return operation.result ?? { operationId: operation.id, status: 'pending', connection: publicConnection(state, own(state.connections, operation.connectionId)!), nextAction: 'wait' };
   }
   // The terminal result is recorded once and returned verbatim to duplicate callbacks.
-  function finish(state: ClientAuthState, operation: OperationRecord, status: OperationStatus, extra: { error?: string; missingScopes?: string[] } = {}): AuthOutcome {
+  function finish(state: ClientAuthState, operation: OperationRecord, status: OperationStatus, extra: { error?: string; missingScopes?: string[]; grantedScopes?: string[] } = {}): AuthOutcome {
     operation.phase = 'terminal'; operation.status = status;
     const result: AuthOutcome = { operationId: operation.id, status, connection: publicConnection(state, own(state.connections, operation.connectionId)!), ...extra };
     if (status === 'failed' || status === 'expired' || status === 'uncertain') result.nextAction = 'sign_in';
@@ -612,30 +714,253 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const operation = own(state.operations, operationId);
       if (!operation || operation.epoch !== state.epoch) throw new AuthFailure('state_changed');
       if (unusedGrantRef !== null) retire(state, `cln_${operationId}`, own(state.connections, operation.connectionId)!, unusedGrantRef);
-      return operation.phase === 'dispatched' ? finish(state, operation, status, extra) : outcomeOf(state, operation);
+      return operation.phase === 'dispatched' ? finish(state, operation, operation.cancelRequested && status !== 'uncertain' ? 'cancelled' : status, extra) : outcomeOf(state, operation);
     });
     // Terminal operations never read their verifier again.
     await secrets.remove(verifierRef);
     return outcome;
   }
 
-  return {
-    async start(domain) {
+  function privateRefs(operation: OperationRecord): string[] {
+    return [...(operation.direct ? [operation.direct.verifierRef] : []), ...(operation.device ? [operation.device.codeRef] : [])];
+  }
+  async function terminate(operationId: string, status: OperationStatus, error?: string): Promise<AuthOutcome> {
+    return commit({ operationId }, [], (state, drop) => {
+      const operation = own(state.operations, operationId)!;
+      if (operation.phase === 'terminal') return outcomeOf(state, operation);
+      drop.push(...privateRefs(operation));
+      return finish(state, operation, operation.cancelRequested && status !== 'uncertain' ? 'cancelled' : status, error ? { error } : {});
+    });
+  }
+  function activateSignIn(state: ClientAuthState, operation: OperationRecord, drop: string[]): AuthOutcome {
+    const staged = operation.staged!, target = own(state.connections, operation.connectionId)!;
+    const granted = staged.scopes, missingScopes = operation.scopes.filter(scope => !granted.includes(scope));
+    const previous = target.grantId === null ? undefined : own(state.grants, target.grantId);
+    const problem = operation.cancelRequested ? 'cancelled' : target.generation !== operation.connectionGeneration || target.sessionId !== operation.signInSessionId ? 'state_changed'
+      : previous && !(operation.requiredExistingScopes ?? previous.scopes).every(scope => granted.includes(scope)) ? 'replacement_rejected' : null;
+    drop.push(...privateRefs(operation));
+    if (problem) {
+      retire(state, `cln_${operation.id}`, target, staged.refreshRef!); drop.push(staged.accessRef);
+      return finish(state, operation, problem === 'cancelled' ? 'cancelled' : 'failed', { error: problem, grantedScopes: [...granted], missingScopes });
+    }
+    if (previous) { retire(state, `cln_${previous.id}`, target, previous.secretRef); delete state.grants[previous.id]; }
+    const grantId = randomId('grt_');
+    state.grants[grantId] = { id: grantId, issuer: target.issuer, userId: target.userId, secretRef: staged.refreshRef!, scopes: granted,
+      expiresAt: staged.refreshExpiresAt, generation: 1, status: 'active', operationId: null };
+    target.grantId = grantId; target.status = 'signed_in'; target.generation++;
+    drop.push(...Object.values(target.slots).map(slot => slot.secretRef));
+    target.slots = { [slotKey(staged.sessionId, operation.resource)]: { secretRef: staged.accessRef, tokenType: 'DPoP', dpopKeyRef: target.dpopKeyRef,
+      scopes: granted, expiresAt: staged.expiresAt, generation: target.generation } };
+    return finish(state, operation, 'completed', { grantedScopes: [...granted], missingScopes });
+  }
+  async function acceptSignIn(operationId: string, token: TokenResponse, issuedAt: number): Promise<AuthOutcome> {
+    const snapshot = await load({ operationId }), operation = own(snapshot.operations, operationId)!;
+    const granted = token.scope.split(' ').filter(Boolean);
+    let refreshRef: string | null = null;
+    try { if (token.refresh_token !== undefined) refreshRef = await secrets.stage(token.refresh_token); }
+    catch { return await terminate(operationId, 'uncertain', 'storage_error'); }
+    if (token.token_type !== 'DPoP' || token.signed_in !== true || token.session_id !== operation.signInSessionId || !refreshRef ||
+      !granted.length || new Set(granted).size !== granted.length || granted.some(scope => !operation.scopes.includes(scope))) {
+      return commit({ operationId }, [], (state, drop) => {
+        const current = own(state.operations, operationId)!;
+        if (refreshRef) retire(state, `cln_${operationId}`, own(state.connections, current.connectionId)!, refreshRef);
+        drop.push(...privateRefs(current)); return current.phase === 'terminal' ? outcomeOf(state, current) : finish(state, current, 'failed', { error: token.token_type !== 'DPoP' ? 'unsupported_token_type' : 'invalid_response' });
+      });
+    }
+    const accessRef = await stageSessionToken(token.access_token);
+    const staged: StagedRefresh = { accessRef, refreshRef, sessionId: token.session_id, scopes: granted, signedIn: true,
+      expiresAt: issuedAt + token.expires_in * 1000, refreshExpiresAt: token.refresh_token_expires_in === undefined ? null : issuedAt + token.refresh_token_expires_in * 1000 };
+    // Stage before activation: recovery can finish locally without exchanging a consumed credential again.
+    const recorded = await transaction({ operationId }, state => {
+      const current = own(state.operations, operationId)!;
+      if (current.phase !== 'dispatched') { retire(state, `cln_${operationId}`, own(state.connections, current.connectionId)!, refreshRef!); return false; }
+      current.phase = 'staged'; current.staged = staged; return true;
+    });
+    if (!recorded) { await secrets.remove(accessRef); return (await api.operation(operationId))!; }
+    return commit({ operationId }, [], (state, drop) => {
+      const current = own(state.operations, operationId)!;
+      return current.phase === 'staged' ? activateSignIn(state, current, drop) : outcomeOf(state, current);
+    });
+  }
+
+  async function claimSignIn(operationId: string, executionOwner: OperationOwner, preSend = false): Promise<{ operation: OperationRecord; connection: ConnectionRecord } | AuthOutcome> {
+    const snapshot = await load({ operationId }), operation = own(snapshot.operations, operationId)!;
+    await currentConnection(operation.connectionId);
+    return await transaction({ operationId }, state => {
+      const current = own(state.operations, operationId)!;
+      if (current.phase !== 'prepared') return outcomeOf(state, current);
+      if (current.cancelRequested) return finish(state, current, 'cancelled');
+      if (current.owner && (options.ownerAlive ?? localOwnerAlive)(current.owner)) return outcomeOf(state, current);
+      const connection = own(state.connections, current.connectionId)!;
+      if (current.expiresAt <= now()) return finish(state, current, 'expired');
+      if (current.connectionGeneration !== connection.generation || current.signInSessionId !== connection.sessionId) return finish(state, current, 'failed', { error: 'state_changed' });
+      checkCooldown(connection);
+      if (!preSend) current.phase = 'dispatched'; current.owner = executionOwner;
+      return { operation: current, connection };
+    });
+  }
+  async function remoteFailure(operationId: string, error: unknown): Promise<AuthOutcome> {
+    const operation = own((await load({ operationId })).operations, operationId)!;
+    if (error instanceof AuthFailure) await holdOff(operation.connectionId, error);
+    const code = error instanceof AuthFailure ? error.code : 'local_error';
+    return await terminate(operationId, AMBIGUOUS.has(code) ? 'uncertain' : 'failed', AMBIGUOUS.has(code) ? 'lost_response' : code);
+  }
+  async function beginDevice(operationId: string): Promise<SignInStart> {
+    const executionOwner = acquireOwner();
+    try {
+      const claim = await claimSignIn(operationId, executionOwner);
+      if (!('operation' in claim)) return { outcome: claim };
+      const { operation, connection } = claim, metadata = connection.metadata;
+      const endpoint = metadata.authorization!.device_authorization_endpoint!, key = await loadDpopKey(connection.dpopKeyRef);
+      const body = new URLSearchParams({ scope: operation.scopes.join(' '), client_id: clientId, client_assertion_type: CLIENT_ASSERTION,
+        client_assertion: await assertion('client-authentication', connection.issuer, key, clientId, operationId) });
+      let response: Response, value: Record<string, unknown>;
+      try { response = await transport.fetch(new Request(endpoint, { method: 'POST', body, headers: { accept: 'application/json' } })); }
+      catch { throw new AuthFailure('transport_error'); }
+      if (response.status !== 200) { await response.body?.cancel(); throw responseFailure(response, response.status === 429 ? 'rate_limited' : 'token_error'); }
+      try { value = parseJson(await response.text()) as Record<string, unknown>; } catch { throw new AuthFailure('invalid_response'); }
+      const { device_code, user_code, verification_uri, verification_uri_complete, expires_in, interval = 5 } = value ?? {};
+      const hosts = [new URL(connection.issuer).hostname, ...metadata.authorization!.poppy_domains];
+      if (typeof device_code !== 'string' || !device_code || typeof user_code !== 'string' || !user_code || typeof verification_uri !== 'string' || !allowedHost(verification_uri, hosts) ||
+        (verification_uri_complete !== undefined && (typeof verification_uri_complete !== 'string' || !allowedHost(verification_uri_complete, hosts))) ||
+        typeof expires_in !== 'number' || !Number.isSafeInteger(expires_in) || expires_in <= 0 || expires_in > 86400 || typeof interval !== 'number' || !Number.isSafeInteger(interval) || interval < 1 || interval > 86400) throw new AuthFailure('invalid_response');
+      const codeRef = await secrets.stage(device_code), nextPollAt = now() + interval * 1000;
+      const outcome = await commit({ operationId }, [codeRef], (state, drop) => {
+        const current = own(state.operations, operationId)!;
+        if (current.cancelRequested) { drop.push(codeRef); return finish(state, current, 'cancelled'); }
+        if (current.phase !== 'dispatched' || own(state.connections, current.connectionId)!.generation !== current.connectionGeneration) { drop.push(codeRef); return finish(state, current, 'failed', { error: 'state_changed' }); }
+        current.phase = 'prepared'; delete current.owner; current.expiresAt = Math.min(current.expiresAt, now() + expires_in * 1000);
+        current.device = { codeRef, intervalMs: interval * 1000, nextPollAt }; return outcomeOf(state, current);
+      });
+      if (outcome.status !== 'pending') return { outcome };
+      return { outcome, device: { verificationUri: verification_uri, ...(verification_uri_complete === undefined ? {} : { verificationUriComplete: verification_uri_complete }),
+        userCode: user_code, organization: { ...metadata.document.organization }, nextPollAt } };
+    } catch (error) { return { outcome: await remoteFailure(operationId, error) }; }
+    finally { releaseOwner(executionOwner); }
+  }
+  async function pollDevice(operationId: string): Promise<AuthOutcome> {
+    const snapshot = await load({ operationId }), found = own(snapshot.operations, operationId)!;
+    if (!found.device) throw new AuthFailure('invalid_operation');
+    if (found.expiresAt <= now()) return await terminate(operationId, 'expired');
+    const wait = found.device.nextPollAt - now();
+    if (wait > 0) return { ...outcomeOf(snapshot, found), retryAfterMs: wait };
+    const executionOwner = acquireOwner();
+    try {
+      const claim = await claimSignIn(operationId, executionOwner);
+      if (!('operation' in claim)) return claim;
+      const { operation, connection } = claim, code = await secrets.read(operation.device!.codeRef);
+      if (!code) return await terminate(operationId, 'failed', 'missing_credential');
+      const issuedAt = now(), fields: Record<string, string> = { grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: code, session_id: operation.signInSessionId! };
+      if (operation.resource) fields.resource = operation.resource;
+      let token: TokenResponse;
+      try { token = await tokenRequest(connection.metadata, connection.dpopKeyRef, fields, null); }
+      catch (error) {
+        if (error instanceof AuthFailure && ['authorization_pending', 'slow_down', 'rate_limited'].includes(error.code)) {
+          await holdOff(connection.id, error);
+          return await transaction({ operationId }, state => {
+            const current = own(state.operations, operationId)!;
+            if (current.phase !== 'dispatched') return outcomeOf(state, current);
+            if (current.cancelRequested) return finish(state, current, 'cancelled');
+            if (error.code === 'slow_down') current.device!.intervalMs += 5000;
+            current.device!.nextPollAt = now() + Math.max(current.device!.intervalMs, Number.isFinite(error.retryAfterMs) ? error.retryAfterMs ?? 0 : 0);
+            current.phase = 'prepared'; delete current.owner;
+            return { ...outcomeOf(state, current), retryAfterMs: current.device!.nextPollAt - now() };
+          });
+        }
+        if (error instanceof AuthFailure && ['access_denied', 'expired_token'].includes(error.code)) return await terminate(operationId, error.code === 'access_denied' ? 'denied' : 'expired', error.code);
+        return await remoteFailure(operationId, error);
+      }
+      return await acceptSignIn(operationId, token, issuedAt);
+    } finally { releaseOwner(executionOwner); }
+  }
+  async function continueMediated(operationId: string): Promise<AuthOutcome> {
+    const executionOwner = acquireOwner();
+    let sensitive: Record<string, string> | null = null;
+    try {
+      const claim = await claimSignIn(operationId, executionOwner, true);
+      if (!('operation' in claim)) return claim;
+      const { operation, connection } = claim, mediated = connection.metadata.document.auth!.mediated!;
+      if (!options.trustedInput) return await terminate(operationId, 'failed', 'trusted_input_required');
+      const fields = operation.mediated ? [{ name: 'code', label: 'One-time code', secret: true }] : mediated.fields;
+      let values: Record<string, string> | null;
+      try { values = await options.trustedInput.collect({ operationId, issuer: connection.issuer, organization: { ...connection.metadata.document.organization }, fields: structuredClone(fields),
+        ...(operation.mediated ? { challenge: { id: operation.mediated.challengeId, sentTo: operation.mediated.sentTo, expiresAt: operation.expiresAt } } : {}) }); }
+      catch { return await terminate(operationId, 'failed', 'input_unavailable'); }
+      sensitive = values;
+      if (values === null) return await terminate(operationId, 'cancelled');
+      if (!values || Object.keys(values).length !== fields.length || !fields.every(field => Object.hasOwn(values!, field.name) && typeof values![field.name] === 'string' && values![field.name].length > 0 && values![field.name].length <= 4096)) return await terminate(operationId, 'failed', 'invalid_input');
+      const endpoint = operation.mediated ? `${mediated.endpoint.replace(/\/$/, '')}/${encodeURIComponent(operation.mediated.challengeId)}` : mediated.endpoint;
+      let credential = await credentialFor(connection.id, operation.resource, null), token = await secrets.read(credential.secretRef);
+      if (!token) { credential = await credentialFor(connection.id, operation.resource, credential.secretRef); token = await secrets.read(credential.secretRef); }
+      if (!token) return await terminate(operationId, 'failed', 'missing_credential');
+      if (connection.sessionId !== (await record(connection.id)).sessionId || now() >= operation.expiresAt) return await terminate(operationId, 'expired');
+      let response: Response | undefined, json: Record<string, unknown>;
+      const issuedAt = now(), key = await loadDpopKey(connection.dpopKeyRef);
+      const dispatch = await transaction({ operationId }, state => {
+        const current = own(state.operations, operationId)!;
+        if (current.phase !== 'prepared' || current.owner?.id !== executionOwner.id || current.cancelRequested) return false;
+        const live = own(state.connections, current.connectionId)!;
+        if (live.generation !== current.connectionGeneration || live.sessionId !== current.signInSessionId || current.expiresAt <= now()) { finish(state, current, 'cancelled'); return false; }
+        current.phase = 'dispatched'; return true;
+      });
+      if (!dispatch) return (await api.operation(operationId))!;
+      try {
+        // Bounded nonce retry only; credentials remain exclusively within this trusted call.
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (attempt > 0 && own((await load({ operationId })).operations, operationId)?.cancelRequested) return await terminate(operationId, 'cancelled');
+          response = await transport.fetch(new Request(endpoint, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `DPoP ${token}`, dpop: await proof(key, 'POST', endpoint, token) },
+            body: JSON.stringify(operation.mediated ? { code: values.code } : { scope: operation.scopes.join(' '), credentials: values }) }));
+          rememberNonce(endpoint, response);
+          if (response.status === 401 && attempt === 0 && dpopChallenge(response.headers.get('www-authenticate'))?.error === 'use_dpop_nonce' && response.headers.has('dpop-nonce')) { await response.body?.cancel(); continue; }
+          break;
+        }
+        if (response!.status === 429 || response!.status === 503) await holdOff(connection.id, responseFailure(response!, 'rate_limited'));
+        json = parseJson(await response!.text()) as Record<string, unknown>;
+      } catch { return await terminate(operationId, response?.status === 429 ? 'failed' : 'uncertain', response?.status === 429 ? 'rate_limited' : 'lost_response'); }
+      const echoed = Object.values(values); for (const name of Object.keys(values)) delete values[name]; values = null;
+      if (response!.status !== 200) {
+        const error = responseFailure(response!, response!.status === 429 ? 'rate_limited' : response!.status >= 400 && response!.status < 500 && typeof json?.error === 'string' && SAFE_ERRORS.has(json.error) ? json.error : 'token_error');
+        return await remoteFailure(operationId, error);
+      }
+      if (json?.status === 'complete') {
+        let result: TokenResponse; try { result = parseTokenResponse(json); } catch { return await terminate(operationId, 'uncertain', 'invalid_response'); }
+        return await acceptSignIn(operationId, result, issuedAt);
+      }
+      if (json?.status === 'failed' || json?.status === 'expired') return await terminate(operationId, json.status === 'expired' ? 'expired' : 'denied');
+      const code = json?.code as Record<string, unknown> | undefined, expiresAt = typeof json?.expires_at === 'string' ? Date.parse(json.expires_at) : NaN;
+      if (json?.status !== 'code_required' || typeof json.sign_in_id !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(json.sign_in_id) ||
+        (operation.mediated && operation.mediated.challengeId !== json.sign_in_id) || typeof code?.sent_to !== 'string' || code.sent_to.length > 512 || !Number.isFinite(expiresAt) || expiresAt <= now()) return await terminate(operationId, 'failed', 'invalid_response');
+      const sentTo = echoed.some(value => value.length > 2 && (code.sent_to as string).includes(value)) ? 'The company sent a one-time code.' : code.sent_to;
+      return await transaction({ operationId }, state => {
+        const current = own(state.operations, operationId)!;
+        if (current.phase !== 'dispatched') return outcomeOf(state, current);
+        if (current.cancelRequested) return finish(state, current, 'cancelled');
+        current.phase = 'prepared'; delete current.owner; current.expiresAt = Math.min(current.expiresAt, expiresAt);
+        current.mediated = { challengeId: json.sign_in_id as string, sentTo }; return outcomeOf(state, current);
+      });
+    } catch (error) { if (!(error instanceof AuthFailure)) throw error; return await remoteFailure(operationId, error); }
+    finally { if (sensitive) for (const name of Object.keys(sensitive)) delete sensitive[name]; releaseOwner(executionOwner); }
+  }
+
+  const api: ClientAuth = {
+    async start(domain, input) {
       let metadata: CompanyMetadata;
       try { metadata = await options.metadata.resolveCompany(domain); } catch { throw new AuthFailure('discovery_failed'); }
       if (!metadata.authorization) throw new AuthFailure('no_auth');
       const issuer = metadata.authorization.issuer;
-      const { userId, dpopKeyRef } = await identityFor(issuer);
+      const anonymous = input?.anonymous === true;
+      const { userId, dpopKeyRef } = await identityFor(issuer, anonymous);
       const createdAt = now();
-      const token = await signedOutToken(metadata, userId, dpopKeyRef, null, null);
+      const token = await signedOutToken(metadata, userId, dpopKeyRef, null, null, anonymous);
       const secretRef = await stageSessionToken(token.access_token);
       const id = randomId('con_'), operationId = randomId('op_');
       return commit({ issuer }, [secretRef], state => {
         // A reset or competing identity since we signed means this session belongs to no current identity.
-        if (own(state.identities, issuer)?.dpopKeyRef !== dpopKeyRef) throw new AuthFailure('state_changed');
+        if (!anonymous && own(state.identities, issuer)?.dpopKeyRef !== dpopKeyRef) throw new AuthFailure('state_changed');
         const connection: ConnectionRecord = {
           id, domain, issuer, metadata, userId, dpopKeyRef, sessionId: token.session_id, generation: 1, status: 'signed_out', grantId: null,
           slots: { [slotKey(token.session_id, null)]: { secretRef, tokenType: 'DPoP', dpopKeyRef, scopes: [], expiresAt: createdAt + token.expires_in * 1000, generation: 1 } },
+          ...(anonymous ? { anonymous: true } : {}),
         };
         state.connections[id] = connection;
         pruneHistory(state);
@@ -656,19 +981,44 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const state = await load({ list: true });
       return Object.values(state.connections).map(connection => publicConnection(state, connection));
     },
-    async target(connectionId) { return targetOf(await record(connectionId)); },
+    async target(connectionId) { return targetOf(await currentConnection(connectionId)); },
 
     // Direct Sign-In (spec 4.5): the operation binds everything the callback must match before the URL exists.
+    async authorization(connectionId, requiredScopes) {
+      if (!Array.isArray(requiredScopes) || !requiredScopes.every(scope => typeof scope === 'string' && /^[\x21\x23-\x5B\x5D-\x7E]+$/.test(scope))) throw new AuthFailure('invalid_scope', connectionId);
+      const connection = await currentConnection(connectionId), state = await load({ connectionId });
+      const grantedScopes = publicConnection(state, connection).scopes;
+      const grant = connection.grantId ? own(state.grants, connection.grantId) : undefined;
+      const methods = (['direct', 'device', 'mediated'] as const).flatMap(method => {
+        const supported = connection.metadata.document.auth?.[method];
+        return supported ? [{ method, scopes: [...supported.scopes] }] : [];
+      });
+      const required = [...new Set(requiredScopes)], missingScopes = required.filter(scope => !grantedScopes.includes(scope));
+      return { requiredScopes: required, grantedScopes, missingScopes, sufficient: connection.status === 'signed_in' && grant?.status === 'active' && (grant.expiresAt === null || grant.expiresAt > now()) && !missingScopes.length,
+        methods, organization: { ...connection.metadata.document.organization } };
+    },
     async beginSignIn(connectionId, input) {
-      const found = await record(connectionId);
-      const direct = found.metadata.document.auth?.direct;
+      let found = await currentConnection(connectionId);
+      if (found.anonymous) {
+        await api.signOut(connectionId);
+        const regular = await api.start(found.domain); connectionId = regular.connection.id;
+        found = await currentConnection(connectionId);
+      }
+      const method = input?.method ?? 'direct';
+      if (!['direct', 'device', 'mediated'].includes(method)) throw new AuthFailure('unsupported_method', connectionId);
+      const supported = found.metadata.document.auth?.[method];
       const authorizationEndpoint = found.metadata.authorization?.authorization_endpoint;
-      if (!direct || !authorizationEndpoint) throw new AuthFailure('direct_unavailable', connectionId);
-      const { scopes, redirectUri, browserBinding } = (input ?? {}) as { scopes?: unknown; redirectUri?: unknown; browserBinding?: unknown };
-      if (!Array.isArray(scopes) || !scopes.length || new Set(scopes).size !== scopes.length || !scopes.every(scope => typeof scope === 'string' && direct.scopes.includes(scope))) throw new AuthFailure('invalid_scope', connectionId);
-      if (typeof redirectUri !== 'string' || !options.redirectUris.includes(redirectUri) || !URL.canParse(redirectUri)) throw new AuthFailure('invalid_redirect', connectionId);
+      if (!supported || (method === 'direct' && !authorizationEndpoint) || (method === 'device' && !found.metadata.authorization?.device_authorization_endpoint)) throw new AuthFailure(`${method}_unavailable`, connectionId);
+      const { scopes, redirectUri, browserBinding, requiredExistingScopes } = input ?? {};
+      if (!Array.isArray(scopes) || !scopes.length || new Set(scopes).size !== scopes.length || !scopes.every(scope => typeof scope === 'string' && supported.scopes.includes(scope))) throw new AuthFailure('invalid_scope', connectionId);
+      const requirement = await api.authorization(connectionId, scopes);
+      if (requiredExistingScopes !== undefined && (!Array.isArray(requiredExistingScopes) || !requiredExistingScopes.every(scope => requirement.grantedScopes.includes(scope)))) throw new AuthFailure('invalid_scope', connectionId);
+      if (requirement.sufficient && !input.force) return { outcome: { operationId: '', status: 'completed', connection: publicConnection(await load({ connectionId }), found), grantedScopes: requirement.grantedScopes, missingScopes: [] } };
+      checkCooldown(found);
+      if (method === 'mediated' && !options.trustedInput) throw new AuthFailure('trusted_input_required', connectionId);
+      if (method === 'direct' && (typeof redirectUri !== 'string' || !options.redirectUris.includes(redirectUri) || !URL.canParse(redirectUri) || !safeHttps(redirectUri) || new URL(redirectUri).hostname !== new URL(clientId).hostname || CALLBACK_PARAMS.some(name => new URL(redirectUri).searchParams.has(name)))) throw new AuthFailure('invalid_redirect', connectionId);
       // The host derives this from its authenticated browser session; a short value would be guessable.
-      if (typeof browserBinding !== 'string' || browserBinding.length < 22) throw new AuthFailure('invalid_binding', connectionId);
+      if (method === 'direct' && (typeof browserBinding !== 'string' || browserBinding.length < 22)) throw new AuthFailure('invalid_binding', connectionId);
       // Ask for the conversation resource up front so the signed-in token is usable there (spec 4.3 "Narrower tokens").
       const resource = found.metadata.document.agent?.protocols.find(protocol => protocol.type === 'poppy')?.resource ?? null;
       // The code exchange names this Session (spec 4.5). A stale credential means it may have ended, so renew first,
@@ -682,7 +1032,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (connection.status === 'disconnected' || connection.sessionId === null) throw new AuthFailure('sign_in_unavailable', connectionId);
       const state = b64(crypto.getRandomValues(new Uint8Array(32)));
       const verifier = b64(crypto.getRandomValues(new Uint8Array(32)));
-      const verifierRef = await secrets.stage(verifier);
+      const verifierRef = method === 'direct' ? await secrets.stage(verifier) : null;
       const createdAt = now(), operationId = randomId('op_');
       const outcome = await commit({ connectionId }, [verifierRef], draft => {
         const current = own(draft.connections, connectionId);
@@ -691,13 +1041,16 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         const operation: OperationRecord = draft.operations[operationId] = {
           epoch: draft.epoch, id: operationId, kind: 'sign_in', connectionId, connectionGeneration: current.generation, grantId: current.grantId, grantGeneration: null,
           phase: 'prepared', status: 'pending', createdAt, expiresAt: createdAt + SIGN_IN_MS, resource, scopes: [...scopes],
-          direct: { stateHash: sha256(state), verifierRef, browserHash: sha256(browserBinding), redirectUri, issuer: current.issuer, clientId, sessionId: connection.sessionId! },
+          method, signInSessionId: connection.sessionId!, requiredExistingScopes: requiredExistingScopes ?? requirement.grantedScopes,
+          direct: method === 'direct' ? { stateHash: sha256(state), verifierRef: verifierRef!, browserHash: sha256(browserBinding!), redirectUri: redirectUri!, issuer: current.issuer, clientId, sessionId: connection.sessionId! } : null,
           staged: null, result: null,
         };
         return outcomeOf(draft, operation);
       });
-      const url = new URL(authorizationEndpoint);
-      const query = { response_type: 'code', client_id: clientId, redirect_uri: redirectUri, scope: scopes.join(' '), state, code_challenge: sha256(verifier), code_challenge_method: 'S256' };
+      if (method === 'device') return beginDevice(outcome.operationId);
+      if (method === 'mediated') return { outcome: await continueMediated(outcome.operationId) };
+      const url = new URL(authorizationEndpoint!);
+      const query = { response_type: 'code', client_id: clientId, redirect_uri: redirectUri!, scope: scopes.join(' '), state, code_challenge: sha256(verifier), code_challenge_method: 'S256' };
       for (const [name, value] of Object.entries(query)) url.searchParams.set(name, value);
       if (resource !== null) url.searchParams.set('resource', resource);
       return { outcome, authorizationUrl: url.href };
@@ -708,13 +1061,14 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       try {
       const { callbackUrl, browserBinding } = (input ?? {}) as { callbackUrl?: unknown; browserBinding?: unknown };
       const { params, base } = parseCallback(callbackUrl);
-      if (typeof browserBinding !== 'string' || params.state === undefined || (params.code === undefined) === (params.error === undefined)) throw new AuthFailure('invalid_callback');
+      if (typeof browserBinding !== 'string' || !params.state || (!params.code && !params.error) || (params.code !== undefined) === (params.error !== undefined)) throw new AuthFailure('invalid_callback');
       const stateHash = sha256(params.state), browserHash = sha256(browserBinding);
       const snapshot = await load({ callbackHash: stateHash });
       const found = Object.values(snapshot.operations).find(operation => operation.kind === 'sign_in' && operation.epoch === snapshot.epoch && operation.direct?.stateHash === stateHash);
       const direct = found?.direct;
       // A wrong browser, redirect or issuer (mix-up, spec 4.5) leaves the operation untouched so the genuine callback still completes.
       if (!found || !direct || direct.browserHash !== browserHash || redirectShape(base) !== redirectShape(new URL(direct.redirectUri)) || params.iss !== direct.issuer) throw new AuthFailure('invalid_callback');
+      checkCooldown(await record(found.connectionId));
       const operationId = found.id;
       const verifier = found.phase === 'prepared' && params.code !== undefined ? await secrets.read(direct.verifierRef) : null;
       const at = now();
@@ -741,61 +1095,33 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const issuedAt = now();
       let token: TokenResponse;
       try { token = await tokenRequest(connection.metadata, connection.dpopKeyRef, fields, null); } catch (error) {
+        if (error instanceof AuthFailure) await holdOff(connection.id, error);
         // A definite rejection is a failure; a lost or non-OAuth answer may have consumed the code, so it is never resent.
         const definite = error instanceof AuthFailure && !AMBIGUOUS.has(error.code);
         return settle(operationId, direct.verifierRef, definite ? 'failed' : 'uncertain', { error: definite ? error.code : 'lost_response' });
       }
-      const granted = token.scope.split(' ').filter(Boolean);
-      const missingScopes = operation.scopes.filter(scope => !granted.includes(scope));
-      let problem: string | null = null;
-      if (token.token_type !== 'DPoP') problem = 'unsupported_token_type';
-      else if (token.signed_in !== true || token.session_id !== direct.sessionId || token.refresh_token === undefined || granted.some(scope => !operation.scopes.includes(scope))) problem = 'invalid_response';
-      else if (missingScopes.length) problem = 'insufficient_scope';
-      let refreshRef: string | null = null, accessRef = '';
-      try {
-        if (token.refresh_token !== undefined) refreshRef = await secrets.stage(token.refresh_token);
-        if (!problem) accessRef = await stageSessionToken(token.access_token);
-      } catch {
-        return settle(operationId, direct.verifierRef, 'uncertain', { error: 'storage_error' }, refreshRef);
-      }
-      // Partial consent or a malformed grant keeps the previous credentials; the new Account Token only awaits revocation.
-      if (problem) return settle(operationId, direct.verifierRef, 'failed', problem === 'insufficient_scope' ? { error: problem, missingScopes } : { error: problem }, refreshRef);
-      const grantId = randomId('grt_');
-      const refreshExpiresAt = token.refresh_token_expires_in === undefined ? null : issuedAt + token.refresh_token_expires_in * 1000;
-      const outcome = await commit({ operationId }, [refreshRef, accessRef], (state, drop) => {
-        const current = own(state.operations, operationId);
-        // shortcut: after a full reset there is no connection to park the new grant on, so its secrets are removed and it is not revoked remotely; revoke here if resets during sign-in matter.
-        if (!current || current.epoch !== state.epoch) throw new AuthFailure('state_changed');
-        const target = own(state.connections, current.connectionId)!;
-        // A sign-out, recovery or Session replacement that ran during the exchange wins; the new grant is kept only for revocation.
-        if (current.phase !== 'dispatched' || target.generation !== current.connectionGeneration || target.sessionId !== direct.sessionId) {
-          retire(state, `cln_${operationId}`, target, refreshRef!);
-          drop.push(accessRef);
-          return current.phase === 'dispatched' ? finish(state, current, 'failed', { error: 'state_changed' }) : outcomeOf(state, current);
-        }
-        const previous = target.grantId === null ? undefined : own(state.grants, target.grantId);
-        if (previous) { retire(state, `cln_${previous.id}`, target, previous.secretRef); delete state.grants[previous.id]; }
-        state.grants[grantId] = { id: grantId, issuer: target.issuer, userId: target.userId, secretRef: refreshRef!, scopes: granted, expiresAt: refreshExpiresAt, generation: 1, status: 'active', operationId: null };
-        target.grantId = grantId; target.status = 'signed_in';
-        // Older tokens for this session reflect the old authority, so all are retired and only the new one stays selectable (spec 4.3).
-        drop.push(...Object.values(target.slots).map(slot => slot.secretRef));
-        target.slots = { [slotKey(direct.sessionId, current.resource)]: { secretRef: accessRef, tokenType: 'DPoP', dpopKeyRef: target.dpopKeyRef, scopes: granted, expiresAt: issuedAt + token.expires_in * 1000, generation: target.generation } };
-        return finish(state, current, 'completed');
-      });
-      await secrets.remove(direct.verifierRef);
-      return outcome;
+      return await acceptSignIn(operationId, token, issuedAt);
       } finally { releaseOwner(executionOwner); }
     },
 
+    async continueSignIn(operationId) {
+      const state = await load({ operationId }), operation = own(state.operations, operationId);
+      if (!operation || operation.kind !== 'sign_in') throw new AuthFailure('unknown_operation');
+      if (operation.phase === 'terminal' || operation.phase !== 'prepared') return outcomeOf(state, operation);
+      return operation.method === 'device' ? pollDevice(operationId) : operation.method === 'mediated' ? continueMediated(operationId) : outcomeOf(state, operation);
+    },
+
     async cancelSignIn(operationId) {
-      const { outcome, verifierRef } = await transaction({ operationId }, state => {
+      return commit({ operationId }, [], (state, drop) => {
         const operation = typeof operationId === 'string' ? own(state.operations, operationId) : undefined;
-        if (!operation?.direct || operation.epoch !== state.epoch) throw new AuthFailure('unknown_operation');
-        // Once the code is sent, cancelling cannot undo the remote exchange; its outcome stands.
-        return { outcome: operation.phase === 'prepared' ? finish(state, operation, 'cancelled') : outcomeOf(state, operation), verifierRef: operation.direct.verifierRef };
+        if (!operation || operation.kind !== 'sign_in' || operation.epoch !== state.epoch) throw new AuthFailure('unknown_operation');
+        if (operation.phase === 'terminal') return outcomeOf(state, operation);
+        operation.cancelRequested = true; drop.push(...privateRefs(operation));
+        if (operation.phase === 'staged') { retire(state, `cln_${operationId}`, own(state.connections, operation.connectionId)!, operation.staged!.refreshRef!); drop.push(operation.staged!.accessRef); }
+        if (operation.phase !== 'dispatched') return finish(state, operation, 'cancelled');
+        // Keep dispatched work recoverable: cancellation cannot prove whether the issuer acted.
+        return operation.result = { operationId, status: 'cancelled', connection: publicConnection(state, own(state.connections, operation.connectionId)!) };
       });
-      if (outcome.status !== 'pending') await secrets.remove(verifierRef);
-      return outcome;
     },
 
     async operation(operationId) {
@@ -824,11 +1150,12 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
             else result = operation.phase === 'prepared' ? closeRefresh(state, operation, 'failed', 'interrupted', false, drop) : closeRefresh(state, operation, 'uncertain', 'lost_response', false, drop);
           }
           // The code may have reached the issuer before the crash; only a fresh sign-in is safe.
+          else if (operation.phase === 'staged') result = activateSignIn(state, operation, drop);
           else if (operation.phase !== 'prepared') result = finish(state, operation, 'uncertain', { error: 'lost_response' });
           else if (at >= operation.expiresAt) result = finish(state, operation, 'expired');
           else return;
           // Terminal operations never read their verifier again.
-          if (operation.direct) drop.push(operation.direct.verifierRef);
+          drop.push(...privateRefs(operation));
           return result;
           });
           if (recovered) results.push(recovered);
@@ -841,7 +1168,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const { resource = null, scopes } = (input ?? {}) as { resource?: unknown; scopes?: unknown };
       if (resource !== null && (typeof resource !== 'string' || !URL.canParse(resource))) throw new AuthFailure('invalid_target', connectionId);
       if (scopes !== undefined && (!Array.isArray(scopes) || !scopes.length || new Set(scopes).size !== scopes.length || !scopes.every(scope => typeof scope === 'string'))) throw new AuthFailure('invalid_scope', connectionId);
-      return renewal(await record(connectionId), resource, scopes ?? null);
+      return renewal(await currentConnection(connectionId), resource, scopes ?? null);
     },
 
     // Sign-out wins over in-flight sign-in and refresh: disconnection and the new generation commit before anything goes remote (IMPLEMENTATION 4).
@@ -853,13 +1180,14 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         connection.generation++; connection.status = 'disconnected';
         drop.push(...Object.values(connection.slots).map(slot => slot.secretRef));
         connection.slots = {};
+        if (connection.anonymous) { drop.push(connection.dpopKeyRef); connection.userId = ''; connection.sessionId = null; }
         const grant = connection.grantId === null ? undefined : own(state.grants, connection.grantId);
         if (grant) { retire(state, `cln_${grant.id}`, connection, grant.secretRef); delete state.grants[grant.id]; }
         connection.grantId = null;
         for (const operation of Object.values(state.operations)) {
           if (operation.connectionId !== connectionId || operation.epoch !== state.epoch || operation.phase !== 'prepared') continue;
           finish(state, operation, 'cancelled');
-          if (operation.direct) drop.push(operation.direct.verifierRef);
+          drop.push(...privateRefs(operation));
         }
       });
       return cleanupNow(connectionId);
@@ -867,12 +1195,14 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     retryCleanup: cleanupNow,
 
     async authorizedFetch(connectionId, request, target, requiredScopes = []) {
-      const expected = targetOf(await record(connectionId));
+      const connection = await currentConnection(connectionId), expected = targetOf(connection);
       if (target.issuer !== expected.issuer || target.endpoint !== expected.endpoint || target.resource !== expected.resource) throw new AuthFailure('invalid_target', connectionId);
       // Credentials go only to the endpoint itself or a slash-delimited child on the same origin.
       const url = new URL(request.url), endpoint = new URL(expected.endpoint);
       const base = endpoint.pathname.replace(/\/$/, '');
       if (url.protocol !== 'https:' || url.hash || url.username || url.password || url.origin !== endpoint.origin || (url.pathname !== endpoint.pathname && !url.pathname.startsWith(`${base}/`))) throw new AuthFailure('invalid_target', connectionId);
+      if (connection.status === 'disconnected') throw new AuthFailure('disconnected', connectionId);
+      checkCooldown(connection);
       const resource = expected.resource ?? null;
       // A conversation long poll is held up to `wait` seconds (spec 7.3, 7.5); that hold must not count as a network timeout.
       const wait = url.searchParams.get('wait');
@@ -880,7 +1210,11 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       let credential = await credentialFor(connectionId, resource, null);
       let nonceRetried = false, renewed = false;
       for (;;) {
-        if (!requiredScopes.every(scope => credential.scopes.includes(scope))) throw new AuthFailure('insufficient_scope', connectionId);
+        if (!requiredScopes.every(scope => credential.scopes.includes(scope))) {
+          const requirement = await api.authorization(connectionId, requiredScopes);
+          if (!renewed && requirement.sufficient) { renewed = true; credential = await renewShared(connectionId, resource); continue; }
+          throw new AuthFailure('insufficient_scope', connectionId);
+        }
         const token = await secrets.read(credential.secretRef);
         if (token === null) {
           // A concurrent renewal replaced and removed this credential; take its successor once.
@@ -894,6 +1228,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         // Clone per attempt so the original body stays available for a bounded retry.
         const response = await transport.fetch(new Request(request.clone(), { headers }), { waitMs });
         rememberNonce(request.url, response);
+        if (response.status === 429 || response.status === 503) await holdOff(connectionId, responseFailure(response, 'rate_limited'));
         if (response.status !== 401) return response;
         const error = dpopChallenge(response.headers.get('www-authenticate'))?.error;
         if (error === 'use_dpop_nonce' && !nonceRetried && response.headers.has('dpop-nonce')) { nonceRetried = true; continue; }
@@ -902,4 +1237,5 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       }
     },
   };
+  return api;
 }

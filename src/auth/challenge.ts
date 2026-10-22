@@ -1,6 +1,6 @@
 // Reads the DPoP challenge from a WWW-Authenticate header (RFC 9110 11.6.1, spec 6); other schemes' params are ignored.
 const TOKEN = /[A-Za-z0-9!#$%&'*+.^_`|~-]+/y;
-export function dpopChallenge(header: string | null): { error?: string; scope?: string } | undefined {
+export function dpopChallenge(header: string | null): { error?: string; scope?: string; extension?: string; conversation_id?: string } | undefined {
   if (!header) return undefined;
   let i = 0;
   let current: { scheme: string; params: Record<string, string> } | undefined;
@@ -33,7 +33,19 @@ export function dpopChallenge(header: string | null): { error?: string; scope?: 
       i += value.length;
     }
     const name = match[0].toLowerCase();
-    if (current.scheme === 'dpop' && (name === 'error' || name === 'scope')) current.params[name] = value;
+    if (current.scheme === 'dpop' && ['error', 'scope', 'extension', 'conversation_id'].includes(name)) current.params[name] = value;
   }
   return found;
+}
+
+export interface AuthChallenge { error?: string; requiredScopes: string[]; extensions: string[]; conversationId?: string }
+// Combine independent detail channels: a sparse JSON error must not erase header scopes/extensions.
+export function authChallenge(header: string | null, body?: unknown): AuthChallenge {
+  const challenge = dpopChallenge(header), json = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
+  const scopes = [challenge?.scope, json.scope].flatMap(value => typeof value === 'string' ? value.split(' ').filter(scope => /^[\x21\x23-\x5B\x5D-\x7E]+$/.test(scope)) : []);
+  const extensions = [challenge?.extension, json.extension].filter((value): value is string => typeof value === 'string' && /^[A-Za-z0-9._-]{1,128}$/.test(value));
+  const safe = new Set(['sign_in_required', 'insufficient_scope', 'invalid_token', 'invalid_dpop_proof', 'use_dpop_nonce', 'extension_required', 'rate_limited', 'invalid_scope']);
+  const error = [challenge?.error, json.error].find((value): value is string => typeof value === 'string' && safe.has(value));
+  const conversationId = [json.conversation_id, challenge?.conversation_id].find((value): value is string => typeof value === 'string' && value.length > 0 && value.length <= 256);
+  return { ...(error ? { error } : {}), requiredScopes: [...new Set(scopes)], extensions: [...new Set(extensions)], ...(conversationId ? { conversationId } : {}) };
 }

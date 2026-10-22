@@ -63,8 +63,8 @@ test('termination before commit rolls back auth records', { timeout: 15000 }, as
   await assert.rejects(store.transaction({ issuer: 'bad' }, state => { state.identities.bad = { userId: undefined }; }), /non-JSON/);
 });
 
-test('live authentication survives another process; owner death after external effect becomes uncertain', { timeout: 20000 }, async t => {
-  const path = await fixture(t), active = worker(t, 'exchange', path);
+for (const mode of ['exchange', 'rotation']) test(`live ${mode} survives another process; owner death after external effect becomes uncertain`, { timeout: 20000 }, async t => {
+  const path = await fixture(t), active = worker(t, mode, path);
   const started = await active.message;
   assert.deepEqual((await worker(t, 'recover', path).message).results, []);
   active.child.kill(); await once(active.child, 'exit');
