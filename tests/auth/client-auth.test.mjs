@@ -1164,7 +1164,7 @@ test('after a restart the memory-only Session Token is renewed, not read from th
   assert.equal(JSON.stringify(store.raw).includes([...company.tokens.keys()][0]), false);
 });
 
-test('a rate-limited renewal surfaces retryAfterMs and is not retried; auth errors are not masked', async () => {
+test('a rate-limited signed-out renewal surfaces retryAfterMs, is not retried and blocks the next request; auth errors are not masked', async () => {
   const { auth, company, clock } = await setup();
   const { connection } = await auth.start(company.domain);
   const target = await auth.target(connection.id);
@@ -1176,6 +1176,7 @@ test('a rate-limited renewal surfaces retryAfterMs and is not retried; auth erro
   };
   await assert.rejects(auth.authorizedFetch(connection.id, conversations(company), target), error => error instanceof AuthFailure && error.retryAfterMs === 30000);
   assert.equal(tokenRequests, 1);
+  clock.t += 30_000; // the wait is over
   company.handle = async (request, init) => request.url === company.tokenEndpoint ? new Response('{"error":"invalid_client"}', { status: 401 }) : handle(request, init);
   await assert.rejects(auth.authorizedFetch(connection.id, conversations(company), target), error => error instanceof AuthFailure && error.retryAfterMs === undefined);
 });
@@ -1189,4 +1190,33 @@ test('duplicate member names in a token response are rejected', async () => {
     return new Response((await response.text()).replace(/^\{/, '{"scope":"","scope":"x",'), { status: 200, headers: response.headers });
   };
   await assert.rejects(auth.start(company.domain), code('invalid_response'));
+});
+
+test('a rate-limited signed-in refresh surfaces retryAfterMs and no token request is sent before it elapses', async () => {
+  const { auth, company, clock, id, target } = await signedIn();
+  clock.t += 25 * 3600_000;
+  const handle = company.handle; let tokenRequests = 0;
+  company.handle = async (request, init) => {
+    if (request.url !== company.tokenEndpoint) return handle(request, init);
+    tokenRequests++; return new Response('{"error":"rate_limited"}', { status: 429, headers: { 'retry-after': '30' } });
+  };
+  await assert.rejects(auth.authorizedFetch(id, conversations(company), target), error => error instanceof AuthFailure && error.retryAfterMs === 30000);
+  assert.equal(tokenRequests, 1);
+  clock.t += 10_000;
+  await assert.rejects(auth.authorizedFetch(id, conversations(company), target), error => error.code === 'rate_limited' && error.retryAfterMs === 20000);
+  assert.equal(tokenRequests, 1, 'no token request during the wait');
+  assert.equal((await auth.get(id)).status, 'signed_in', 'a 429 is a definite rejection and leaves the grant usable');
+  company.handle = handle; clock.t += 20_000;
+  assert.equal((await auth.authorizedFetch(id, conversations(company), target)).status, 200);
+});
+
+test('a host SecretStore ref that looks like a memory ref still reaches the host store', async () => {
+  const secrets = memorySecrets(); const stage = secrets.stage;
+  secrets.stage = async secret => { const ref = `mem:${await stage(secret)}`; secrets.map.set(ref, secrets.map.get(ref.slice(4))); return ref; };
+  const { auth, company, store } = await setup({ secrets });
+  const { connection } = await auth.start(company.domain);
+  const key = store.raw.identities[company.issuer].dpopKeyRef;
+  assert.ok(key.startsWith('mem:'));
+  const response = await auth.authorizedFetch(connection.id, conversations(company), await auth.target(connection.id));
+  assert.equal(response.status, 200);
 });

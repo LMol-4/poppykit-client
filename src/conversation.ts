@@ -50,7 +50,8 @@ export function createConversationClient(options: ConversationClientOptions) {
   async function call(make: () => Request): Promise<Response> {
     for (let attempt = 1; ; attempt++) {
       let response: Response | undefined;
-      try { response = await authorizedRequest(make()); } catch (error) { if (!(error instanceof TransportError)) throw error; if (attempt >= maxAttempts) throw new ConversationError('network_error'); }
+      try { response = await authorizedRequest(make()); } catch (error) { // A renewal's lost connection is an AuthFailure('transport_error'); it is as retryable as a lost request.
+        if (!(error instanceof TransportError || (error as { code?: unknown })?.code === 'transport_error')) throw error; if (attempt >= maxAttempts) throw new ConversationError('network_error'); }
       let delay = Math.min(maxDelayMs, random() * baseDelayMs * 2 ** (attempt - 1)); // full jitter
       if (response) {
         if (response.status !== 429 && response.status < 500) return response;

@@ -576,3 +576,10 @@ test('a duplicate member name in a response body is an invalid response', async 
   const { client } = setup({ authorizedRequest: async () => new Response('{"conversation_id":"cnv_1","conversation_id":"cnv_2","status":"working","responder":"agent"}', { status: 201 }) });
   await assert.rejects(client.start({ ...msg, id: 'msg_w' }), e => e.code === 'invalid_response');
 });
+
+test('a renewal that lost its connection (AuthFailure transport_error) is retried like a transport failure', async () => {
+  let calls = 0;
+  const { client, server } = setup({ authorizedRequest: async request => { if (++calls < 3) throw Object.assign(new Error('Auth transport_error'), { code: 'transport_error' }); return server.handle(request); } });
+  assert.equal((await client.start({ ...msg, id: 'msg_v' })).conversation_id, 'cnv_1');
+  assert.equal(calls, 3);
+});

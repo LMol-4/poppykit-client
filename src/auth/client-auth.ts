@@ -177,11 +177,11 @@ interface DpopKey { privateKey: CryptoKey; jwk: PublicEcJwk; thumbprint: string 
 export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   const { namespace, localUserId, clientId, identity, store, transport } = options;
   // Session Tokens live in memory only (guide "Storing tokens"); after a restart the missing token triggers a renewal.
-  const sessionTokens = new Map<string, string>();
+  const sessionTokens = new Map<string, string>(); // keyed by refs this closure created, so a host ref can never match
   const secrets: SecretStore = {
     stage: secret => options.secrets.stage(secret),
-    read: async ref => ref.startsWith('mem:') ? sessionTokens.get(ref) ?? null : options.secrets.read(ref),
-    remove: async ref => { if (ref.startsWith('mem:')) sessionTokens.delete(ref); else await options.secrets.remove(ref); },
+    read: async ref => sessionTokens.has(ref) ? sessionTokens.get(ref)! : options.secrets.read(ref),
+    remove: async ref => { if (!sessionTokens.delete(ref)) await options.secrets.remove(ref); },
   };
   async function stageSessionToken(token: string): Promise<string> { const ref = `mem:${randomId()}`; sessionTokens.set(ref, token); return ref; }
   const now = options.now ?? Date.now;
@@ -271,11 +271,11 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (response.status === 200) {
         try { return parseTokenResponse(json); } catch { throw new AuthFailure('invalid_response'); }
       }
-      let error = 'token_error';
-      try { error = parseProtocolError(json).error; } catch { /* non-OAuth body */ }
+      let error = response.status === 429 ? 'rate_limited' : 'token_error';
+      try { if (response.status !== 429) error = parseProtocolError(json).error; } catch { /* non-OAuth body */ }
       if (error === 'use_dpop_nonce' && response.status === 400 && attempt === 0 && response.headers.has('dpop-nonce')) continue;
       // Only a recognised OAuth code on a 4xx is a definite rejection; a 5xx or proxy page may follow a completed exchange.
-      throw new AuthFailure(response.status >= 400 && response.status < 500 && SAFE_ERRORS.has(error) ? error : 'token_error', undefined, retryAfterMilliseconds(response.headers.get('retry-after'), now())); // spec 4.3: the agent waits
+      throw new AuthFailure(response.status >= 400 && response.status < 500 && (SAFE_ERRORS.has(error) || response.status === 429) ? error : 'token_error', undefined, retryAfterMilliseconds(response.headers.get('retry-after'), now())); // spec 4.3: the agent waits
     }
   }
 
@@ -411,6 +411,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         token = await send();
       }
     } catch (error) {
+      if (error instanceof AuthFailure && error.retryAfterMs !== undefined) retryAfter.set(operationId, error.retryAfterMs);
       const code = error instanceof AuthFailure ? error.code : 'local_error'; // non-AuthFailure errors come from local signing before dispatch
       // A lost, unreadable or non-OAuth answer may follow a rotation, so the old Account Token is never resent (IMPLEMENTATION 4).
       if (AMBIGUOUS.has(code)) return endRefresh(operationId, 'uncertain', 'lost_response');
@@ -504,13 +505,26 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
 
   // In-process single flight: parallel requests on one stale slot share one renewal; the grant claim covers other processes.
   const renewing = new Map<string, Promise<CredentialRecord>>();
+  // Retry-After from the issuer (spec 4.3: the agent MUST wait). In memory: a restart forgets it, which costs at most one early request.
+  const retryAfter = new Map<string, number>(); // operation id -> ms, handed from refresh() to renewShared()
+  const notBefore = new Map<string, number>(); // connection id -> earliest next token request
   function renewShared(connectionId: string, resource: string | null): Promise<CredentialRecord> {
     const key = JSON.stringify([connectionId, resource]);
     let pending = renewing.get(key);
     if (!pending) {
       pending = (async () => {
-        const outcome = await renewal(await record(connectionId), resource, null);
-        if (outcome.status !== 'completed') throw new AuthFailure(outcome.status === 'pending' ? 'renewal_pending' : outcome.error ?? 'renewal_failed', connectionId);
+        const wait = (notBefore.get(connectionId) ?? 0) - now();
+        if (wait > 0) throw new AuthFailure('rate_limited', connectionId, wait);
+        let outcome: AuthOutcome;
+        try { outcome = await renewal(await record(connectionId), resource, null); } catch (error) {
+          if (error instanceof AuthFailure && error.retryAfterMs !== undefined) notBefore.set(connectionId, now() + error.retryAfterMs);
+          throw error;
+        }
+        if (outcome.status !== 'completed') {
+          const ms = retryAfter.get(outcome.operationId); retryAfter.delete(outcome.operationId);
+          if (ms !== undefined) notBefore.set(connectionId, now() + ms);
+          throw new AuthFailure(outcome.status === 'pending' ? 'renewal_pending' : outcome.error ?? 'renewal_failed', connectionId, ms);
+        }
         const slot = own((await record(connectionId)).slots, slotKey(outcome.connection.sessionId, resource));
         if (!slot) throw new AuthFailure('state_changed', connectionId);
         return slot;
