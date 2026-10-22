@@ -43,7 +43,7 @@ export interface AuthChallenge { error?: string; requiredScopes: string[]; exten
 export function authChallenge(header: string | null, body?: unknown): AuthChallenge {
   const challenge = dpopChallenge(header), json = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
   const scopes = [challenge?.scope, json.scope].flatMap(value => typeof value === 'string' ? value.split(' ').filter(scope => /^[\x21\x23-\x5B\x5D-\x7E]+$/.test(scope)) : []);
-  const extensions = [challenge?.extension, json.extension].filter((value): value is string => typeof value === 'string' && /^[A-Za-z0-9._-]{1,128}$/.test(value));
+  const extensions = [challenge?.extension, json.extension].filter((value): value is string => typeof value === 'string' && value.length <= 512 && /^(?:[A-Za-z0-9._-]+|(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\/[A-Za-z0-9._~-]+(?:\/[A-Za-z0-9._~-]+)*)$/.test(value));
   const safe = new Set(['sign_in_required', 'insufficient_scope', 'invalid_token', 'invalid_dpop_proof', 'use_dpop_nonce', 'extension_required', 'rate_limited', 'invalid_scope']);
   const error = [challenge?.error, json.error].find((value): value is string => typeof value === 'string' && safe.has(value));
   const conversationId = [json.conversation_id, challenge?.conversation_id].find((value): value is string => typeof value === 'string' && value.length > 0 && value.length <= 256);

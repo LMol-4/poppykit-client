@@ -657,3 +657,8 @@ test('watch backoff cancellation releases immediately and JSON fallback has its 
   await assert.rejects(async()=>{for await(const _ of huge.watch('c1')){}},{code:'body_limit'});
   const frames=[];for await(const frame of parseEventStream(streamResponse(eventFrame({...streamEvent('closed'),status:'closed'}).replaceAll('\n','\r'),1).body))frames.push(frame);assert.equal(frames.length,1);
 });
+
+test('conversation extension errors preserve bounded domain-qualified header and body details',async()=>{
+  const {client,server}=setup();server.hooks.failures.push(json({error:'extension_required',extension:'example.com/gift-wrap'},403,{'www-authenticate':'DPoP error="extension_required", extension="other.example/thing"'}));
+  await assert.rejects(client.read('c1'),error=>error.code==='extension_required'&&error.extensions.includes('example.com/gift-wrap')&&error.extensions.includes('other.example/thing'));
+});
