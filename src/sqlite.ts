@@ -21,9 +21,11 @@ export class SqliteConversationStore implements ConversationStore {
   close(): void { this.db.close(); }
   /** Explicit local administration only; forgetting a retry does not cancel accepted remote work. */
   removeOutbound(key: ConversationKey, id: string): void {
-    const record = this.outbound(key, id);
-    if (record && record.endpoint !== key.endpoint) throw new TypeError('outbound binding');
-    this.db.prepare('DELETE FROM outbound WHERE connection=? AND issuer=? AND id=?').run(key.connectionId, key.issuer, id);
+    this.atomic(() => {
+      const record = this.outbound(key, id);
+      if (record && record.endpoint !== key.endpoint) throw new TypeError('outbound binding');
+      this.db.prepare('DELETE FROM outbound WHERE connection=? AND issuer=? AND id=?').run(key.connectionId, key.issuer, id);
+    });
   }
   private atomic<T>(action: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');

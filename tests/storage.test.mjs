@@ -12,6 +12,16 @@ import { createConversationClient } from '../dist/index.js';
 
 const key = { connectionId: 'c', issuer: 'https://issuer.test/one', endpoint: 'https://company.test/conversations' };
 const row = { ...key, id: 'message', target: null, request: { message: { id: 'message', sender: 'agent', text: 'hello' } }, fingerprint: 'same', phase: 'pending' };
+test('explicit SQLite retry removal preserves other destinations',async t=>{
+  const store=new SqliteConversationStore(await fixture(t));t.after(()=>store.close());
+  await store.prepareOutbound(key,row);
+  assert.throws(()=>store.removeOutbound({...key,endpoint:'https://other.test/conversations'},row.id),/binding/);
+  assert.equal((await store.getOutbound(key,row.id)).fingerprint,'same');
+  store.removeOutbound(key,row.id);assert.equal(await store.getOutbound(key,row.id),undefined);
+  store.removeOutbound(key,row.id);
+  const other={...key,endpoint:'https://other.test/conversations'};await store.prepareOutbound(other,{...row,endpoint:other.endpoint});
+  assert.throws(()=>store.removeOutbound(key,row.id),/binding/);assert.ok(await store.getOutbound(other,row.id));
+});
 const directories = [];
 after(async () => { for (const dir of directories) await rm(dir, { recursive: true, force: true }); });
 async function fixture(t) {
