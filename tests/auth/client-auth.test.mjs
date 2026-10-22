@@ -1226,6 +1226,25 @@ test('public renew() returns retryAfterMs and sends no token request inside the 
   assert.equal((await auth.renew(id)).status, 'completed');
 });
 
+test('inside a Retry-After window renew() still reports disconnected, not rate_limited', async () => {
+  const { auth, company, id } = await signedIn();
+  const handle = company.handle;
+  company.handle = async (request, init) => request.url === company.tokenEndpoint ? new Response('{"error":"rate_limited"}', { status: 429, headers: { 'retry-after': '30' } }) : handle(request, init);
+  assert.equal((await auth.renew(id)).retryAfterMs, 30000);
+  await auth.signOut(id);
+  await assert.rejects(auth.renew(id), error => error.code === 'disconnected');
+});
+
+test('a signed-out renew() with scopes reports invalid_scope inside a Retry-After window', async () => {
+  const { auth, company, clock } = await setup();
+  const { connection } = await auth.start(company.domain);
+  clock.t += 3_600_000;
+  const handle = company.handle;
+  company.handle = async (request, init) => request.url === company.tokenEndpoint ? new Response('{"error":"rate_limited"}', { status: 429, headers: { 'retry-after': '30' } }) : handle(request, init);
+  await assert.rejects(auth.renew(connection.id), error => error.retryAfterMs === 30000);
+  await assert.rejects(auth.renew(connection.id, { scopes: ['x'] }), error => error.code === 'invalid_scope');
+});
+
 test('a huge Retry-After is clamped to one hour', async () => {
   const { auth, company, clock, id } = await signedIn();
   const handle = company.handle;

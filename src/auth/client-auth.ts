@@ -505,15 +505,14 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   }
   // Every token-request path (internal refresh and public renew) goes through here, so all honour Retry-After.
   async function renewal(connection: ConnectionRecord, resource: string | null, scopes: string[] | null): Promise<AuthOutcome> {
+    // Local failures first: a wait is only meaningful for a connection that can still send a token request.
+    if (connection.status === 'signed_out' && scopes?.length) throw new AuthFailure('invalid_scope', connection.id);
+    if (connection.status !== 'signed_out' && connection.status !== 'signed_in') throw new AuthFailure(connection.status === 'disconnected' ? 'disconnected' : 'grant_uncertain', connection.id);
     const wait = (notBefore.get(connection.id) ?? 0) - now();
     if (wait > 0) throw new AuthFailure('rate_limited', connection.id, wait);
     let outcome: AuthOutcome;
     try {
-      if (connection.status === 'signed_out') {
-        if (scopes?.length) throw new AuthFailure('invalid_scope', connection.id);
-        outcome = await signedOutRenewal(connection, resource);
-      } else if (connection.status !== 'signed_in') throw new AuthFailure(connection.status === 'disconnected' ? 'disconnected' : 'grant_uncertain', connection.id);
-      else outcome = await refresh(connection, resource, scopes);
+      outcome = connection.status === 'signed_out' ? await signedOutRenewal(connection, resource) : await refresh(connection, resource, scopes);
     } catch (error) {
       if (error instanceof AuthFailure && error.retryAfterMs !== undefined) throw new AuthFailure(error.code, error.connectionId, holdOff(connection.id, error.retryAfterMs));
       throw error;
