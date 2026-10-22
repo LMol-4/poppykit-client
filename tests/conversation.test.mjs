@@ -602,3 +602,30 @@ test('URL path append preserves encoded base path and query parameters',async()=
   const seen=[];const client=createConversationClient({endpoint:'https://api.example/a%20b/conversations/?tenant=one%26two',connectionId:'c',issuer:'i',clock:{now:()=>0},store:memoryStore(),authorizedRequest:async request=>{seen.push(request.url);return json({conversation_id:'c1',events:[],cursor:null,has_more:false,status:'idle',responder:'agent'});}});
   await client.read('c1');assert.equal(seen[0],'https://api.example/a%20b/conversations/c1/events?tenant=one%26two');
 });
+import { parseEventStream } from '../dist/protocol/sse.js';
+const eventFrame=e=>`id: ${e.id}\ndata: ${JSON.stringify(e)}\n\n`;
+const streamResponse=(text,fragment=9999999)=>new Response(new ReadableStream({start(c){const b=new TextEncoder().encode(text);for(let i=0;i<b.length;i+=fragment)c.enqueue(b.slice(i,i+fragment));c.close();}}),{headers:{'content-type':'text/event-stream'}});
+const streamEvent=(id,type='state')=>({id,type,created_at:'2026-10-22T00:00:00Z',status:'idle',responder:'agent'});
+
+test('SSE fragmentation, UTF-8, CRLF, frame limits and incomplete frames',async()=>{
+  const value={...streamEvent('e1','user_requested'),reason:'café ☕'};
+  const response=streamResponse(eventFrame(value).replaceAll('\n','\r\n'),1);
+  const frames=[];for await(const frame of parseEventStream(response.body))frames.push(frame);
+  assert.deepEqual(frames,[{kind:'event',event:value}]);
+  await assert.rejects(async()=>{for await(const _ of parseEventStream(streamResponse('data: '+ 'x'.repeat(300)).body,{maxFrameBytes:100})){}},{field:'sse.frame.size'});
+  const incomplete=[];for await(const frame of parseEventStream(streamResponse(eventFrame(value).slice(0,-2)).body))incomplete.push(frame);assert.deepEqual(incomplete,[]);
+});
+
+test('watch reconnect uses Last-Event-ID, clears deltas, deduplicates, and acknowledges only explicit ack',async()=>{
+  const seen=[],partial=[],store=memoryStore();let n=0;
+  const e1=streamEvent('e1'),e2={...streamEvent('e2'),status:'closed'};
+  const client=createConversationClient({endpoint:EP,connectionId:'c',issuer:'i',store,clock:{now:()=>0},sleep:async()=>{},authorizedRequest:async request=>{seen.push(request);return n++===0?streamResponse(eventFrame(e1)+'event: text-delta\ndata: {"message_id":"m1","text":"unfinished"}\n\n',1):streamResponse(eventFrame(e1)+eventFrame(e2));}});
+  const results=[];for await(const item of client.watch('c1',{consumer:'ui',onPartial:value=>partial.push(value)})){results.push(item.event.id);assert.equal(await store.getCheckpoint({connectionId:'c',issuer:'i'},'c1','ui'),results.length===1?undefined:'e1');await item.ack();}
+  assert.deepEqual(results,['e1','e2']);assert.equal(seen[1].headers.get('last-event-id'),'e1');assert.ok(partial.some(value=>value?.text==='unfinished'));assert.equal(partial.at(-1),null);assert.equal(await store.getCheckpoint({connectionId:'c',issuer:'i'},'c1','ui'),'e2');
+});
+
+test('watch handles JSON fallback, explicit history-gap recovery and method-independent authorization hook',async()=>{
+  let calls=0,auth;const client=createConversationClient({endpoint:EP,connectionId:'c',issuer:'i',store:memoryStore(),clock:{now:()=>0},sleep:async()=>{},authorization:async(id,scopes)=>auth={id,scopes,methods:['device']},authorizedRequest:async()=>++calls===1?json({error:'cursor_expired'},410):json({conversation_id:'c1',events:[{...streamEvent('e1'),status:'closed'}],cursor:'e1',has_more:false,status:'closed',responder:'agent'})});
+  const events=[];for await(const item of client.watch('c1',{cursor:'old',onHistoryGap:()=>true}))events.push(item.event.id);assert.deepEqual(events,['e1']);
+  assert.deepEqual(await client.authorization({...streamEvent('a','authorization'),scope:'read write'}),{id:'c',scopes:['read','write'],methods:['device']});
+});

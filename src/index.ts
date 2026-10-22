@@ -10,3 +10,7 @@ export type { ConversationClientOptions, ConsumerCheckpoint, ConversationClientS
 export type { ConversationStore, ConversationKey } from './conversation-store.js';
 
 export type { OperationOwner } from './auth/ownership.js';
+
+export type { WatchOptions, WatchedEvent } from './conversation.js';
+export { parseEventStream } from './protocol/sse.js';
+export type { StreamFrame } from './protocol/sse.js';

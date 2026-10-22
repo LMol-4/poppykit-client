@@ -1,7 +1,9 @@
+import { parseEventStream } from './protocol/sse.js';
+import type { ConversationEvent } from './protocol/wire.js';
 import type { ConversationStore } from './conversation-store.js';
 import { dpopChallenge } from './auth/challenge.js';
 import { secureUrl, TransportError } from './network/transport.js';
-import { canonical, id as parseId, parseJson, parseConversationRequest, parseConversationState, parseEventPage, parseMessage, parseProtocolError, retryAfterMilliseconds } from './protocol/wire.js';
+import { canonical, id as parseId, parseJson, parseConversationRequest, parseConversationState, parseEventPage, parseMessage, parseProtocolError, retryAfterMilliseconds, ValidationError } from './protocol/wire.js';
 import type { ConversationRequest, ConversationState, EventPage, Message } from './protocol/wire.js';
 
 export interface OutboundRecord {
@@ -26,9 +28,13 @@ export interface ConversationClientOptions {
   store: ConversationStore;
   clock: { now(): number };
   newId?: () => string; sleep?: (ms: number) => Promise<void>; random?: () => number;
+  /** Optional safe UI hook supplied by the single authentication lifecycle. */
+  authorization?: (connectionId: string, scopes: string[]) => Promise<unknown>;
   maxAttempts?: number; baseDelayMs?: number; maxDelayMs?: number; maxPages?: number;
 }
 export interface ReadOptions extends ReadParams { consumer?: string; signal?: AbortSignal }
+export interface WatchOptions extends ReadOptions { lastEventId?: string; maxReconnects?: number; onPartial?: (value: { messageId: string; text: string } | null) => void; onHistoryGap?: () => Promise<boolean> | boolean }
+export interface WatchedEvent { event: ConversationEvent; ack(): Promise<void> }
 export type OutboundInput = Omit<Message, 'id'> & { id?: string };
 
 // A definite rejection will not change on retry; anything else (auth, 408, 429, 5xx) leaves the operation retryable.
@@ -65,12 +71,12 @@ export function createConversationClient(options: ConversationClientOptions) {
   async function failure(response: Response): Promise<ConversationError> {
     const challenge = dpopChallenge(response.headers.get('www-authenticate'));
     let code = '', scope = challenge?.scope, conversationId: string | undefined, extension: string | undefined;
-    try { const body = parseProtocolError(parseJson(await response.text())); code = body.error; extension = body.extension; if (typeof body.scope === 'string') scope = body.scope; if (code === 'direct_conversation_open') conversationId = body.conversation_id; } catch { /* non-protocol body */ }
+    try { const body = parseProtocolError(parseJson(await response.text())); code = body.error; extension = body.extension ?? (challenge as { extension?: string } | undefined)?.extension; if (typeof body.scope === 'string') scope = body.scope; if (code === 'direct_conversation_open') conversationId = body.conversation_id; } catch { /* non-protocol body */ }
     if (!knownCodes.has(code)) {
       // Token errors (spec 6) arrive in WWW-Authenticate: DPoP error="...", scope="...".
       const challenge = dpopChallenge(response.headers.get('www-authenticate'));
       code = challenge?.error ?? '';
-      scope = challenge?.scope;
+      scope ??= challenge?.scope;
     }
     if (!knownCodes.has(code)) code = 'http_error';
     return new ConversationError(code, response.status, retryAfterMilliseconds(response.headers.get('retry-after'), clock.now()), scope, conversationId, extension);
@@ -131,6 +137,48 @@ export function createConversationClient(options: ConversationClientOptions) {
   }
 
   const client = {
+    async authorization(event: ConversationEvent): Promise<unknown> {
+      if (event.type !== 'authorization' || !options.authorization) throw new ConversationError('authorization_unavailable');
+      return options.authorization(connectionId,typeof event.scope === 'string' ? event.scope.split(' ').filter(Boolean) : []);
+    },
+    async *watch(conversationId: string, opts: WatchOptions = {}): AsyncGenerator<WatchedEvent> {
+      parseId(conversationId,'conversation_id');
+      if(opts.consumer !== undefined && opts.cursor !== undefined)throw new ConversationError('invalid_request');
+      let cursor = opts.lastEventId ?? (opts.consumer === undefined ? opts.cursor : await checkpoint(conversationId,opts.consumer));
+      let reconnects=0, attempts=0;
+      const maxReconnects=opts.maxReconnects ?? 4;
+      if(!Number.isSafeInteger(maxReconnects)||maxReconnects<0)throw new ConversationError('invalid_request');
+      const seen = new Set<string>(); // Bounded per watch; durable consumers ack explicitly.
+      const eventAck = (event: ConversationEvent, previous: string | undefined): WatchedEvent => ({event, async ack() { if(opts.consumer!==undefined) await store.advanceCheckpoint(key,{connectionId,issuer,conversationId,name:opts.consumer,cursor:event.id},[previous]); }});
+      for (;;) {
+        opts.signal?.throwIfAborted();
+        const url=new URL(conversationUrl(conversationId,'events')); if(opts.cursor!==undefined)url.searchParams.set('cursor',opts.cursor);
+        const headers=new Headers({accept:'text/event-stream'}); if(cursor!==undefined)headers.set('last-event-id',cursor);
+        let response: Response;
+        try { response=await authorizedRequest(new Request(url,{headers,signal:opts.signal})); }
+        catch(error){opts.onPartial?.(null);opts.signal?.throwIfAborted();if(!(error instanceof TransportError)||reconnects++>=maxReconnects)throw error;await sleep(Math.min(maxDelayMs,baseDelayMs*2**attempts++));continue;}
+        if(!response.ok){const error=await failure(response);if(error.code==='cursor_expired'&&await opts.onHistoryGap?.()){cursor=undefined;opts.cursor=undefined;seen.clear();if(opts.consumer!==undefined)await client.resetConsumer(conversationId,opts.consumer);continue;}throw error;}
+        let closed=false;
+        try {
+          if(response.headers.get('content-type')?.split(';')[0].trim()==='text/event-stream') {
+            if(!response.body)throw new ConversationError('invalid_response');
+            let partialBytes=0;
+            for await(const frame of parseEventStream(response.body,{signal:opts.signal})){
+              if(frame.kind==='delta'){partialBytes+=Buffer.byteLength(frame.text);if(partialBytes>1048576)throw new ConversationError('body_limit');opts.onPartial?.({messageId:frame.messageId,text:frame.text});continue;}
+              const event=frame.event,previous=cursor;
+              if(!seen.has(event.id)){if(seen.size>=10000)throw new ConversationError('too_many_events');seen.add(event.id);if(event.type==='message')opts.onPartial?.(null);yield eventAck(event,previous);}
+              cursor=event.id;closed=event.type==='state'&&event.status==='closed';
+            }
+          } else {
+            const page=parseEventPage(parseJson(await response.text()),cursor);
+            for(const event of page.events){const previous=cursor;if(!seen.has(event.id)){if(seen.size>=10000)throw new ConversationError('too_many_events');seen.add(event.id);yield eventAck(event,previous);}cursor=event.id;}
+            closed=page.status==='closed';
+          }
+        } catch(error) { opts.signal?.throwIfAborted(); if(error instanceof ValidationError || error instanceof ConversationError)throw error; } finally { opts.onPartial?.(null); await response.body?.cancel().catch(()=>{}); }
+        if(closed||reconnects++>=maxReconnects)return;
+        opts.signal?.throwIfAborted(); await sleep(Math.min(maxDelayMs,baseDelayMs*2**attempts++));
+      }
+    },
     start: (message: OutboundInput, opts: ReadParams & { parentConversationId?: string } = {}) => submit(message, null, opts, opts.parentConversationId),
     send: (conversationId: string, message: OutboundInput, opts: ReadParams = {}) => submit(message, conversationId, opts),
     /** Re-dispatch a pending outbound operation with its original ID and content. */
