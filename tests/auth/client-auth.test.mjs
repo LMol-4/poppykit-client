@@ -21,7 +21,8 @@ function memoryStore(initial = initialClientAuthState()) {
     crashNext: false, crashIn: 0, // crashIn = n fails the nth transaction from now
     get raw() { return state; },
     async read() { return structuredClone(state); },
-    transaction(change) {
+    async pendingOperations(after, limit) { return Object.values(state.operations).filter(row => row.phase !== 'terminal' && row.id > (after ?? '')).map(row => row.id).sort().slice(0, limit); },
+    transaction(selection, change = selection) {
       const run = chain.then(() => {
         // Simulates the process dying before commit.
         if (store.crashNext) { store.crashNext = false; throw new Error('crash'); }
@@ -722,16 +723,16 @@ test('a secret store failure after the exchange is reported as uncertain', async
   assert.deepEqual(store.raw.grants, {}); assert.deepEqual(store.raw.cleanup, {});
 });
 
-test('recovery during an in-flight exchange wins; the late grant is parked, not activated', async () => {
+test("recovery leaves another invocation's live exchange intact", async () => {
   const { auth, company, options, store } = await setup();
   const { connection } = await auth.start(company.domain);
   const { callbackUrl } = await beginAndApprove(auth, company, connection.id);
   const original = company.handle;
   company.handle = async (request, init) => { const response = await original(request, init); if (request.url === company.tokenEndpoint) await createClientAuth(options).recover(); return response; };
   const outcome = await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER });
-  assert.equal(outcome.status, 'uncertain');
-  assert.equal(store.raw.connections[connection.id].status, 'signed_out'); assert.deepEqual(store.raw.grants, {});
-  assert.equal(Object.keys(store.raw.cleanup).length, 1);
+  assert.equal(outcome.status, 'completed');
+  assert.equal(store.raw.connections[connection.id].status, 'signed_in');
+  assert.equal(Object.keys(store.raw.cleanup).length, 0);
 });
 
 test('sign-in requests the conversation resource so the signed-in token works there', async () => {
@@ -1133,9 +1134,9 @@ async function interruptedRefresh(interrupt) {
     };
     const sent = exchanges(company);
     const outcome = await auth.renew(id);
-    assert.equal(exchanges(company), sent, `${interrupt}: no refresh sent`);
+    assert.equal(exchanges(company), sent + (interrupt === 'recover' ? 1 : 0));
     if (interrupt === 'recover') {
-      assert.deepEqual([outcome.status, outcome.error], ['failed', 'interrupted']);
+      assert.equal(outcome.status, 'completed');
       assert.deepEqual([grantOf(store, id).operationId, grantOf(store, id).status, store.raw.connections[id].status], [null, 'active', 'signed_in']);
       assert.equal((await auth.renew(id)).status, 'completed');
     } else {
@@ -1144,7 +1145,7 @@ async function interruptedRefresh(interrupt) {
     }
   }
 }
-test('a refresh that recovery settled before dispatch is never sent', () => interruptedRefresh('recover'));
+test('a live refresh survives recovery before dispatch', () => interruptedRefresh('recover'));
 test('a refresh that sign-out cancelled before dispatch is never sent', () => interruptedRefresh('signOut'));
 
 test('connection exposes the verified organization, including a domain that differs from the lookup', async () => {

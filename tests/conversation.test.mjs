@@ -14,6 +14,12 @@ const memoryStore = () => {
   let state = initialConversationClientState();
   return {
     read: async () => structuredClone(state),
+    async getOutbound(key, id) { return structuredClone(state.outbound.find(r => r.connectionId === key.connectionId && r.issuer === key.issuer && r.id === id)); },
+    async prepareOutbound(key, record) { const old = await this.getOutbound(key, record.id); if (old) return old; state.outbound.push(structuredClone(record)); return structuredClone(record); },
+    async settleOutbound(key, id, result) { const row = state.outbound.find(r => r.connectionId === key.connectionId && r.issuer === key.issuer && r.id === id); if (row.phase === 'pending') Object.assign(row, structuredClone(result)); },
+    async getCheckpoint(key, conversationId, name) { return (state.consumers ?? []).find(r => r.connectionId === key.connectionId && r.issuer === key.issuer && r.conversationId === conversationId && r.name === name)?.cursor; },
+    async advanceCheckpoint(key, row, from) { state.consumers ??= []; const old = state.consumers.find(r => r.connectionId === key.connectionId && r.issuer === key.issuer && r.conversationId === row.conversationId && r.name === row.name); if (from.includes(old?.cursor)) { if (old) old.cursor = row.cursor; else state.consumers.push(structuredClone(row)); } },
+    async resetCheckpoint(key, conversationId, name) { state.consumers = (state.consumers ?? []).filter(r => !(r.connectionId === key.connectionId && r.issuer === key.issuer && r.conversationId === conversationId && r.name === name)); },
     transaction: async change => { const draft = structuredClone(state); const result = change(draft); assertJson(draft); state = draft; return structuredClone(result); },
   };
 };
@@ -514,13 +520,13 @@ test('close success returns the closed state', async () => {
   assert.ok(server.log.at(-1).startsWith('POST') && server.log.at(-1).endsWith(`/${cid}/close`));
 });
 
-test('completed outbound records are pruned to about the newest N; pending ones are kept', async () => {
+test('outbound receipts remain available for later retries', async () => {
   const { client, server, store } = setup({ keepCompleted: 2 });
   server.hooks.failures.push(json({ error: 'x' }, 500), json({ error: 'x' }, 500), json({ error: 'x' }, 500), json({ error: 'x' }, 500));
   await assert.rejects(client.start({ ...msg, id: 'msg_pend' })); // stays pending
   for (const i of [1, 2, 3, 4]) await client.start({ ...msg, id: `msg_p${i}` });
-  // N completed plus the one in flight at prune time
-  assert.deepEqual((await store.read()).outbound.map(r => r.id), ['msg_pend', 'msg_p2', 'msg_p3', 'msg_p4']);
+  // Keep receipts until an explicit retention policy can preserve retry identity.
+  assert.deepEqual((await store.read()).outbound.map(r => r.id), ['msg_pend', 'msg_p1', 'msg_p2', 'msg_p3', 'msg_p4']);
   const before = server.byMessage.size;
   await client.start({ ...msg, id: 'msg_p4' }); // recent retry is still deduped locally
   assert.equal(server.byMessage.size, before);

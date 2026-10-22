@@ -29,6 +29,10 @@ optional hosted-identity adapter/reference entry point. These are planned
 capabilities, not features available in this checkout. Operators supply enrollment
 authentication and hosting; the SDK will not require a PoppyKit cloud service.
 
+J1 now supplies targeted storage contracts, optional SQLite adapters, immutable
+outbound destinations and owner-aware authentication recovery. See [STORAGE.md](STORAGE.md)
+for Node requirements, transaction guarantees, adapter setup and reset instructions.
+
 The official repository now provides JSON Schemas and a partial implementation-kit
 validator. Their shape checks supplement the normative prose and behavioral tests;
 the schema's stale assertion-audience description must not override the issuer rule.

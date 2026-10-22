@@ -1,0 +1,56 @@
+import { SqliteAuthStore, SqliteConversationStore } from '../dist/sqlite.js';
+import { createClientAuth, createMetadataResolver } from '../dist/index.js';
+import { createFakeCompany, fakeTransport } from '../tests/auth/fake-issuer.mjs';
+import { DatabaseSync } from 'node:sqlite';
+
+const [mode, path] = process.argv.slice(2);
+const key = { connectionId: 'c', issuer: 'https://issuer.test/one', endpoint: 'https://company.test/conversations' };
+const row = { ...key, id: 'message', target: null, request: { message: { id: 'message', sender: 'agent', text: 'hello' } }, fingerprint: 'same', phase: 'pending' };
+const pause = () => new Promise(() => { setInterval(() => {}, 1000); });
+if (mode === 'prepare') {
+  const store = new SqliteConversationStore(path);
+  await store.prepareOutbound(key, row); store.close();
+  process.send({ ready: true });
+} else if (mode === 'before-commit') {
+  const store = new SqliteAuthStore(path);
+  await store.transaction({ issuer: 'uncommitted' }, state => {
+    state.identities.uncommitted = { userId: 'u', dpopKeyRef: 'reference' };
+    process.send({ ready: true });
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+  });
+} else {
+  const store = new SqliteAuthStore(path);
+  const secrets = new Map();
+  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const jwk = { ...await crypto.subtle.exportKey('jwk', pair.publicKey), kid: 'test-key', alg: 'ES256' };
+  const identity = { kid: jwk.kid, publicJwk: async () => jwk, sign: async input => new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, pair.privateKey, input)) };
+  const clientId = 'https://agent.test/client.json', redirectUri = 'https://agent.test/callback', browserBinding = 'browser-binding-for-test-only';
+  const company = createFakeCompany({ jwks: { keys: [jwk] }, clientId, redirectUris: [redirectUri], now: Date.now });
+  const transport = fakeTransport(company);
+  const auth = createClientAuth({ namespace: 'process-test', localUserId: 'user', clientId, redirectUris: [redirectUri], identity, store,
+    secrets: { async stage(value) { const id = crypto.randomUUID(); secrets.set(id, value); return id; }, async read(id) { return secrets.get(id) ?? null; }, async remove(id) { secrets.delete(id); } },
+    transport, metadata: createMetadataResolver(transport) });
+  if (mode === 'recover') {
+    const results = await auth.recover(); store.close();
+    process.send({ results: results.map(r => ({ status: r.status, operationId: r.operationId })) });
+  } else {
+    const { connection } = await auth.start(company.domain);
+    const begun = await auth.beginSignIn(connection.id, { scopes: ['poppy:read'], redirectUri, browserBinding });
+    const callbackUrl = company.authorize(begun.authorizationUrl, { account: 'account' });
+    const handle = company.handle;
+    company.handle = async (request, options) => {
+      const response = await handle(request, options);
+      if (request.url === company.tokenEndpoint) {
+        // Synthetic external side effect commits independently of SDK completion.
+        const external = new DatabaseSync(path + '.external');
+        external.exec('CREATE TABLE IF NOT EXISTS effects (id TEXT PRIMARY KEY)');
+        external.prepare('INSERT INTO effects VALUES (?)').run(begun.outcome.operationId);
+        external.close();
+        process.send({ ready: true, operationId: begun.outcome.operationId });
+        await pause();
+      }
+      return response;
+    };
+    await auth.completeSignIn({ callbackUrl, browserBinding });
+  }
+}

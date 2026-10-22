@@ -1,3 +1,6 @@
+import type { AuthSelection, AuthStore } from './store.js';
+import { acquireOwner, releaseOwner, localOwnerAlive } from './ownership.js';
+import type { OperationOwner } from './ownership.js';
 import { createHash } from 'node:crypto';
 import { calculateJwkThumbprint } from 'jose';
 import { parseJson, parseProtocolError, parseTokenResponse, retryAfterMilliseconds } from '../protocol/wire.js';
@@ -7,10 +10,7 @@ import type { CompanyMetadata, MetadataResolver } from '../network/discovery.js'
 import type { HttpTransport } from '../network/transport.js';
 import { dpopChallenge } from './challenge.js';
 
-export interface StateStore<S> {
-  read(): Promise<S>;
-  transaction<T>(change: (draft: S) => T): Promise<T>;
-}
+export type { AuthStore, AuthSelection };
 export interface SecretStore {
   stage(secret: string): Promise<string>;
   read(reference: string): Promise<string | null>;
@@ -27,9 +27,10 @@ export interface ClientAuthOptions {
   namespace: string; localUserId: string; clientId: string;
   redirectUris: readonly string[]; // used by Direct Sign-In (J09)
   identity: IdentitySigner;
-  store: StateStore<ClientAuthState>; secrets: SecretStore;
+  store: AuthStore; secrets: SecretStore;
   transport: HttpTransport; metadata: MetadataResolver;
   now?: () => number;
+  ownerAlive?: (owner: OperationOwner) => boolean;
 }
 
 export type ConnectionStatus = 'signed_out' | 'signed_in' | 'disconnected' | 'uncertain';
@@ -86,6 +87,7 @@ export interface DirectRecord {
   redirectUri: string; issuer: string; clientId: string; sessionId: string;
 }
 export interface OperationRecord {
+  owner?: OperationOwner;
   epoch: string; id: string; kind: 'start' | 'renew' | 'sign_in'; connectionId: string;
   connectionGeneration: number; grantId: string | null; grantGeneration: number | null;
   phase: 'prepared' | 'dispatched' | 'staged' | 'terminal';
@@ -194,12 +196,12 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   function checkOwner(state: ClientAuthState): void {
     if (state.owner && (state.owner.namespace !== namespace || state.owner.clientId !== clientId || state.owner.localUserId !== localUserId)) throw new AuthFailure('owner_mismatch');
   }
-  async function load(): Promise<ClientAuthState> { const state = await store.read(); checkOwner(state); return state; }
-  function transaction<T>(change: (state: ClientAuthState) => T): Promise<T> {
-    return store.transaction(state => { checkOwner(state); state.owner ??= owner; return change(state); });
+  async function load(selection: AuthSelection): Promise<ClientAuthState> { const state = await store.read(selection); checkOwner(state); return state; }
+  function transaction<T>(selection: AuthSelection, change: (state: ClientAuthState) => T): Promise<T> {
+    return store.transaction(selection, state => { checkOwner(state); state.owner ??= owner; return change(state); });
   }
   async function record(connectionId: string): Promise<ConnectionRecord> {
-    const found = typeof connectionId === 'string' ? own((await load()).connections, connectionId) : undefined;
+    const found = typeof connectionId === 'string' ? own((await load({ connectionId })).connections, connectionId) : undefined;
     if (!found) throw new AuthFailure('unknown_connection');
     return found;
   }
@@ -292,14 +294,14 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   }
 
   async function identityFor(issuer: string): Promise<{ userId: string; dpopKeyRef: string }> {
-    const existing = own((await load()).identities, issuer);
+    const existing = own((await load({ issuer })).identities, issuer);
     if (existing) return existing;
     // shortcut: extractable key, because the SecretStore holds the private JWK as a string and Node cannot persist a non-extractable CryptoKey; move to a KMS/OS-keystore signer when the host platform offers one.
     const pair = await crypto.subtle.generateKey(EC, true, ['sign', 'verify']);
     const { kty, crv, x, y, d } = await crypto.subtle.exportKey('jwk', pair.privateKey);
     const dpopKeyRef = await secrets.stage(JSON.stringify({ kty, crv, x, y, d }));
     const userId = randomId('usr_');
-    const winner = await transaction(state => own(state.identities, issuer) ?? (state.identities[issuer] = { userId, dpopKeyRef }));
+    const winner = await transaction({ issuer }, state => own(state.identities, issuer) ?? (state.identities[issuer] = { userId, dpopKeyRef }));
     // A concurrent start won; our staged key was never referenced by any record.
     if (winner.dpopKeyRef !== dpopKeyRef) await secrets.remove(dpopKeyRef);
     return winner;
@@ -308,10 +310,10 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   // Commits a change that may stage or release secrets. When our own fence check rejects it, nothing references the
   // staged secrets, so they are removed; references the committed change pushed to `drop` are removed after commit.
   // shortcut: a crash between stage() and commit leaves an unreferenced secret; SecretStore cannot list, so add a sweep when D offers one.
-  async function commit<T>(staged: (string | null)[], change: (state: ClientAuthState, drop: string[]) => T): Promise<T> {
+  async function commit<T>(selection: AuthSelection, staged: (string | null)[], change: (state: ClientAuthState, drop: string[]) => T): Promise<T> {
     const drop: string[] = [];
     let result: T;
-    try { result = await transaction(state => { drop.length = 0; return change(state, drop); }); } catch (error) {
+    try { result = await transaction(selection, state => { drop.length = 0; return change(state, drop); }); } catch (error) {
       if (error instanceof AuthFailure && error.code === 'state_changed') for (const ref of staged) if (ref !== null) await secrets.remove(ref);
       throw error;
     }
@@ -358,7 +360,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       token = await signedOutToken(connection.metadata, connection.userId, connection.dpopKeyRef, null, resource);
     }
     const secretRef = await stageSessionToken(token.access_token);
-    return commit([secretRef], (state, drop) => {
+    return commit({ connectionId: connection.id }, [secretRef], (state, drop) => {
       const current = own(state.connections, connection.id);
       if (!current || current.generation !== connection.generation || current.status !== 'signed_out' || current.sessionId !== connection.sessionId) throw new AuthFailure('state_changed', connection.id);
       switchSession(current, token.session_id, drop);
@@ -370,8 +372,10 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   // Account Token refresh (spec 4.8). The grant claim allows one rotation in flight per grant across processes,
   // because a second sender could present a token the first rotation already replaced.
   async function refresh(connection: ConnectionRecord, resource: string | null, scopes: string[] | null): Promise<AuthOutcome> {
+    const executionOwner = acquireOwner();
+    try {
     const at = now(), operationId = randomId('op_');
-    const claim = await transaction(state => {
+    const claim = await transaction({ connectionId: connection.id }, state => {
       const current = own(state.connections, connection.id)!;
       const grant = current.grantId === null ? undefined : own(state.grants, current.grantId);
       if (current.status !== 'signed_in' || !grant) throw new AuthFailure('state_changed', connection.id);
@@ -381,24 +385,25 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (scopes && !scopes.every(scope => grant.scopes.includes(scope))) throw new AuthFailure('invalid_scope', connection.id);
       grant.operationId = operationId;
       const operation = renewOperation(state, operationId, current, grant, at, resource, scopes ?? [...grant.scopes]);
+      operation.owner = executionOwner;
       return { running: null, connection: current, secretRef: grant.secretRef, requested: operation.scopes };
     });
     if (claim.running) return claim.running;
     let refreshToken: string | null;
-    try { refreshToken = await secrets.read(claim.secretRef); } catch { return endRefresh(operationId, 'failed', 'storage_error'); }
-    if (refreshToken === null) return endRefresh(operationId, 'failed', 'missing_credential');
+    try { refreshToken = await secrets.read(claim.secretRef); } catch { return await endRefresh(operationId, 'failed', 'storage_error'); }
+    if (refreshToken === null) return await endRefresh(operationId, 'failed', 'missing_credential');
     const sessionId = claim.connection.sessionId!;
     const fields: Record<string, string> = { grant_type: 'refresh_token', refresh_token: refreshToken, session_id: sessionId };
     if (resource !== null) fields.resource = resource;
     if (scopes) fields.scope = scopes.join(' ');
     // The last local step before the send; a crash before it sent nothing, so recover just releases the grant.
-    const dispatched = await transaction(state => {
+    const dispatched = await transaction({ operationId }, state => {
       const operation = own(state.operations, operationId);
       if (!operation || operation.epoch !== state.epoch || operation.phase !== 'prepared') return false;
-      operation.phase = 'dispatched';
+      operation.phase = 'dispatched'; operation.owner = executionOwner;
       return true;
     });
-    if (!dispatched) return endRefresh(operationId, 'failed', 'state_changed');
+    if (!dispatched) return await endRefresh(operationId, 'failed', 'state_changed');
     const issuedAt = now();
     const send = () => tokenRequest(claim.connection.metadata, claim.connection.dpopKeyRef, fields, null);
     let token: TokenResponse, newSession = false;
@@ -414,38 +419,39 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (error instanceof AuthFailure && error.retryAfterMs !== undefined) retryAfter.set(operationId, error.retryAfterMs);
       const code = error instanceof AuthFailure ? error.code : 'local_error'; // non-AuthFailure errors come from local signing before dispatch
       // A lost, unreadable or non-OAuth answer may follow a rotation, so the old Account Token is never resent (IMPLEMENTATION 4).
-      if (AMBIGUOUS.has(code)) return endRefresh(operationId, 'uncertain', 'lost_response');
-      return endRefresh(operationId, 'failed', code);
+      if (AMBIGUOUS.has(code)) return await endRefresh(operationId, 'uncertain', 'lost_response');
+      return await endRefresh(operationId, 'failed', code);
     }
     const granted = token.scope.split(' ').filter(Boolean);
     let problem: string | null = null;
     if (token.token_type !== 'DPoP') problem = 'unsupported_token_type';
     else if (token.signed_in !== true || (newSession ? token.session_id === sessionId : token.session_id !== sessionId) || granted.some(scope => !claim.requested.includes(scope))) problem = 'invalid_response';
     let refreshRef: string | null = null, accessRef: string | null = null;
-    try { if (token.refresh_token !== undefined) refreshRef = await secrets.stage(token.refresh_token); } catch { return endRefresh(operationId, 'uncertain', 'storage_error'); }
+    try { if (token.refresh_token !== undefined) refreshRef = await secrets.stage(token.refresh_token); } catch { return await endRefresh(operationId, 'uncertain', 'storage_error'); }
     if (!problem) try { accessRef = await stageSessionToken(token.access_token); } catch { problem = 'storage_error'; }
-    if (problem || accessRef === null) return endRefresh(operationId, 'failed', problem ?? 'storage_error', refreshRef);
+    if (problem || accessRef === null) return await endRefresh(operationId, 'failed', problem ?? 'storage_error', refreshRef);
     const staged: StagedRefresh = {
       accessRef, refreshRef, sessionId: token.session_id, scopes: granted, signedIn: true, expiresAt: issuedAt + token.expires_in * 1000,
       refreshExpiresAt: token.refresh_token_expires_in === undefined ? null : issuedAt + token.refresh_token_expires_in * 1000,
     };
     // Its own commit, so a crash before activation leaves the new Account Token referenced for recover (interface 4).
-    const recorded = await transaction(state => {
+    const recorded = await transaction({ operationId }, state => {
       const operation = own(state.operations, operationId);
       if (!operation || operation.epoch !== state.epoch || operation.phase !== 'dispatched') return false;
       operation.phase = 'staged'; operation.staged = staged;
       return true;
     });
-    if (!recorded) return endRefresh(operationId, 'failed', 'state_changed', refreshRef, accessRef);
-    return commit([accessRef, refreshRef], (state, drop) => {
+    if (!recorded) return await endRefresh(operationId, 'failed', 'state_changed', refreshRef, accessRef);
+    return await commit({ operationId }, [accessRef, refreshRef], (state, drop) => {
       const operation = own(state.operations, operationId);
       if (!operation || operation.epoch !== state.epoch) throw new AuthFailure('state_changed');
       return operation.phase === 'staged' ? activateRefresh(state, operation, drop) : outcomeOf(state, operation);
     });
+    } finally { releaseOwner(executionOwner); }
   }
   // Ends a refresh that will not activate. A returned Account Token is parked for revocation.
   function endRefresh(operationId: string, status: OperationStatus, error: string, refreshRef: string | null = null, accessRef: string | null = null): Promise<AuthOutcome> {
-    return commit([refreshRef, accessRef], (state, drop) => {
+    return commit({ operationId }, [refreshRef, accessRef], (state, drop) => {
       const operation = own(state.operations, operationId);
       if (!operation || operation.epoch !== state.epoch) throw new AuthFailure('state_changed');
       if (accessRef !== null) drop.push(accessRef);
@@ -565,18 +571,18 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   }
   async function cleanupNow(connectionId: string): Promise<SignOutOutcome> {
     const connection = await record(connectionId);
-    const items = Object.values((await load()).cleanup).filter(item => item.connectionId === connectionId && item.status === 'pending');
+    const items = Object.values((await load({ connectionId })).cleanup).filter(item => item.connectionId === connectionId && item.status === 'pending');
     for (const item of items) {
       const token = await secrets.read(item.secretRef);
       const revoked = token !== null && await revoke(connection, item, token);
       if (token !== null && !revoked) continue;
-      await commit([], (state, drop) => {
+      await commit({ connectionId }, [], (state, drop) => {
         const current = own(state.cleanup, item.id);
         if (current?.secretRef !== item.secretRef) return;
         if (revoked) { delete state.cleanup[item.id]; drop.push(item.secretRef); } else current.status = 'uncertain';
       });
     }
-    const state = await load();
+    const state = await load({ connectionId });
     return { connection: publicConnection(state, own(state.connections, connectionId)!), cleanup: cleanupStatus(state, connectionId) };
   }
 
@@ -602,7 +608,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   }
   // Records a terminal sign-in result if the exchange still owns the operation; a recovery that ran meanwhile wins.
   async function settle(operationId: string, verifierRef: string, status: OperationStatus, extra: { error?: string; missingScopes?: string[] }, unusedGrantRef: string | null = null): Promise<AuthOutcome> {
-    const outcome = await transaction(state => {
+    const outcome = await transaction({ operationId }, state => {
       const operation = own(state.operations, operationId);
       if (!operation || operation.epoch !== state.epoch) throw new AuthFailure('state_changed');
       if (unusedGrantRef !== null) retire(state, `cln_${operationId}`, own(state.connections, operation.connectionId)!, unusedGrantRef);
@@ -624,7 +630,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const token = await signedOutToken(metadata, userId, dpopKeyRef, null, null);
       const secretRef = await stageSessionToken(token.access_token);
       const id = randomId('con_'), operationId = randomId('op_');
-      return commit([secretRef], state => {
+      return commit({ issuer }, [secretRef], state => {
         // A reset or competing identity since we signed means this session belongs to no current identity.
         if (own(state.identities, issuer)?.dpopKeyRef !== dpopKeyRef) throw new AuthFailure('state_changed');
         const connection: ConnectionRecord = {
@@ -642,12 +648,12 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       });
     },
     async get(connectionId) {
-      const state = await load();
+      const state = await load({ connectionId });
       const found = typeof connectionId === 'string' ? own(state.connections, connectionId) : undefined;
       return found ? publicConnection(state, found) : null;
     },
     async list() {
-      const state = await load();
+      const state = await load({ list: true });
       return Object.values(state.connections).map(connection => publicConnection(state, connection));
     },
     async target(connectionId) { return targetOf(await record(connectionId)); },
@@ -678,7 +684,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const verifier = b64(crypto.getRandomValues(new Uint8Array(32)));
       const verifierRef = await secrets.stage(verifier);
       const createdAt = now(), operationId = randomId('op_');
-      const outcome = await commit([verifierRef], draft => {
+      const outcome = await commit({ connectionId }, [verifierRef], draft => {
         const current = own(draft.connections, connectionId);
         if (!current || current.generation !== connection.generation || current.status !== connection.status || current.sessionId !== connection.sessionId) throw new AuthFailure('state_changed', connectionId);
         pruneHistory(draft);
@@ -698,11 +704,13 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     },
 
     async completeSignIn(input) {
+      const executionOwner = acquireOwner();
+      try {
       const { callbackUrl, browserBinding } = (input ?? {}) as { callbackUrl?: unknown; browserBinding?: unknown };
       const { params, base } = parseCallback(callbackUrl);
       if (typeof browserBinding !== 'string' || params.state === undefined || (params.code === undefined) === (params.error === undefined)) throw new AuthFailure('invalid_callback');
       const stateHash = sha256(params.state), browserHash = sha256(browserBinding);
-      const snapshot = await load();
+      const snapshot = await load({ callbackHash: stateHash });
       const found = Object.values(snapshot.operations).find(operation => operation.kind === 'sign_in' && operation.epoch === snapshot.epoch && operation.direct?.stateHash === stateHash);
       const direct = found?.direct;
       // A wrong browser, redirect or issuer (mix-up, spec 4.5) leaves the operation untouched so the genuine callback still completes.
@@ -711,7 +719,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const verifier = found.phase === 'prepared' && params.code !== undefined ? await secrets.read(direct.verifierRef) : null;
       const at = now();
       // Only one claimant moves prepared -> dispatched; everyone else gets the recorded progress or result.
-      const claim = await transaction(state => {
+      const claim = await transaction({ operationId }, state => {
         const operation = own(state.operations, operationId);
         if (!operation || operation.epoch !== state.epoch) throw new AuthFailure('invalid_callback');
         if (operation.phase !== 'prepared') return outcomeOf(state, operation);
@@ -720,7 +728,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         if (at >= operation.expiresAt) return finish(state, operation, 'expired');
         if (params.error !== undefined) return params.error === 'access_denied' ? finish(state, operation, 'denied', { error: 'access_denied' }) : finish(state, operation, 'failed', { error: AUTHORIZE_ERRORS.has(params.error) ? params.error : 'authorization_error' });
         if (verifier === null) return finish(state, operation, 'failed', { error: 'missing_key' });
-        operation.phase = 'dispatched';
+        operation.phase = 'dispatched'; operation.owner = executionOwner;
         return { connection, operation };
       });
       if (!('operation' in claim)) {
@@ -754,7 +762,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (problem) return settle(operationId, direct.verifierRef, 'failed', problem === 'insufficient_scope' ? { error: problem, missingScopes } : { error: problem }, refreshRef);
       const grantId = randomId('grt_');
       const refreshExpiresAt = token.refresh_token_expires_in === undefined ? null : issuedAt + token.refresh_token_expires_in * 1000;
-      const outcome = await commit([refreshRef, accessRef], (state, drop) => {
+      const outcome = await commit({ operationId }, [refreshRef, accessRef], (state, drop) => {
         const current = own(state.operations, operationId);
         // shortcut: after a full reset there is no connection to park the new grant on, so its secrets are removed and it is not revoked remotely; revoke here if resets during sign-in matter.
         if (!current || current.epoch !== state.epoch) throw new AuthFailure('state_changed');
@@ -776,10 +784,11 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       });
       await secrets.remove(direct.verifierRef);
       return outcome;
+      } finally { releaseOwner(executionOwner); }
     },
 
     async cancelSignIn(operationId) {
-      const { outcome, verifierRef } = await transaction(state => {
+      const { outcome, verifierRef } = await transaction({ operationId }, state => {
         const operation = typeof operationId === 'string' ? own(state.operations, operationId) : undefined;
         if (!operation?.direct || operation.epoch !== state.epoch) throw new AuthFailure('unknown_operation');
         // Once the code is sent, cancelling cannot undo the remote exchange; its outcome stands.
@@ -790,7 +799,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     },
 
     async operation(operationId) {
-      const state = await load();
+      const state = await load({ operationId });
       const found = typeof operationId === 'string' ? own(state.operations, operationId) : undefined;
       return found && found.epoch === state.epoch ? outcomeOf(state, found) : null;
     },
@@ -798,24 +807,34 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     // Host calls this at startup; it never repeats a remote exchange.
     async recover() {
       const at = now();
-      return commit([], (state, drop) => {
-        const results: AuthOutcome[] = [];
-        for (const operation of Object.values(state.operations)) {
-          if (operation.epoch !== state.epoch || operation.phase === 'terminal') continue;
+      const results: AuthOutcome[] = [];
+      let after: string | undefined;
+      for (;;) {
+        const ids = await store.pendingOperations(after, 100);
+        if (!ids.length) return results;
+        for (const operationId of ids) {
+          const recovered = await commit({ operationId }, [], (state, drop): AuthOutcome | undefined => {
+          const operation = own(state.operations, operationId);
+          if (!operation || operation.epoch !== state.epoch || operation.phase === 'terminal') return;
+          if (operation.owner && (options.ownerAlive ?? localOwnerAlive)(operation.owner)) return;
+          let result: AuthOutcome;
           // A fully staged refresh finishes locally; its fences still decide whether it activates.
           if (operation.kind === 'renew') {
-            if (operation.phase === 'staged') results.push(activateRefresh(state, operation, drop));
-            else results.push(operation.phase === 'prepared' ? closeRefresh(state, operation, 'failed', 'interrupted', false, drop) : closeRefresh(state, operation, 'uncertain', 'lost_response', false, drop));
+            if (operation.phase === 'staged') result = activateRefresh(state, operation, drop);
+            else result = operation.phase === 'prepared' ? closeRefresh(state, operation, 'failed', 'interrupted', false, drop) : closeRefresh(state, operation, 'uncertain', 'lost_response', false, drop);
           }
           // The code may have reached the issuer before the crash; only a fresh sign-in is safe.
-          else if (operation.phase !== 'prepared') results.push(finish(state, operation, 'uncertain', { error: 'lost_response' }));
-          else if (at >= operation.expiresAt) results.push(finish(state, operation, 'expired'));
-          else continue;
+          else if (operation.phase !== 'prepared') result = finish(state, operation, 'uncertain', { error: 'lost_response' });
+          else if (at >= operation.expiresAt) result = finish(state, operation, 'expired');
+          else return;
           // Terminal operations never read their verifier again.
           if (operation.direct) drop.push(operation.direct.verifierRef);
+          return result;
+          });
+          if (recovered) results.push(recovered);
         }
-        return results;
-      });
+        after = ids.at(-1);
+      }
     },
 
     async renew(connectionId, input) {
@@ -828,7 +847,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     // Sign-out wins over in-flight sign-in and refresh: disconnection and the new generation commit before anything goes remote (IMPLEMENTATION 4).
     async signOut(connectionId) {
       await record(connectionId);
-      await commit([], (state, drop) => {
+      await commit({ connectionId }, [], (state, drop) => {
         const connection = own(state.connections, connectionId)!;
         if (connection.status === 'disconnected') return;
         connection.generation++; connection.status = 'disconnected';

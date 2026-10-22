@@ -1,11 +1,11 @@
+import type { ConversationStore } from './conversation-store.js';
 import { dpopChallenge } from './auth/challenge.js';
 import { TransportError } from './network/transport.js';
 import { canonical, id as parseId, parseJson, parseConversationRequest, parseConversationState, parseEventPage, parseMessage, parseProtocolError, retryAfterMilliseconds } from './protocol/wire.js';
 import type { ConversationRequest, ConversationState, EventPage, Message } from './protocol/wire.js';
 
-export interface StateStore<State> { read(): Promise<State>; transaction<Result>(change: (draft: State) => Result): Promise<Result> }
 export interface OutboundRecord {
-  connectionId: string; issuer: string; id: string; target: string | null; request: ConversationRequest; fingerprint: string;
+  connectionId: string; issuer: string; endpoint: string; id: string; target: string | null; request: ConversationRequest; fingerprint: string;
   phase: 'pending' | 'accepted' | 'rejected'; read?: ReadParams; response?: ConversationState | EventPage; error?: { code: string; status: number; conversationId?: string };
 }
 // POST ?wait/?cursor, persisted with the record so a retry repeats the original read parameters (spec 7.3).
@@ -23,10 +23,10 @@ export class ConversationError extends Error {
 export interface ConversationClientOptions {
   authorizedRequest(request: Request): Promise<Response>;
   endpoint: string; connectionId: string; issuer: string;
-  store: StateStore<ConversationClientState>;
+  store: ConversationStore;
   clock: { now(): number };
   newId?: () => string; sleep?: (ms: number) => Promise<void>; random?: () => number;
-  maxAttempts?: number; baseDelayMs?: number; maxDelayMs?: number; maxPages?: number; keepCompleted?: number;
+  maxAttempts?: number; baseDelayMs?: number; maxDelayMs?: number; maxPages?: number;
 }
 export interface ReadOptions extends ReadParams { consumer?: string }
 export type OutboundInput = Omit<Message, 'id'> & { id?: string };
@@ -40,8 +40,8 @@ export function createConversationClient(options: ConversationClientOptions) {
   const newId = options.newId ?? (() => `msg_${Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('base64url')}`); // 128 random bits
   const random = options.random ?? Math.random;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
-  const maxAttempts = options.maxAttempts ?? 4, baseDelayMs = options.baseDelayMs ?? 250, maxDelayMs = options.maxDelayMs ?? 60000, maxPages = options.maxPages ?? 1000, keepCompleted = options.keepCompleted ?? 100;
-  const mine = (r: { connectionId: string; issuer: string }) => r.connectionId === connectionId && r.issuer === issuer;
+  const maxAttempts = options.maxAttempts ?? 4, baseDelayMs = options.baseDelayMs ?? 250, maxDelayMs = options.maxDelayMs ?? 60000, maxPages = options.maxPages ?? 1000;
+  const key = { connectionId, issuer, endpoint };
   // Validated IDs only: '.' and '..' survive encodeURIComponent and would escape the endpoint.
   const conversationUrl = (id: string, tail: string) => `${endpoint}/${parseId(id, 'conversation_id')}/${tail}`;
 
@@ -79,13 +79,14 @@ export function createConversationClient(options: ConversationClientOptions) {
   const delivered = new WeakMap<EventPage, { conversationId: string; consumer: string; chain: (string | undefined)[] }>();
   async function checkpoint(conversationId: string, consumer: string): Promise<string | undefined> {
     parseId(consumer, 'consumer');
-    return ((await store.read()).consumers ?? []).find(c => mine(c) && c.conversationId === conversationId && c.name === consumer)?.cursor;
+    return store.getCheckpoint(key, conversationId, consumer);
   }
 
   async function dispatch(id: string): Promise<ConversationState> {
     parseId(id, 'message.id');
-    const record = (await store.read()).outbound.find(r => mine(r) && r.id === id);
+    const record = await store.getOutbound(key, id);
     if (!record) throw new ConversationError('unknown_operation');
+    if (record.endpoint !== endpoint) throw new ConversationError('invalid_target');
     if (record.phase === 'accepted') return record.response!;
     if (record.phase === 'rejected') throw new ConversationError(record.error!.code, record.error!.status, undefined, undefined, record.error!.conversationId);
     const url = new URL(record.target === null ? endpoint : conversationUrl(record.target, 'messages'));
@@ -99,12 +100,12 @@ export function createConversationClient(options: ConversationClientOptions) {
         // A 2xx means accepted; a company that ignores wait answers with a plain state.
         try { state = record.read ? parseEventPage(body, record.read.cursor) : parseConversationState(body); } catch { state = parseConversationState(body); }
       } catch { throw new ConversationError('invalid_response', response.status); }
-      await store.transaction(draft => { const r = draft.outbound.find(x => mine(x) && x.id === id)!; r.phase = 'accepted'; r.response = state; });
+      await store.settleOutbound(key, id, { phase: 'accepted', response: state });
       return state;
     }
     const error = await failure(response);
     // direct_conversation_open lasts only until the Direct Conversation closes (spec 7.10), so the same message stays retryable.
-    if (definite(response.status) && error.code !== 'direct_conversation_open') await store.transaction(draft => { const r = draft.outbound.find(x => mine(x) && x.id === id)!; r.phase = 'rejected'; r.error = { code: error.code, status: response.status, ...(error.conversationId === undefined ? {} : { conversationId: error.conversationId }) }; });
+    if (definite(response.status) && error.code !== 'direct_conversation_open') await store.settleOutbound(key, id, { phase: 'rejected', error: { code: error.code, status: response.status, ...(error.conversationId === undefined ? {} : { conversationId: error.conversationId }) } });
     throw error;
   }
 
@@ -116,15 +117,8 @@ export function createConversationClient(options: ConversationClientOptions) {
     const message = parseMessage({ ...input, id: input.id ?? newId() }) as Message;
     const request = parseConversationRequest({ message, ...(parent === undefined ? {} : { parent_conversation_id: parent }) });
     const fingerprint = canonical({ target, request });
-    await store.transaction(draft => {
-      const existing = draft.outbound.find(r => mine(r) && r.id === message.id);
-      if (!existing) {
-        draft.outbound.push({ connectionId, issuer, id: message.id, target, request, fingerprint, phase: 'pending', ...(read.wait === undefined && read.cursor === undefined ? {} : { read: { ...(read.wait === undefined ? {} : { wait: read.wait }), ...(read.cursor === undefined ? {} : { cursor: read.cursor }) } }) });
-        // Keep only the newest completed records (enough to dedupe a recent retry); pending ones always stay.
-        let kept = 0;
-        draft.outbound = draft.outbound.reverse().filter(r => r.phase === 'pending' || !mine(r) || ++kept <= keepCompleted).reverse();
-      } else if (existing.fingerprint !== fingerprint) throw new ConversationError('message_id_conflict');
-    });
+    const existing = await store.prepareOutbound(key, { connectionId, issuer, endpoint, id: message.id, target, request, fingerprint, phase: 'pending', ...(read.wait === undefined && read.cursor === undefined ? {} : { read: { ...(read.wait === undefined ? {} : { wait: read.wait }), ...(read.cursor === undefined ? {} : { cursor: read.cursor }) } }) });
+    if (existing.fingerprint !== fingerprint || existing.endpoint !== endpoint) throw new ConversationError('message_id_conflict');
     return { ...(await dispatch(message.id)), messageId: message.id };
   }
 
@@ -140,7 +134,7 @@ export function createConversationClient(options: ConversationClientOptions) {
     send: (conversationId: string, message: OutboundInput, opts: ReadParams = {}) => submit(message, conversationId, opts),
     /** Re-dispatch a pending outbound operation with its original ID and content. */
     retry: dispatch,
-    async operation(messageId: string): Promise<OutboundRecord | undefined> { return (await store.read()).outbound.find(r => mine(r) && r.id === messageId); },
+    async operation(messageId: string): Promise<OutboundRecord | undefined> { return store.getOutbound(key, messageId); },
     handoff: (conversationId: string) => simplePost(conversationId, 'handoff'),
     close: (conversationId: string) => simplePost(conversationId, 'close'),
     /** Reads one whole page. Explicit `cursor`, or the checkpoint of a named `consumer` (not both). Never acknowledges. */
@@ -183,17 +177,12 @@ export function createConversationClient(options: ConversationClientOptions) {
       if (page.cursor === null) return; // empty foreign page: nothing to advance past
       const cursor = page.cursor;
       // Compare-and-set: cursors are opaque, so a page advances only from a checkpoint it was read from; stale acks do nothing.
-      await store.transaction(draft => {
-        const list = draft.consumers ??= [];
-        const row = list.find(c => mine(c) && c.conversationId === conversationId && c.name === consumer);
-        if (!from.chain.includes(row?.cursor)) return;
-        if (row) row.cursor = cursor; else list.push({ connectionId, issuer, conversationId, name: consumer, cursor });
-      });
+      await store.advanceCheckpoint(key, { connectionId, issuer, conversationId, name: consumer, cursor }, from.chain);
     },
     /** After cursor_expired: forget the checkpoint so the consumer rereads retained history from the start (dedupe by event ID; missing events were not processed). */
     async resetConsumer(conversationId: string, consumer: string): Promise<void> {
       parseId(conversationId, 'conversation_id'); parseId(consumer, 'consumer');
-      await store.transaction(draft => { draft.consumers = (draft.consumers ?? []).filter(c => !(mine(c) && c.conversationId === conversationId && c.name === consumer)); });
+      await store.resetCheckpoint(key, conversationId, consumer);
     },
   };
   return client;
