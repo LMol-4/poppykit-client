@@ -365,3 +365,27 @@ test('cache validators revalidate after expiry; invalidation refetches and never
   now=60001;assert.equal((await resolver.resolveClient(uri)).client_name,'Agent');assert.equal(calls,2);
   resolver.invalidate(uri);await resolver.resolveClient(uri);assert.equal(calls,3);
 });
+
+test('stalled TLS is counted against pool cap and abort destroys the unassigned socket',async t=>{
+  const net=await import('node:net');let connections=0,closed=0;const sockets=new Set();
+  const server=net.createServer(socket=>{connections++;sockets.add(socket);socket.on('data',()=>{});socket.on('close',()=>{closed++;sockets.delete(socket);});});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const transport=createNodeTransport({maxSockets:1,timeoutMs:2000,localExceptions:[{hostname:'127.0.0.1',addresses:['127.0.0.1']}]});
+  t.after(()=>{transport.close();for(const socket of sockets)socket.destroy();server.close();});
+  const controller=new AbortController(),url=`https://127.0.0.1:${server.address().port}/`;
+  const first=transport.fetch(new Request(url,{signal:controller.signal}));
+  while(connections===0)await new Promise(resolve=>setTimeout(resolve,1));
+  await assert.rejects(transport.fetch(new Request(url)),{code:'overloaded'});assert.equal(connections,1);
+  controller.abort();await assert.rejects(first);
+  const deadline=Date.now()+500;while(!closed&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,1));
+  assert.equal(closed,1,'aborted handshake closes before timeout');
+});
+
+test('304 inherits no-cache; invalidation fences an in-flight stale fetch',async()=>{
+  const uri='https://agent.example/client',value={client_id:uri,client_name:'old',jwks_uri:'https://agent.example/keys',redirect_uris:[],token_endpoint_auth_method:'private_key_jwt'};let calls=0;
+  const resolver=createMetadataResolver({async fetch(){return ++calls===1?Response.json(value,{headers:{etag:'"v1"','cache-control':'no-cache'}}):new Response(null,{status:304});}});
+  await resolver.resolveClient(uri);await resolver.resolveClient(uri);await resolver.resolveClient(uri);assert.equal(calls,3);
+  let release,started;const gate=new Promise(resolve=>release=resolve),entered=new Promise(resolve=>started=resolve);calls=0;
+  const racing=createMetadataResolver({async fetch(){if(++calls===1){started();await gate;return Response.json(value);}return Response.json({...value,client_name:'new'});}});
+  const old=racing.resolveClient(uri);await entered;racing.invalidate(uri);assert.equal((await racing.resolveClient(uri)).client_name,'new');release();await old;assert.equal((await racing.resolveClient(uri)).client_name,'new');assert.equal(calls,2);
+});

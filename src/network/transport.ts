@@ -105,20 +105,33 @@ export function createNodeTransport(options: NetworkOptions = {}): HttpTransport
           agent.createConnection = ((connectionOptions: ConnectionOptions, callback: (error: Error | null, socket?: ReturnType<typeof connect>) => void) => {
             const selected = approved[0];
             const socket = connect({ ...connectionOptions, host: selected.address, servername: isIP(hostname) ? undefined : hostname, rejectUnauthorized: true, minVersion: 'TLSv1.2', ca: options.ca ? [...rootCertificates, options.ca] : undefined });
+            const connectSignal = (connectionOptions as ConnectionOptions & { transportSignal?: AbortSignal }).transportSignal;
+            const abortConnect = () => settle(new TransportError('network_error'));
             connecting.add(socket); socket.setTimeout?.(limits.timeoutMs, () => socket.destroy(new TransportError('timeout')));
             let settled = false;
-            const settle = (error: Error | null) => { if (settled) return; settled = true; connecting.delete(socket); socket.setTimeout?.(0); if (error) { socket.destroy(); callback(error); } else callback(null, socket); };
+            const settle = (error: Error | null) => { if (settled) return; settled = true; connectSignal?.removeEventListener('abort',abortConnect); connecting.delete(socket); socket.setTimeout?.(0); if (error) { socket.destroy(); callback(error); } else callback(null, socket); };
+            connectSignal?.addEventListener('abort',abortConnect,{once:true}); if(connectSignal?.aborted)queueMicrotask(abortConnect);
             socket.once('error', error => settle(error instanceof TransportError ? error : new TransportError('network_error')));
             socket.once('secureConnect', () => settle(socket.remoteAddress && approved.some(item => normalizedAddress(item.address) === normalizedAddress(socket.remoteAddress!)) && allowed(hostname, socket.remoteAddress) ? null : new TransportError('blocked_address')));
             return undefined;
           }) as typeof agent.createConnection;
+          agent.reuseSocket = (duplex, outgoing) => {
+            const socket = duplex as TLSSocket;
+            if (!socket.remoteAddress || !approved.some(item => normalizedAddress(item.address) === normalizedAddress(socket.remoteAddress!)) || !allowed(hostname,socket.remoteAddress)) {
+              const error = new TransportError('blocked_address'); socket.destroy(error); outgoing.destroy(error); return;
+            }
+            Agent.prototype.reuseSocket.call(agent,socket,outgoing);
+          };
           pool = { agent, active: 0, origin: url.origin, mode }; pools.set(poolKey, pool);
         }
-        const selectedPool = pool; selectedPool.active++;
+        const selectedPool = pool;
+        // No hidden Agent queue: callers retry overload, after fresh DNS and policy validation.
+        if (selectedPool.active >= limits.maxSockets) throw new TransportError('overloaded');
+        selectedPool.active++;
         let releaseCalled = false;
         const release = () => { if (!releaseCalled) { releaseCalled = true; selectedPool.active--; } };
         const response = await new Promise<Response>((resolve, reject) => {
-          const outgoing = httpsRequest(url, { method: request.method, headers: Object.fromEntries(request.headers), agent: selectedPool.agent, signal }, incoming => {
+          const outgoing = httpsRequest(url, { method: request.method, headers: Object.fromEntries(request.headers), agent: selectedPool.agent, signal, ...{ transportSignal: signal } }, incoming => {
             const headers = new Headers(); for (let i = 0; i < incoming.rawHeaders.length; i += 2) headers.append(incoming.rawHeaders[i], incoming.rawHeaders[i + 1]);
             const status = incoming.statusCode ?? 502;
             if (status < 200 || status > 599) { incoming.destroy(); reject(new TransportError('network_error')); return; }

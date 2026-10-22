@@ -88,9 +88,10 @@ function remember<V>(map: Map<string, V>, key: string, value: V, max: number, ex
 export function createMetadataResolver(transport: HttpTransport, options: { now?: () => number; maxEntries?: number; maxConcurrentFetches?: number; maxFetchesPerMinute?: number } = {}): MetadataResolver {
   const now = options.now ?? Date.now; const maxEntries = options.maxEntries ?? 1000;
   const maxConcurrent = options.maxConcurrentFetches ?? 16; const maxPerMinute = options.maxFetchesPerMinute ?? 120;
+  let epoch = 0;
   const starts: number[] = [];
-  const cache = new Map<string, { value: unknown; url: string; expires: number; etag?: string; modified?: string }>();
-  const pending = new Map<string, Promise<{ value: unknown; url: string; expires: number; etag?: string; modified?: string }>>();
+  const cache = new Map<string, { value: unknown; url: string; expires: number; etag?: string; modified?: string; control?: string }>();
+  const pending = new Map<string, Promise<{ value: unknown; url: string; expires: number; etag?: string; modified?: string; control?: string }>>();
   const refreshes = new Map<string, number>();
   const authDocuments = new Map<string, Map<string, { auth: string; expires: number }>>();
   async function get(target: string, validate: (value: unknown, servedUrl: string) => unknown, mode: 'endpoint' | 'discovery', refresh = false) {
@@ -101,29 +102,32 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
       while (starts.length && now() - starts[0] >= 60000) starts.shift();
       if (pending.size >= maxConcurrent || starts.length >= maxPerMinute) throw new ValidationError('metadata.rate_limited');
       starts.push(now()); if (refresh) remember(refreshes, target, now(), maxEntries, at => now() - at >= 60000);
+      const startedEpoch = epoch;
       task = (async () => {
         const headers = new Headers(); if (cached?.etag) headers.set('if-none-match', cached.etag); else if (cached?.modified) headers.set('if-modified-since', cached.modified);
         const response = await transport.fetch(new Request(target, { headers }), { mode });
         if (response.status !== 200 && !(response.status === 304 && cached)) throw new ValidationError('metadata.status');
         let value: unknown; try { value = response.status === 304 ? cached!.value : parseJson(await response.text()); } catch { throw new ValidationError('metadata.json'); }
         const servedUrl = response.status === 304 ? cached!.url : response.url || target; validate(value, servedUrl);
-        const control = response.headers.get('cache-control') ?? ''; const age = Number(response.headers.get('age') ?? 0);
+        const control = response.headers.get('cache-control') ?? (response.status === 304 ? cached?.control : undefined) ?? ''; const age = Number(response.headers.get('age') ?? 0);
         const seconds = Number(/(?:^|,)\s*max-age=(\d+)/i.exec(control)?.[1] ?? 60); // no max-age: 60 s floor (guide: at least a minute)
         const expires = now() + (/\b(?:no-store|no-cache)\b/i.test(control) ? 0 : Math.max(0, Math.min(300, seconds - (Number.isFinite(age) ? age : 0)))) * 1000;
-        const result = { value, url: response.status === 304 ? cached!.url : servedUrl, expires, etag: response.headers.get('etag') ?? cached?.etag, modified: response.headers.get('last-modified') ?? cached?.modified }; if (!/\bno-store\b/i.test(control)) remember(cache, key, result, maxEntries, entry => entry.expires <= now()); else cache.delete(key);
+        const result = { value, control, url: response.status === 304 ? cached!.url : servedUrl, expires, etag: response.headers.get('etag') ?? cached?.etag, modified: response.headers.get('last-modified') ?? cached?.modified }; if (startedEpoch !== epoch) return result; if (!/\bno-store\b/i.test(control)) remember(cache, key, result, maxEntries, entry => entry.expires <= now()); else cache.delete(key);
         return result;
       })(); pending.set(key, task);
     }
     try { const result = await task; validate(result.value, result.url); return structuredClone(result); } finally { if (pending.get(key) === task) pending.delete(key); }
   }
   return {
-    invalidate(target?: string) { if (target === undefined) { cache.clear(); authDocuments.clear(); } else { for (const key of cache.keys()) if (key.endsWith(`:${target}`)) cache.delete(key); authDocuments.clear(); } },
+    invalidate(target?: string) { epoch++; pending.clear(); if (target === undefined) { cache.clear(); authDocuments.clear(); } else { for (const key of cache.keys()) if (key.endsWith(`:${target}`)) cache.delete(key); authDocuments.clear(); } },
     async resolveCompany(input) {
+      const startedEpoch = epoch;
       if (!/^[a-z0-9.-]+(?::\d{1,5})?$/i.test(input)) throw new ValidationError('domain');
       const target = `https://${input}/.well-known/poppy.json`;
       const found = await get(target, parsePoppyDocument, 'discovery'); const document = parsePoppyDocument(found.value, found.url);
       if (!document.auth) return { document, url: found.url };
       const auth = await get(authorizationMetadataUrl(document.auth.issuer), value => parseAuthorizationMetadata(value, document), 'discovery');
+      if(startedEpoch!==epoch) return {document,authorization:parseAuthorizationMetadata(auth.value,document),url:found.url};
       const entries = authDocuments.get(document.auth.issuer) ?? new Map();
       const spelling = canonical(document.auth); const currentDomain = document.organization.domain.toLowerCase();
       for (const [otherDomain, entry] of entries) if (otherDomain !== currentDomain && entry.expires > now() && entry.auth !== spelling) throw new ValidationError('auth.consistency');
