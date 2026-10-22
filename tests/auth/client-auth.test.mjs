@@ -1468,3 +1468,84 @@ test('a narrow Session Token renews from a sufficient grant without another sign
   await auth.renew(id, { scopes: ['poppy:read'] });
   assert.equal((await auth.authorizedFetch(id, conversations(company), target, ['poppy:write'])).status, 200);
 });
+
+for (const method of ['direct', 'device', 'mediated']) test(`${method} cancellation during remote exchange fences late grant into durable cleanup`, async () => {
+  const env = await setup({ method }); env.options.trustedInput = { collect: async () => ({ password: 'private-password' }) };
+  const auth = createClientAuth(env.options), { connection } = await auth.start(env.company.domain);
+  let operationId, run;
+  if (method === 'direct') { const begun = await beginAndApprove(auth, env.company, connection.id); operationId = begun.begun.operationId; run = () => auth.completeSignIn({ callbackUrl: begun.callbackUrl, browserBinding: BROWSER }); }
+  else if (method === 'device') { const begun = await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] }); operationId = begun.outcome.operationId; env.clock.t += 5000; run = () => auth.continueSignIn(operationId); }
+  else run = async () => (await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] })).outcome;
+  const handle = env.company.handle; let deliver, waiting; const ready = new Promise(resolve => { waiting = resolve; });
+  env.company.handle = async (request, options) => {
+    const response = await handle(request, options);
+    if (request.url === (method === 'mediated' ? `${env.company.issuer}/sign-in` : env.company.tokenEndpoint)) {
+      operationId ??= Object.values(env.store.raw.operations).find(record => record.phase === 'dispatched').id;
+      waiting(); await new Promise(resolve => { deliver = resolve; });
+    }
+    return response;
+  };
+  const active = run(); await ready; assert.equal((await auth.cancelSignIn(operationId)).status, 'cancelled');
+  assert.deepEqual(await createClientAuth(env.options).recover(), [], 'cancellation leaves live remote owner recoverable');
+  deliver(); const result = await active; assert.equal(result.status, 'cancelled');
+  assert.equal((await auth.get(connection.id)).status, 'signed_out'); assert.equal(Object.keys(env.store.raw.grants).length, 0);
+  assert.equal(Object.values(env.store.raw.cleanup).length, 1); assert.equal((await auth.retryCleanup(connection.id)).cleanup, 'complete');
+});
+
+test('Device rejects phishing links before exposing codes and persists a server polling deadline', async () => {
+  const env = await setup({ method: 'device' }), { connection } = await env.auth.start(env.company.domain), handle = env.company.handle;
+  env.company.handle = async (request, options) => {
+    const result = await handle(request, options);
+    if (request.url !== `${env.company.issuer}/device`) return result;
+    const body = await result.json(); body.verification_uri = 'https://unrelated.test/approve'; return new Response(JSON.stringify(body));
+  };
+  const denied = await env.auth.beginSignIn(connection.id, { method: 'device', scopes: ['poppy:read'] }); assert.equal(denied.device, undefined);
+  env.company.handle = handle;
+  const { outcome } = await env.auth.beginSignIn(connection.id, { method: 'device', scopes: ['poppy:read'] }); env.clock.t += 5000;
+  env.company.handle = async (request, options) => request.url === env.company.tokenEndpoint ? new Response('HTML', { status: 429, headers: { 'retry-after': '7200' } }) : handle(request, options);
+  assert.equal((await env.auth.continueSignIn(outcome.operationId)).retryAfterMs, 7200000);
+  const count = exchanges(env.company); env.clock.t += 1000;
+  assert.equal((await createClientAuth(env.options).continueSignIn(outcome.operationId)).retryAfterMs, 7199000);
+  assert.equal(exchanges(env.company), count);
+});
+
+for (const method of ['device', 'mediated']) test(`${method} cancellation cannot reopen after a late pending/challenge response`, async () => {
+  const env = await setup({ method }); let inputCalls = 0;
+  env.options.trustedInput = { collect: async () => { inputCalls++; return { password: 'private-password' }; } };
+  env.company.signInBehavior.codeRequired = true; env.company.signInBehavior.status = 'authorization_pending';
+  const auth = createClientAuth(env.options), { connection } = await auth.start(env.company.domain);
+  let operationId, run;
+  if (method === 'device') { const begun = await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] }); operationId = begun.outcome.operationId; env.clock.t += 5000; run = () => auth.continueSignIn(operationId); }
+  else run = async () => (await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] })).outcome;
+  const handle = env.company.handle; let deliver, waiting; const ready = new Promise(resolve => { waiting = resolve; });
+  env.company.handle = async (request, options) => {
+    const response = await handle(request, options);
+    if (request.url === (method === 'device' ? env.company.tokenEndpoint : `${env.company.issuer}/sign-in`)) {
+      operationId ??= Object.values(env.store.raw.operations).find(record => record.phase === 'dispatched').id;
+      waiting(); await new Promise(resolve => { deliver = resolve; });
+    }
+    return response;
+  };
+  const active = run(); await ready; await auth.cancelSignIn(operationId); deliver();
+  assert.equal((await active).status, 'cancelled'); const count = env.company.requests.length;
+  assert.equal((await createClientAuth(env.options).continueSignIn(operationId)).status, 'cancelled');
+  assert.equal(env.company.requests.length, count); assert.equal(inputCalls, method === 'mediated' ? 1 : 0);
+  assert.equal(env.store.raw.operations[operationId].phase, 'terminal');
+});
+
+test('canceling Device authorization disposes its late device code and exposes no approval link', async () => {
+  const env = await setup({ method: 'device' }), { connection } = await env.auth.start(env.company.domain), handle = env.company.handle;
+  let operationId, deliver, waiting; const ready = new Promise(resolve => { waiting = resolve; });
+  env.company.handle = async (request, options) => {
+    const response = await handle(request, options);
+    if (request.url === `${env.company.issuer}/device`) {
+      operationId = Object.values(env.store.raw.operations).find(record => record.phase === 'dispatched').id;
+      waiting(); await new Promise(resolve => { deliver = resolve; });
+    }
+    return response;
+  };
+  const active = env.auth.beginSignIn(connection.id, { method: 'device', scopes: ['poppy:read'] }); await ready;
+  await env.auth.cancelSignIn(operationId); deliver(); const result = await active;
+  assert.equal(result.outcome.status, 'cancelled'); assert.equal(result.device, undefined);
+  assert.equal([...env.secrets.map.values()].some(value => env.company.devices.has(value)), false);
+});

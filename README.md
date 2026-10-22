@@ -9,24 +9,25 @@ operate a managed agent or credential service. The CLI is optional.
 
 The SDK design supports explicitly selected independent connections, including
 multiple accounts at one company. Account-selection UI is a host policy.
-Discovery can be used without authentication dependencies; Direct Sign-In
-is a separate capability. Interrupted exchanges and remote revocation failures
+Discovery can be used without authentication dependencies. Direct, Device and
+Mediated sign-in share the lifecycle described in [AUTH.md](AUTH.md).
+Interrupted exchanges and remote revocation failures
 have explicit outcomes rather than silently retrying or reconnecting.
 
 Demo applications are deferred and are not dependencies of this SDK.
 
-Status (2026-10-22): unpublished implementation of discovery, Direct Sign-In,
-session/credential lifecycle, and JSON conversations. Known correctness issues
+Status (2026-10-22): unpublished implementation of discovery, all three sign-in
+methods, anonymous sessions, credential lifecycle, and JSON conversations. Known correctness issues
 remain; passing tests do not establish complete protocol conformance.
 
 Targets the current [Personal Agent Protocol draft 0.2 specification](https://personalagentprotocol.org/docs/0.2/spec)
 and [guides](https://personalagentprotocol.org/docs/0.2/guides).
 
 The October 19 source pin is historical evidence, not overriding authority.
-The reviewed implementation programme adds all three sign-in methods, anonymous
-browsing, streaming, feedback, API/browser hooks, targeted durable storage, and an
+The reviewed implementation programme also adds streaming, feedback, API/browser hooks, and an
 optional hosted-identity adapter/reference entry point. These are planned
-capabilities, not features available in this checkout. Operators supply enrollment
+capabilities, not features available in this checkout. Targeted durable storage
+and authentication are available now. Operators supply enrollment
 authentication and hosting; the SDK will not require a PoppyKit cloud service.
 
 J1 now supplies targeted storage contracts, optional SQLite adapters, immutable

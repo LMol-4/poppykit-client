@@ -134,6 +134,7 @@ export interface OperationRecord {
   method?: SignInMethod; requiredExistingScopes?: string[]; signInSessionId?: string;
   device?: { codeRef: string; intervalMs: number; nextPollAt: number };
   mediated?: { challengeId: string; sentTo: string };
+  cancelRequested?: boolean;
 }
 export interface StagedRefresh {
   accessRef: string; refreshRef: string | null; sessionId: string; scopes: string[];
@@ -704,7 +705,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const operation = own(state.operations, operationId);
       if (!operation || operation.epoch !== state.epoch) throw new AuthFailure('state_changed');
       if (unusedGrantRef !== null) retire(state, `cln_${operationId}`, own(state.connections, operation.connectionId)!, unusedGrantRef);
-      return operation.phase === 'dispatched' ? finish(state, operation, status, extra) : outcomeOf(state, operation);
+      return operation.phase === 'dispatched' ? finish(state, operation, operation.cancelRequested && status !== 'uncertain' ? 'cancelled' : status, extra) : outcomeOf(state, operation);
     });
     // Terminal operations never read their verifier again.
     await secrets.remove(verifierRef);
@@ -719,19 +720,19 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const operation = own(state.operations, operationId)!;
       if (operation.phase === 'terminal') return outcomeOf(state, operation);
       drop.push(...privateRefs(operation));
-      return finish(state, operation, status, error ? { error } : {});
+      return finish(state, operation, operation.cancelRequested && status !== 'uncertain' ? 'cancelled' : status, error ? { error } : {});
     });
   }
   function activateSignIn(state: ClientAuthState, operation: OperationRecord, drop: string[]): AuthOutcome {
     const staged = operation.staged!, target = own(state.connections, operation.connectionId)!;
     const granted = staged.scopes, missingScopes = operation.scopes.filter(scope => !granted.includes(scope));
     const previous = target.grantId === null ? undefined : own(state.grants, target.grantId);
-    const problem = target.generation !== operation.connectionGeneration || target.sessionId !== operation.signInSessionId ? 'state_changed'
+    const problem = operation.cancelRequested ? 'cancelled' : target.generation !== operation.connectionGeneration || target.sessionId !== operation.signInSessionId ? 'state_changed'
       : previous && !(operation.requiredExistingScopes ?? previous.scopes).every(scope => granted.includes(scope)) ? 'replacement_rejected' : null;
     drop.push(...privateRefs(operation));
     if (problem) {
       retire(state, `cln_${operation.id}`, target, staged.refreshRef!); drop.push(staged.accessRef);
-      return finish(state, operation, 'failed', { error: problem, grantedScopes: [...granted], missingScopes });
+      return finish(state, operation, problem === 'cancelled' ? 'cancelled' : 'failed', { error: problem, grantedScopes: [...granted], missingScopes });
     }
     if (previous) { retire(state, `cln_${previous.id}`, target, previous.secretRef); delete state.grants[previous.id]; }
     const grantId = randomId('grt_');
@@ -779,6 +780,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     return await transaction({ operationId }, state => {
       const current = own(state.operations, operationId)!;
       if (current.phase !== 'prepared') return outcomeOf(state, current);
+      if (current.cancelRequested) return finish(state, current, 'cancelled');
       if (current.owner && (options.ownerAlive ?? localOwnerAlive)(current.owner)) return outcomeOf(state, current);
       const connection = own(state.connections, current.connectionId)!;
       if (current.expiresAt <= now()) return finish(state, current, 'expired');
@@ -816,10 +818,12 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const codeRef = await secrets.stage(device_code), nextPollAt = now() + interval * 1000;
       const outcome = await commit({ operationId }, [codeRef], (state, drop) => {
         const current = own(state.operations, operationId)!;
+        if (current.cancelRequested) { drop.push(codeRef); return finish(state, current, 'cancelled'); }
         if (current.phase !== 'dispatched' || own(state.connections, current.connectionId)!.generation !== current.connectionGeneration) { drop.push(codeRef); return finish(state, current, 'failed', { error: 'state_changed' }); }
         current.phase = 'prepared'; delete current.owner; current.expiresAt = Math.min(current.expiresAt, now() + expires_in * 1000);
         current.device = { codeRef, intervalMs: interval * 1000, nextPollAt }; return outcomeOf(state, current);
       });
+      if (outcome.status !== 'pending') return { outcome };
       return { outcome, device: { verificationUri: verification_uri, ...(verification_uri_complete === undefined ? {} : { verificationUriComplete: verification_uri_complete }),
         userCode: user_code, organization: { ...metadata.document.organization }, nextPollAt } };
     } catch (error) { return { outcome: await remoteFailure(operationId, error) }; }
@@ -847,6 +851,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
           return await transaction({ operationId }, state => {
             const current = own(state.operations, operationId)!;
             if (current.phase !== 'dispatched') return outcomeOf(state, current);
+            if (current.cancelRequested) return finish(state, current, 'cancelled');
             if (error.code === 'slow_down') current.device!.intervalMs += 5000;
             current.device!.nextPollAt = now() + Math.max(current.device!.intervalMs, Number.isFinite(error.retryAfterMs) ? error.retryAfterMs ?? 0 : 0);
             current.phase = 'prepared'; delete current.owner;
@@ -884,7 +889,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const issuedAt = now(), key = await loadDpopKey(connection.dpopKeyRef);
       const dispatch = await transaction({ operationId }, state => {
         const current = own(state.operations, operationId)!;
-        if (current.phase !== 'prepared' || current.owner?.id !== executionOwner.id) return false;
+        if (current.phase !== 'prepared' || current.owner?.id !== executionOwner.id || current.cancelRequested) return false;
         const live = own(state.connections, current.connectionId)!;
         if (live.generation !== current.connectionGeneration || live.sessionId !== current.signInSessionId || current.expiresAt <= now()) { finish(state, current, 'cancelled'); return false; }
         current.phase = 'dispatched'; return true;
@@ -893,6 +898,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       try {
         // Bounded nonce retry only; credentials remain exclusively within this trusted call.
         for (let attempt = 0; attempt < 2; attempt++) {
+          if (attempt > 0 && own((await load({ operationId })).operations, operationId)?.cancelRequested) return await terminate(operationId, 'cancelled');
           response = await transport.fetch(new Request(endpoint, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `DPoP ${token}`, dpop: await proof(key, 'POST', endpoint, token) },
             body: JSON.stringify(operation.mediated ? { code: values.code } : { scope: operation.scopes.join(' '), credentials: values }) }));
           rememberNonce(endpoint, response);
@@ -919,6 +925,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       return await transaction({ operationId }, state => {
         const current = own(state.operations, operationId)!;
         if (current.phase !== 'dispatched') return outcomeOf(state, current);
+        if (current.cancelRequested) return finish(state, current, 'cancelled');
         current.phase = 'prepared'; delete current.owner; current.expiresAt = Math.min(current.expiresAt, expiresAt);
         current.mediated = { challengeId: json.sign_in_id as string, sentTo }; return outcomeOf(state, current);
       });
@@ -1096,14 +1103,16 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     },
 
     async cancelSignIn(operationId) {
-      const { outcome, verifierRef } = await transaction({ operationId }, state => {
+      return commit({ operationId }, [], (state, drop) => {
         const operation = typeof operationId === 'string' ? own(state.operations, operationId) : undefined;
         if (!operation || operation.kind !== 'sign_in' || operation.epoch !== state.epoch) throw new AuthFailure('unknown_operation');
-        // Once the code is sent, cancelling cannot undo the remote exchange; its outcome stands.
-        return { outcome: operation.phase === 'prepared' ? finish(state, operation, 'cancelled') : outcomeOf(state, operation), verifierRef: privateRefs(operation) };
+        if (operation.phase === 'terminal') return outcomeOf(state, operation);
+        operation.cancelRequested = true; drop.push(...privateRefs(operation));
+        if (operation.phase === 'staged') { retire(state, `cln_${operationId}`, own(state.connections, operation.connectionId)!, operation.staged!.refreshRef!); drop.push(operation.staged!.accessRef); }
+        if (operation.phase !== 'dispatched') return finish(state, operation, 'cancelled');
+        // Keep dispatched work recoverable: cancellation cannot prove whether the issuer acted.
+        return operation.result = { operationId, status: 'cancelled', connection: publicConnection(state, own(state.connections, operation.connectionId)!) };
       });
-      if (outcome.status !== 'pending') for (const ref of verifierRef) await secrets.remove(ref);
-      return outcome;
     },
 
     async operation(operationId) {
