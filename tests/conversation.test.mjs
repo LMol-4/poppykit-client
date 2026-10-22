@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createConversationClient, initialConversationClientState, ConversationError } from '../dist/conversation.js';
+import { TransportError } from '../dist/network/transport.js';
 
 const EP = 'https://api.example.com/poppy/conversations';
 const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } });
@@ -46,7 +47,7 @@ function company() {
         entry = { key, target, state: { conversation_id: conversation, status: 'working', responder: 'agent' }, status: target === null ? 201 : 202 };
         byMessage.set(id, entry);
       }
-      if (hooks.dropResponses > 0) { hooks.dropResponses--; throw new TypeError('connection reset'); }
+      if (hooks.dropResponses > 0) { hooks.dropResponses--; throw new TransportError('network_error'); }
       return json(entry.state, entry.status);
     }
     const events = /^\/([^/]+)\/events$/.exec(path);
@@ -541,4 +542,44 @@ test('start persists only wait and cursor as read, never parentConversationId or
   assert.deepEqual((await store.read()).outbound[0].read, { wait: 0 });
   await client.start({ ...msg, id: 'msg_rd2' }, { wait: 0, parentConversationId: 'cnv_parent' });
   assert.deepEqual((await store.read()).outbound[1].read, { wait: 0 });
+});
+
+test('only transport failures are retried; auth failures propagate unchanged, with their retryAfterMs', async () => {
+  for (const error of [Object.assign(new Error('rate'), { retryAfterMs: 30000 }), new TypeError('disconnected')]) {
+    let calls = 0;
+    const { client } = setup({ authorizedRequest: async () => { calls++; throw error; } });
+    await assert.rejects(client.start({ ...msg, id: 'msg_z' }), thrown => thrown === error);
+    assert.equal(calls, 1);
+  }
+  let calls = 0;
+  const { client } = setup({ authorizedRequest: async () => { calls++; throw new TransportError('timeout'); }, maxAttempts: 3 });
+  await assert.rejects(client.start({ ...msg, id: 'msg_y' }), e => e.code === 'network_error');
+  assert.equal(calls, 3);
+});
+
+test('backoff is capped full jitter with injectable randomness', async () => {
+  const delays = [];
+  const { client } = setup({ authorizedRequest: async () => new Response('', { status: 503 }), sleep: async ms => { delays.push(ms); }, random: () => 0.5, baseDelayMs: 1000, maxDelayMs: 1500, maxAttempts: 4 });
+  await assert.rejects(client.start({ ...msg, id: 'msg_x' }), e => e.status === 503);
+  assert.deepEqual(delays, [500, 1000, 1500]); // 0.5 * 1000 * 2^(n-1), capped at 1500
+});
+
+test('default message IDs carry 128 random bits as base64url and are unique', async () => {
+  const ids = new Set();
+  const { client } = setup({ newId: undefined });
+  for (let i = 0; i < 3; i++) ids.add((await client.start({ sender: 'agent', text: `t${i}` })).messageId);
+  assert.equal(ids.size, 3);
+  for (const id of ids) assert.match(id, /^msg_[A-Za-z0-9_-]{22}$/);
+});
+
+test('a duplicate member name in a response body is an invalid response', async () => {
+  const { client } = setup({ authorizedRequest: async () => new Response('{"conversation_id":"cnv_1","conversation_id":"cnv_2","status":"working","responder":"agent"}', { status: 201 }) });
+  await assert.rejects(client.start({ ...msg, id: 'msg_w' }), e => e.code === 'invalid_response');
+});
+
+test('a renewal that lost its connection (AuthFailure transport_error) is retried like a transport failure', async () => {
+  let calls = 0;
+  const { client, server } = setup({ authorizedRequest: async request => { if (++calls < 3) throw Object.assign(new Error('Auth transport_error'), { code: 'transport_error' }); return server.handle(request); } });
+  assert.equal((await client.start({ ...msg, id: 'msg_v' })).conversation_id, 'cnv_1');
+  assert.equal(calls, 3);
 });

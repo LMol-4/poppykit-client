@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { calculateJwkThumbprint } from 'jose';
-import { parseProtocolError, parseTokenResponse } from '../protocol/wire.js';
+import { parseJson, parseProtocolError, parseTokenResponse, retryAfterMilliseconds } from '../protocol/wire.js';
 import type { JsonObject, TokenResponse } from '../protocol/wire.js';
 import { validateClientId } from '../network/discovery.js';
 import type { CompanyMetadata, MetadataResolver } from '../network/discovery.js';
@@ -35,6 +35,8 @@ export interface ClientAuthOptions {
 export type ConnectionStatus = 'signed_out' | 'signed_in' | 'disconnected' | 'uncertain';
 export interface Connection {
   id: string; domain: string; issuer: string;
+  // The verified company that answered discovery; its domain can differ from `domain` after a redirect (guide "Finding a company").
+  organization: { name: string; domain: string };
   sessionId: string | null; generation: number; status: ConnectionStatus;
   scopes: string[];
 }
@@ -113,7 +115,7 @@ export interface ClientAuthState {
 }
 
 export class AuthFailure extends Error {
-  constructor(readonly code: string, readonly connectionId?: string) { super(`Auth ${code}`); this.name = 'AuthFailure'; }
+  constructor(readonly code: string, readonly connectionId?: string, readonly retryAfterMs?: number) { super(`Auth ${code}`); this.name = 'AuthFailure'; }
 }
 
 const EC = { name: 'ECDSA', namedCurve: 'P-256' } as const;
@@ -173,7 +175,15 @@ async function compact(header: JsonObject, payload: JsonObject, sign: (input: Ui
 interface DpopKey { privateKey: CryptoKey; jwk: PublicEcJwk; thumbprint: string }
 
 export function createClientAuth(options: ClientAuthOptions): ClientAuth {
-  const { namespace, localUserId, clientId, identity, store, secrets, transport } = options;
+  const { namespace, localUserId, clientId, identity, store, transport } = options;
+  // Session Tokens live in memory only (guide "Storing tokens"); after a restart the missing token triggers a renewal.
+  const sessionTokens = new Map<string, string>(); // keyed by refs this closure created, so a host ref can never match
+  const secrets: SecretStore = {
+    stage: secret => options.secrets.stage(secret),
+    read: async ref => sessionTokens.has(ref) ? sessionTokens.get(ref)! : options.secrets.read(ref),
+    remove: async ref => { if (!sessionTokens.delete(ref)) await options.secrets.remove(ref); },
+  };
+  async function stageSessionToken(token: string): Promise<string> { const ref = `mem:${randomId()}`; sessionTokens.set(ref, token); return ref; }
   const now = options.now ?? Date.now;
   if (typeof namespace !== 'string' || !namespace || typeof localUserId !== 'string' || !localUserId) throw new AuthFailure('invalid_options');
   try { validateClientId(clientId); } catch { throw new AuthFailure('invalid_options'); }
@@ -196,7 +206,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   function publicConnection(state: ClientAuthState, connection: ConnectionRecord): Connection {
     const { id, domain, issuer, sessionId, generation, status, grantId } = connection;
     const scopes = grantId === null ? [] : [...own(state.grants, grantId)?.scopes ?? []];
-    return { id, domain, issuer, sessionId, generation, status, scopes };
+    return { id, domain, issuer, organization: { ...connection.metadata.document.organization }, sessionId, generation, status, scopes };
   }
 
   async function loadDpopKey(reference: string): Promise<DpopKey> {
@@ -257,15 +267,15 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       try { response = await transport.fetch(request); text = await response.text(); } catch { throw new AuthFailure('transport_error'); }
       rememberNonce(endpoint, response);
       let json: unknown;
-      try { json = JSON.parse(text); } catch { /* reported below */ }
+      try { json = parseJson(text); } catch { /* reported below */ }
       if (response.status === 200) {
         try { return parseTokenResponse(json); } catch { throw new AuthFailure('invalid_response'); }
       }
-      let error = 'token_error';
-      try { error = parseProtocolError(json).error; } catch { /* non-OAuth body */ }
+      let error = response.status === 429 ? 'rate_limited' : 'token_error';
+      try { if (response.status !== 429) error = parseProtocolError(json).error; } catch { /* non-OAuth body */ }
       if (error === 'use_dpop_nonce' && response.status === 400 && attempt === 0 && response.headers.has('dpop-nonce')) continue;
       // Only a recognised OAuth code on a 4xx is a definite rejection; a 5xx or proxy page may follow a completed exchange.
-      throw new AuthFailure(response.status >= 400 && response.status < 500 && SAFE_ERRORS.has(error) ? error : 'token_error');
+      throw new AuthFailure(response.status >= 400 && response.status < 500 && (SAFE_ERRORS.has(error) || response.status === 429) ? error : 'token_error', undefined, retryAfterMilliseconds(response.headers.get('retry-after'), now())); // spec 4.3: the agent waits
     }
   }
 
@@ -284,6 +294,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   async function identityFor(issuer: string): Promise<{ userId: string; dpopKeyRef: string }> {
     const existing = own((await load()).identities, issuer);
     if (existing) return existing;
+    // shortcut: extractable key, because the SecretStore holds the private JWK as a string and Node cannot persist a non-extractable CryptoKey; move to a KMS/OS-keystore signer when the host platform offers one.
     const pair = await crypto.subtle.generateKey(EC, true, ['sign', 'verify']);
     const { kty, crv, x, y, d } = await crypto.subtle.exportKey('jwk', pair.privateKey);
     const dpopKeyRef = await secrets.stage(JSON.stringify({ kty, crv, x, y, d }));
@@ -346,7 +357,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (!(error instanceof AuthFailure && error.code === 'invalid_session')) throw error;
       token = await signedOutToken(connection.metadata, connection.userId, connection.dpopKeyRef, null, resource);
     }
-    const secretRef = await secrets.stage(token.access_token);
+    const secretRef = await stageSessionToken(token.access_token);
     return commit([secretRef], (state, drop) => {
       const current = own(state.connections, connection.id);
       if (!current || current.generation !== connection.generation || current.status !== 'signed_out' || current.sessionId !== connection.sessionId) throw new AuthFailure('state_changed', connection.id);
@@ -400,6 +411,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         token = await send();
       }
     } catch (error) {
+      if (error instanceof AuthFailure && error.retryAfterMs !== undefined) retryAfter.set(operationId, error.retryAfterMs);
       const code = error instanceof AuthFailure ? error.code : 'local_error'; // non-AuthFailure errors come from local signing before dispatch
       // A lost, unreadable or non-OAuth answer may follow a rotation, so the old Account Token is never resent (IMPLEMENTATION 4).
       if (AMBIGUOUS.has(code)) return endRefresh(operationId, 'uncertain', 'lost_response');
@@ -411,7 +423,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     else if (token.signed_in !== true || (newSession ? token.session_id === sessionId : token.session_id !== sessionId) || granted.some(scope => !claim.requested.includes(scope))) problem = 'invalid_response';
     let refreshRef: string | null = null, accessRef: string | null = null;
     try { if (token.refresh_token !== undefined) refreshRef = await secrets.stage(token.refresh_token); } catch { return endRefresh(operationId, 'uncertain', 'storage_error'); }
-    if (!problem) try { accessRef = await secrets.stage(token.access_token); } catch { problem = 'storage_error'; }
+    if (!problem) try { accessRef = await stageSessionToken(token.access_token); } catch { problem = 'storage_error'; }
     if (problem || accessRef === null) return endRefresh(operationId, 'failed', problem ?? 'storage_error', refreshRef);
     const staged: StagedRefresh = {
       accessRef, refreshRef, sessionId: token.session_id, scopes: granted, signedIn: true, expiresAt: issuedAt + token.expires_in * 1000,
@@ -493,13 +505,26 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
 
   // In-process single flight: parallel requests on one stale slot share one renewal; the grant claim covers other processes.
   const renewing = new Map<string, Promise<CredentialRecord>>();
+  // Retry-After from the issuer (spec 4.3: the agent MUST wait). In memory: a restart forgets it, which costs at most one early request.
+  const retryAfter = new Map<string, number>(); // operation id -> ms, handed from refresh() to renewShared()
+  const notBefore = new Map<string, number>(); // connection id -> earliest next token request
   function renewShared(connectionId: string, resource: string | null): Promise<CredentialRecord> {
     const key = JSON.stringify([connectionId, resource]);
     let pending = renewing.get(key);
     if (!pending) {
       pending = (async () => {
-        const outcome = await renewal(await record(connectionId), resource, null);
-        if (outcome.status !== 'completed') throw new AuthFailure(outcome.status === 'pending' ? 'renewal_pending' : outcome.error ?? 'renewal_failed', connectionId);
+        const wait = (notBefore.get(connectionId) ?? 0) - now();
+        if (wait > 0) throw new AuthFailure('rate_limited', connectionId, wait);
+        let outcome: AuthOutcome;
+        try { outcome = await renewal(await record(connectionId), resource, null); } catch (error) {
+          if (error instanceof AuthFailure && error.retryAfterMs !== undefined) notBefore.set(connectionId, now() + error.retryAfterMs);
+          throw error;
+        }
+        if (outcome.status !== 'completed') {
+          const ms = retryAfter.get(outcome.operationId); retryAfter.delete(outcome.operationId);
+          if (ms !== undefined) notBefore.set(connectionId, now() + ms);
+          throw new AuthFailure(outcome.status === 'pending' ? 'renewal_pending' : outcome.error ?? 'renewal_failed', connectionId, ms);
+        }
         const slot = own((await record(connectionId)).slots, slotKey(outcome.connection.sessionId, resource));
         if (!slot) throw new AuthFailure('state_changed', connectionId);
         return slot;
@@ -592,7 +617,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const { userId, dpopKeyRef } = await identityFor(issuer);
       const createdAt = now();
       const token = await signedOutToken(metadata, userId, dpopKeyRef, null, null);
-      const secretRef = await secrets.stage(token.access_token);
+      const secretRef = await stageSessionToken(token.access_token);
       const id = randomId('con_'), operationId = randomId('op_');
       return commit([secretRef], state => {
         // A reset or competing identity since we signed means this session belongs to no current identity.
@@ -716,7 +741,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       let refreshRef: string | null = null, accessRef = '';
       try {
         if (token.refresh_token !== undefined) refreshRef = await secrets.stage(token.refresh_token);
-        if (!problem) accessRef = await secrets.stage(token.access_token);
+        if (!problem) accessRef = await stageSessionToken(token.access_token);
       } catch {
         return settle(operationId, direct.verifierRef, 'uncertain', { error: 'storage_error' }, refreshRef);
       }

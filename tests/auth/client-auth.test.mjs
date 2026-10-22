@@ -65,7 +65,7 @@ test('start creates a signed-out session with verified assertions and a separate
   const { auth, company, store, secrets, signer } = await setup();
   const outcome = await auth.start(company.domain);
   assert.equal(outcome.status, 'completed');
-  assert.deepEqual(Object.keys(outcome.connection).sort(), ['domain', 'generation', 'id', 'issuer', 'scopes', 'sessionId', 'status']);
+  assert.deepEqual(Object.keys(outcome.connection).sort(), ['domain', 'generation', 'id', 'issuer', 'organization', 'scopes', 'sessionId', 'status']);
   assert.equal(outcome.connection.status, 'signed_out'); assert.equal(outcome.connection.issuer, company.issuer);
   assert.deepEqual(outcome.connection.scopes, []); assert.ok(company.sessions.has(outcome.connection.sessionId));
   const [client, session] = company.assertions;
@@ -84,7 +84,7 @@ test('start creates a signed-out session with verified assertions and a separate
   const persisted = JSON.stringify(store.raw);
   for (const token of company.tokens.keys()) { assert.equal(persisted.includes(token), false); assert.equal(JSON.stringify(outcome).includes(token), false); }
   assert.equal(persisted.includes('"d"'), false);
-  assert.ok([...secrets.map.values()].some(value => company.tokens.has(value)));
+  assert.equal([...secrets.map.values()].some(value => company.tokens.has(value)), false, 'Session Tokens stay in memory');
   assert.equal(store.raw.operations[outcome.operationId].result.status, 'completed');
   assert.deepEqual(store.raw.owner, { namespace: 'demo', clientId: CLIENT_ID, localUserId: 'alice' });
   assert.deepEqual(await auth.get(outcome.connection.id), outcome.connection);
@@ -372,8 +372,8 @@ test('a reset between token issuance and activation does not attach the session'
   company.handle = async (request, options) => { const response = await originalFetch(request, options); if (request.url === company.tokenEndpoint && !reset) { reset = true; await transaction(state => { Object.assign(state, initialClientAuthState(), { owner: state.owner }); }); } return response; };
   await assert.rejects(auth.start(company.domain), code('state_changed'));
   assert.deepEqual(store.raw.connections, {});
-  // The fenced-out session token was never referenced, so it is removed rather than orphaned.
-  assert.equal([...secrets.map.values()].filter(value => company.tokens.has(value)).length, 1);
+  // The fenced-out session token lived in memory only, so nothing was persisted for it.
+  assert.equal([...secrets.map.values()].filter(value => company.tokens.has(value)).length, 0);
 });
 
 test('a renewal answered for a different session is rejected and leaves the slots unchanged', async () => {
@@ -584,8 +584,8 @@ test('denied, cancelled and expired sign-ins are terminal and keep the signed-ou
   assert.equal(exchanges(company), 1);
   assert.deepEqual(store.raw.connections[connection.id].slots, slots);
   assert.equal(store.raw.connections[connection.id].status, 'signed_out');
-  // Every terminal sign-in removed its verifier; only the DPoP key and session token remain.
-  assert.equal(secrets.map.size, 2);
+  // Every terminal sign-in removed its verifier; only the DPoP key remains (Session Tokens are memory-only).
+  assert.equal(secrets.map.size, 1);
 });
 
 test('partial consent keeps the previous grant and parks the new Account Token for revocation', async () => {
@@ -1146,3 +1146,77 @@ async function interruptedRefresh(interrupt) {
 }
 test('a refresh that recovery settled before dispatch is never sent', () => interruptedRefresh('recover'));
 test('a refresh that sign-out cancelled before dispatch is never sent', () => interruptedRefresh('signOut'));
+
+test('connection exposes the verified organization, including a domain that differs from the lookup', async () => {
+  const { auth, company } = await setup();
+  const { connection } = await auth.start(company.domain);
+  assert.deepEqual(connection.organization, { name: 'shop', domain: company.domain });
+  assert.deepEqual((await auth.get(connection.id)).organization, connection.organization);
+});
+
+test('after a restart the memory-only Session Token is renewed, not read from the SecretStore', async () => {
+  const { auth, options, company, store, secrets } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const restarted = createClientAuth(options);
+  const response = await restarted.authorizedFetch(connection.id, conversations(company), await restarted.target(connection.id));
+  assert.equal(response.status, 200);
+  assert.equal([...secrets.map.values()].some(value => company.tokens.has(value)), false);
+  assert.equal(JSON.stringify(store.raw).includes([...company.tokens.keys()][0]), false);
+});
+
+test('a rate-limited signed-out renewal surfaces retryAfterMs, is not retried and blocks the next request; auth errors are not masked', async () => {
+  const { auth, company, clock } = await setup();
+  const { connection } = await auth.start(company.domain);
+  const target = await auth.target(connection.id);
+  clock.t += 3_600_000;
+  const handle = company.handle; let tokenRequests = 0;
+  company.handle = async (request, init) => {
+    if (request.url !== company.tokenEndpoint) return handle(request, init);
+    tokenRequests++; return new Response('{"error":"rate_limited"}', { status: 429, headers: { 'retry-after': '30' } });
+  };
+  await assert.rejects(auth.authorizedFetch(connection.id, conversations(company), target), error => error instanceof AuthFailure && error.retryAfterMs === 30000);
+  assert.equal(tokenRequests, 1);
+  clock.t += 30_000; // the wait is over
+  company.handle = async (request, init) => request.url === company.tokenEndpoint ? new Response('{"error":"invalid_client"}', { status: 401 }) : handle(request, init);
+  await assert.rejects(auth.authorizedFetch(connection.id, conversations(company), target), error => error instanceof AuthFailure && error.retryAfterMs === undefined);
+});
+
+test('duplicate member names in a token response are rejected', async () => {
+  const { auth, company } = await setup();
+  const handle = company.handle;
+  company.handle = async (request, init) => {
+    const response = await handle(request, init);
+    if (request.url !== company.tokenEndpoint) return response;
+    return new Response((await response.text()).replace(/^\{/, '{"scope":"","scope":"x",'), { status: 200, headers: response.headers });
+  };
+  await assert.rejects(auth.start(company.domain), code('invalid_response'));
+});
+
+test('a rate-limited signed-in refresh surfaces retryAfterMs and no token request is sent before it elapses', async () => {
+  const { auth, company, clock, id, target } = await signedIn();
+  clock.t += 25 * 3600_000;
+  const handle = company.handle; let tokenRequests = 0;
+  company.handle = async (request, init) => {
+    if (request.url !== company.tokenEndpoint) return handle(request, init);
+    tokenRequests++; return new Response('{"error":"rate_limited"}', { status: 429, headers: { 'retry-after': '30' } });
+  };
+  await assert.rejects(auth.authorizedFetch(id, conversations(company), target), error => error instanceof AuthFailure && error.retryAfterMs === 30000);
+  assert.equal(tokenRequests, 1);
+  clock.t += 10_000;
+  await assert.rejects(auth.authorizedFetch(id, conversations(company), target), error => error.code === 'rate_limited' && error.retryAfterMs === 20000);
+  assert.equal(tokenRequests, 1, 'no token request during the wait');
+  assert.equal((await auth.get(id)).status, 'signed_in', 'a 429 is a definite rejection and leaves the grant usable');
+  company.handle = handle; clock.t += 20_000;
+  assert.equal((await auth.authorizedFetch(id, conversations(company), target)).status, 200);
+});
+
+test('a host SecretStore ref that looks like a memory ref still reaches the host store', async () => {
+  const secrets = memorySecrets(); const stage = secrets.stage;
+  secrets.stage = async secret => { const ref = `mem:${await stage(secret)}`; secrets.map.set(ref, secrets.map.get(ref.slice(4))); return ref; };
+  const { auth, company, store } = await setup({ secrets });
+  const { connection } = await auth.start(company.domain);
+  const key = store.raw.identities[company.issuer].dpopKeyRef;
+  assert.ok(key.startsWith('mem:'));
+  const response = await auth.authorizedFetch(connection.id, conversations(company), await auth.target(connection.id));
+  assert.equal(response.status, 200);
+});
