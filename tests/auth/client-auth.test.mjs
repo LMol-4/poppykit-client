@@ -1283,9 +1283,14 @@ for (const method of ['device', 'mediated']) {
     let result = begun.outcome;
     if (method === 'device') { clock.t += 5000; result = await createClientAuth(env.options).continueSignIn(result.operationId); }
     assert.deepEqual([result.status, result.grantedScopes, result.missingScopes], ['completed', ['poppy:read'], ['poppy:write']]);
-    const oldGrant = store.raw.connections[connection.id].grantId;
+    let oldGrant = store.raw.connections[connection.id].grantId;
     assert.equal((await auth.authorization(connection.id, ['poppy:read'])).sufficient, true);
     assert.equal((await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] })).outcome.status, 'completed');
+    begun = await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read', 'poppy:write'] }); result = begun.outcome;
+    if (method === 'device') { clock.t += 5000; result = await auth.continueSignIn(result.operationId); }
+    assert.equal(result.status, 'completed'); assert.deepEqual(result.missingScopes, ['poppy:write']);
+    assert.notEqual(store.raw.connections[connection.id].grantId, oldGrant, 'partial replacement preserving all old access activates');
+    oldGrant = store.raw.connections[connection.id].grantId;
     company.signInBehavior.scopes = ['poppy:write'];
     begun = await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read', 'poppy:write'] }); result = begun.outcome;
     if (method === 'device') { clock.t += 5000; result = await auth.continueSignIn(result.operationId); }
@@ -1548,4 +1553,36 @@ test('canceling Device authorization disposes its late device code and exposes n
   await env.auth.cancelSignIn(operationId); deliver(); const result = await active;
   assert.equal(result.outcome.status, 'cancelled'); assert.equal(result.device, undefined);
   assert.equal([...env.secrets.map.values()].some(value => env.company.devices.has(value)), false);
+});
+
+test('Mediated one-time code approval resumes after restart without resending credentials', async () => {
+  const env = await setup({ method: 'mediated' }), prompts = [];
+  env.company.signInBehavior.codeRequired = true;
+  env.options.trustedInput = { collect: async request => { prompts.push(request); return request.challenge ? { code: '123456' } : { password: 'private-password' }; } };
+  const auth = createClientAuth(env.options), { connection } = await auth.start(env.company.domain);
+  const { outcome } = await auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['poppy:read'] });
+  assert.equal(outcome.status, 'pending');
+  assert.equal((await createClientAuth(env.options).continueSignIn(outcome.operationId)).status, 'completed');
+  assert.deepEqual(prompts.map(prompt => prompt.fields.map(field => field.name)), [['password'], ['code']]);
+});
+
+test('different full issuers sharing a host keep identities, keys and credentials isolated', async () => {
+  const env = await setup(), first = env.company, second = createFakeCompany({ name: 'shop', issuerPath: '/other', jwks: { keys: [env.signer.jwk] }, clientId: CLIENT_ID, now: env.options.now, redirectUris: [REDIRECT] });
+  let current = first;
+  env.options.metadata.resolveCompany = async () => ({
+    document: await (await current.handle(new Request(`https://${current.domain}/.well-known/poppy.json`))).json(),
+    authorization: await (await current.handle(new Request(`https://auth.shop.test/.well-known/oauth-authorization-server${new URL(current.issuer).pathname}`))).json(),
+    url: `https://shop.test/.well-known/poppy.json`,
+  });
+  env.transport.fetch = (request, options) => current.handle(request, options);
+  const auth = createClientAuth(env.options), a = await auth.start(first.domain); current = second;
+  const b = await auth.start(second.domain);
+  const one = env.store.raw.identities[first.issuer], two = env.store.raw.identities[second.issuer];
+  assert.notEqual(one.userId, two.userId); assert.notEqual(one.dpopKeyRef, two.dpopKeyRef);
+  assert.notEqual(a.connection.issuer, b.connection.issuer);
+  const count = second.requests.length;
+  await assert.rejects(auth.renew(a.connection.id), code('metadata_changed'));
+  assert.equal(second.requests.filter(request => request.url === second.tokenEndpoint).length, 1, 'first issuer credential never sent to second');
+  assert.ok(second.requests.length >= count, 'metadata refresh is allowed');
+  current = first; assert.equal((await auth.renew(a.connection.id)).status, 'completed');
 });
