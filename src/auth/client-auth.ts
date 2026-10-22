@@ -8,7 +8,9 @@ import type { JsonObject, TokenResponse } from '../protocol/wire.js';
 import { validateClientId } from '../network/discovery.js';
 import type { CompanyMetadata, MetadataResolver } from '../network/discovery.js';
 import type { HttpTransport } from '../network/transport.js';
-import { dpopChallenge } from './challenge.js';
+import { dpopChallenge, schemeChallenge } from './challenge.js';
+import { resolveApiTarget, mcpScheme, browserDestination, validateFeedback } from '../integrations.js';
+import type { ApiTarget, AgentBrowserController, FeedbackReport } from '../integrations.js';
 
 export type { AuthStore, AuthSelection };
 export interface SecretStore {
@@ -97,10 +99,14 @@ export interface ClientAuth {
   retryCleanup(connectionId: string): Promise<SignOutOutcome>;
   recover(): Promise<AuthOutcome[]>;
   authorizedFetch(connectionId: string, request: Request, target: ConversationTarget, requiredScopes?: readonly string[]): Promise<Response>;
+  apiTarget(connectionId: string, apiUrl: string, destination?: string): Promise<ApiTarget>;
+  apiFetch(connectionId: string, request: Request, target: ApiTarget, requiredScopes?: readonly string[]): Promise<Response>;
+  joinBrowser(connectionId: string, returnTo: string, controller: AgentBrowserController): Promise<void>;
+  feedback(connectionId: string, report: FeedbackReport): Promise<void>;
 }
 
 export interface CredentialRecord {
-  secretRef: string; tokenType: 'DPoP'; dpopKeyRef: string;
+  secretRef: string; tokenType: 'DPoP' | 'Bearer'; dpopKeyRef: string;
   scopes: string[]; expiresAt: number; generation: number;
 }
 export interface ConnectionRecord {
@@ -137,6 +143,7 @@ export interface OperationRecord {
   cancelRequested?: boolean;
 }
 export interface StagedRefresh {
+  tokenType?: 'DPoP' | 'Bearer';
   accessRef: string; refreshRef: string | null; sessionId: string; scopes: string[];
   signedIn: boolean; expiresAt: number; refreshExpiresAt: number | null;
 }
@@ -223,6 +230,7 @@ async function compact(header: JsonObject, payload: JsonObject, sign: (input: Ui
 }
 
 interface DpopKey { privateKey: CryptoKey; jwk: PublicEcJwk; thumbprint: string }
+interface AcquiredToken { token: TokenResponse; scheme: 'DPoP' | 'Bearer' }
 
 export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   const { namespace, localUserId, clientId, identity, store, transport } = options;
@@ -257,7 +265,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   function destinations(metadata: CompanyMetadata): string {
     const auth = metadata.authorization;
     return JSON.stringify([auth?.issuer, auth?.token_endpoint, auth?.revocation_endpoint, auth?.authorization_endpoint, auth?.device_authorization_endpoint,
-      metadata.document.auth?.mediated?.endpoint, metadata.document.agent?.protocols]);
+      metadata.document.auth?.mediated?.endpoint, metadata.document.agent?.protocols, metadata.document.apis, metadata.document.web, metadata.document.feedback]);
   }
   async function verified(metadata: CompanyMetadata): Promise<CompanyMetadata> {
     let fresh: CompanyMetadata;
@@ -338,10 +346,11 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   }
   // Token endpoint request with client assertion and fresh DPoP proof (spec 4.1-4.3); sessionSub adds a session assertion.
   // Throws transport_error only when the request may have reached the issuer without a readable answer.
-  async function tokenRequest(metadata: CompanyMetadata, dpopKeyRef: string, fields: Record<string, string>, sessionSub: string | null, localIdentity = false): Promise<TokenResponse> {
+  async function tokenRequest(metadata: CompanyMetadata, dpopKeyRef: string, fields: Record<string, string>, sessionSub: string | null, localIdentity = false): Promise<AcquiredToken> {
     const authorization = (await verified(metadata)).authorization!;
     const endpoint = authorization.token_endpoint;
     const key = await loadDpopKey(dpopKeyRef);
+    const scheme = await resourceScheme(metadata, fields.resource ?? null);
     for (let attempt = 0; ; attempt++) {
       const body = new URLSearchParams(fields);
       if (sessionSub !== null) body.set('assertion', localIdentity ? await signIdentity({ typ: 'JWT' }, assertionClaims(sessionSub, authorization.issuer), key.thumbprint) : await assertion('session', authorization.issuer, key, sessionSub));
@@ -356,7 +365,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       let json: unknown;
       try { json = parseJson(text); } catch { /* reported below */ }
       if (response.status === 200) {
-        try { return parseTokenResponse(json); } catch { throw new AuthFailure('invalid_response'); }
+        try { return { token: parseTokenResponse(json), scheme }; } catch { throw new AuthFailure('invalid_response'); }
       }
       let error = response.status === 429 ? 'rate_limited' : 'token_error';
       try { if (response.status !== 429) error = parseProtocolError(json).error; } catch { /* non-OAuth body */ }
@@ -366,14 +375,25 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     }
   }
 
+  async function resourceScheme(metadata: CompanyMetadata, resource: string | null): Promise<'DPoP' | 'Bearer'> {
+    const mcp = metadata.document.apis?.find(api => api.type === 'mcp' && api.url === resource);
+    if (!mcp) return 'DPoP';
+    if (mcp.resource !== undefined && mcp.resource !== mcp.url) throw new AuthFailure('invalid_target');
+    try {
+      const scheme = await mcpScheme(transport, metadata.authorization!.issuer, mcp.url);
+      // Bearer MCP tokens cannot authorize a conversation, even when discovery reuses their resource identifier.
+      if (scheme === 'Bearer' && metadata.document.agent?.protocols.some(protocol => protocol.resource === resource)) throw 0;
+      return scheme;
+    } catch { throw new AuthFailure('invalid_target'); }
+  }
+
   // Signed-out Session Token via the JWT bearer grant (spec 4.2); renewal passes session_id.
   async function signedOutToken(metadata: CompanyMetadata, userId: string, dpopKeyRef: string, sessionId: string | null, resource: string | null, anonymous = false): Promise<TokenResponse> {
     const fields: Record<string, string> = { grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer' };
     if (sessionId !== null) fields.session_id = sessionId;
     if (resource !== null) fields.resource = resource;
-    const token = await tokenRequest(metadata, dpopKeyRef, fields, userId, anonymous);
-    // Only DPoP is executable; a Bearer token is never used as a fallback.
-    if (token.token_type !== 'DPoP') throw new AuthFailure('unsupported_token_type');
+    const { token, scheme } = await tokenRequest(metadata, dpopKeyRef, fields, userId, anonymous);
+    if (token.token_type !== scheme) throw new AuthFailure('unsupported_token_type');
     if (token.signed_in !== false || token.scope !== '' || (sessionId !== null && token.session_id !== sessionId)) throw new AuthFailure('invalid_response');
     return token;
   }
@@ -455,7 +475,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const current = own(state.connections, connection.id);
       if (!current || current.generation !== connection.generation || current.status !== 'signed_out' || current.sessionId !== connection.sessionId) throw new AuthFailure('state_changed', connection.id);
       switchSession(current, token.session_id, drop);
-      replaceSlot(current, resource, { secretRef, tokenType: 'DPoP', dpopKeyRef: current.dpopKeyRef, scopes: [], expiresAt: issuedAt + token.expires_in * 1000, generation: current.generation }, drop);
+      replaceSlot(current, resource, { secretRef, tokenType: token.token_type, dpopKeyRef: current.dpopKeyRef, scopes: [], expiresAt: issuedAt + token.expires_in * 1000, generation: current.generation }, drop);
       return finish(state, renewOperation(state, operationId, current, null, issuedAt, resource, []), 'completed');
     });
   }
@@ -497,14 +517,14 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     if (!dispatched) return await endRefresh(operationId, 'failed', 'state_changed');
     const issuedAt = now();
     const send = () => tokenRequest(claim.connection.metadata, claim.connection.dpopKeyRef, fields, null);
-    let token: TokenResponse, newSession = false;
+    let acquired: AcquiredToken, newSession = false;
     try {
-      try { token = await send(); } catch (error) {
+      try { acquired = await send(); } catch (error) {
         // A definite invalid_session (a 4xx OAuth code) left the Account Token unused, so this is a new request, not a resend:
         // without session_id the Company starts a new Session signed in to the same account (spec 4.8).
         if (!(error instanceof AuthFailure && error.code === 'invalid_session')) throw error;
         delete fields.session_id; newSession = true;
-        token = await send();
+        acquired = await send();
       }
     } catch (error) {
       if (error instanceof AuthFailure && error.retryAfterMs !== undefined) await holdOff(connection.id, error);
@@ -513,16 +533,17 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (AMBIGUOUS.has(code)) return await endRefresh(operationId, 'uncertain', 'lost_response');
       return await endRefresh(operationId, 'failed', code);
     }
+    const { token, scheme } = acquired;
     const granted = token.scope.split(' ').filter(Boolean);
     let problem: string | null = null;
-    if (token.token_type !== 'DPoP') problem = 'unsupported_token_type';
+    if (token.token_type !== scheme) problem = 'unsupported_token_type';
     else if (token.signed_in !== true || (newSession ? token.session_id === sessionId : token.session_id !== sessionId) || granted.some(scope => !claim.requested.includes(scope))) problem = 'invalid_response';
     let refreshRef: string | null = null, accessRef: string | null = null;
     try { if (token.refresh_token !== undefined) refreshRef = await secrets.stage(token.refresh_token); } catch { return await endRefresh(operationId, 'uncertain', 'storage_error'); }
     if (!problem) try { accessRef = await stageSessionToken(token.access_token); } catch { problem = 'storage_error'; }
     if (problem || accessRef === null) return await endRefresh(operationId, 'failed', problem ?? 'storage_error', refreshRef);
     const staged: StagedRefresh = {
-      accessRef, refreshRef, sessionId: token.session_id, scopes: granted, signedIn: true, expiresAt: issuedAt + token.expires_in * 1000,
+      accessRef, refreshRef, tokenType: token.token_type, sessionId: token.session_id, scopes: granted, signedIn: true, expiresAt: issuedAt + token.expires_in * 1000,
       refreshExpiresAt: token.refresh_token_expires_in === undefined ? null : issuedAt + token.refresh_token_expires_in * 1000,
     };
     // Its own commit, so a crash before activation leaves the new Account Token referenced for recover (interface 4).
@@ -588,7 +609,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     }
     switchSession(connection, staged.sessionId, drop);
     // Only this resource's credential changes; other resources' credentials survive (IMPLEMENTATION 3).
-    replaceSlot(connection, operation.resource, { secretRef: staged.accessRef, tokenType: 'DPoP', dpopKeyRef: connection.dpopKeyRef, scopes: staged.scopes, expiresAt: staged.expiresAt, generation: connection.generation }, drop);
+    replaceSlot(connection, operation.resource, { secretRef: staged.accessRef, tokenType: staged.tokenType ?? 'DPoP', dpopKeyRef: connection.dpopKeyRef, scopes: staged.scopes, expiresAt: staged.expiresAt, generation: connection.generation }, drop);
     return finish(state, operation, 'completed');
   }
   // Decimal absolute milliseconds preserve even Retry-After values beyond safe JS integers.
@@ -853,7 +874,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const issuedAt = now(), fields: Record<string, string> = { grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: code, session_id: operation.signInSessionId! };
       if (operation.resource) fields.resource = operation.resource;
       let token: TokenResponse;
-      try { token = await tokenRequest(connection.metadata, connection.dpopKeyRef, fields, null); }
+      try { token = (await tokenRequest(connection.metadata, connection.dpopKeyRef, fields, null)).token; }
       catch (error) {
         if (error instanceof AuthFailure && ['authorization_pending', 'slow_down', 'rate_limited'].includes(error.code)) {
           await holdOff(connection.id, error);
@@ -942,6 +963,43 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     finally { if (sensitive) for (const name of Object.keys(sensitive)) delete sensitive[name]; releaseOwner(executionOwner); }
   }
 
+  async function sendAuthorized(connectionId: string, request: Request, target: ConversationTarget, requiredScopes: readonly string[], scheme: 'DPoP' | 'Bearer' = 'DPoP', retryRejected = true): Promise<Response> {
+    const connection = await record(connectionId);
+    const url = new URL(request.url), endpoint = new URL(target.endpoint), base = endpoint.pathname.replace(/\/$/, '');
+    if (!safeHttps(request.url) || url.origin !== endpoint.origin || (url.pathname !== endpoint.pathname && !url.pathname.startsWith(`${base}/`))) throw new AuthFailure('invalid_target', connectionId);
+    if (connection.status === 'disconnected') throw new AuthFailure('disconnected', connectionId);
+    checkCooldown(connection);
+    const resource = target.resource ?? null, wait = url.searchParams.get('wait');
+    const waitMs = wait !== null && /^\d+$/.test(wait) ? Math.min(Number(wait), MAX_WAIT_SECONDS) * 1000 : 0;
+    let credential = await credentialFor(connectionId, resource, null), nonceRetried = false, renewed = false;
+    for (;;) {
+      if (credential.tokenType !== scheme) throw new AuthFailure('invalid_target', connectionId);
+      if (!requiredScopes.every(scope => credential.scopes.includes(scope))) {
+        const requirement = await api.authorization(connectionId, requiredScopes);
+        if (!renewed && requirement.sufficient) { renewed = true; credential = await renewShared(connectionId, resource); continue; }
+        throw new AuthFailure('insufficient_scope', connectionId);
+      }
+      const token = await secrets.read(credential.secretRef);
+      if (token === null) {
+        if (renewed) throw new AuthFailure('missing_credential', connectionId);
+        renewed = true; credential = await credentialFor(connectionId, resource, credential.secretRef); continue;
+      }
+      const headers = new Headers(request.headers);
+      headers.delete('cookie'); headers.delete('dpop'); headers.set('authorization', `${scheme} ${token}`);
+      if (scheme === 'DPoP') headers.set('dpop', await proof(await loadDpopKey(credential.dpopKeyRef), request.method, request.url, token));
+      const authorized = new Request(request.clone(), { headers, credentials: 'omit', redirect: 'error' });
+      const streaming = request.headers.get('accept')?.split(',').some(value => value.trim().split(';')[0] === 'text/event-stream');
+      const response = await (streaming && transport.stream ? transport.stream(authorized) : transport.fetch(authorized, { waitMs }));
+      rememberNonce(request.url, response);
+      if (response.status === 429 || response.status === 503) await holdOff(connectionId, responseFailure(response, 'rate_limited'));
+      if (response.status !== 401 || !retryRejected) return response;
+      const error = schemeChallenge(response.headers.get('www-authenticate'), scheme)?.error;
+      if (error === 'use_dpop_nonce' && !nonceRetried && response.headers.has('dpop-nonce')) { await response.body?.cancel().catch(() => {}); nonceRetried = true; continue; }
+      if (error === 'invalid_token' && !renewed) { await response.body?.cancel().catch(() => {}); renewed = true; credential = await credentialFor(connectionId, resource, credential.secretRef); continue; }
+      return response;
+    }
+  }
+
   const api: ClientAuth = {
     async start(domain, input) {
       let metadata: CompanyMetadata;
@@ -1021,6 +1079,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (method === 'direct' && (typeof browserBinding !== 'string' || browserBinding.length < 22)) throw new AuthFailure('invalid_binding', connectionId);
       // Ask for the conversation resource up front so the signed-in token is usable there (spec 4.3 "Narrower tokens").
       const resource = found.metadata.document.agent?.protocols.find(protocol => protocol.type === 'poppy')?.resource ?? null;
+      if (await resourceScheme(found.metadata, resource) !== 'DPoP') throw new AuthFailure('invalid_target', connectionId);
       // The code exchange names this Session (spec 4.5). A stale credential means it may have ended, so renew first,
       // which replaces an ended Session; a failed renewal leaves the Session as it was for the issuer to judge.
       const renew = () => credentialFor(connectionId, resource, null).catch(error => { if (!(error instanceof AuthFailure)) throw error; });
@@ -1094,7 +1153,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (operation.resource !== null) fields.resource = operation.resource;
       const issuedAt = now();
       let token: TokenResponse;
-      try { token = await tokenRequest(connection.metadata, connection.dpopKeyRef, fields, null); } catch (error) {
+      try { token = (await tokenRequest(connection.metadata, connection.dpopKeyRef, fields, null)).token; } catch (error) {
         if (error instanceof AuthFailure) await holdOff(connection.id, error);
         // A definite rejection is a failure; a lost or non-OAuth answer may have consumed the code, so it is never resent.
         const definite = error instanceof AuthFailure && !AMBIGUOUS.has(error.code);
@@ -1194,49 +1253,47 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     },
     retryCleanup: cleanupNow,
 
+    async apiTarget(connectionId, apiUrl, destination) {
+      const connection = await currentConnection(connectionId);
+      try { return await resolveApiTarget(connection.metadata, options.metadata, transport, apiUrl, destination); } catch { throw new AuthFailure('invalid_target', connectionId); }
+    },
+    async apiFetch(connectionId, request, target, requiredScopes = []) {
+      const expected = await api.apiTarget(connectionId, target.apiUrl, target.endpoint);
+      if (expected.kind !== target.kind || expected.issuer !== target.issuer || expected.endpoint !== target.endpoint || expected.resource !== target.resource || expected.scheme !== target.scheme) throw new AuthFailure('invalid_target', connectionId);
+      if (expected.kind === 'mcp' && request.url !== expected.endpoint) throw new AuthFailure('invalid_target', connectionId);
+      return sendAuthorized(connectionId, request, expected, requiredScopes, expected.scheme);
+    },
+    async joinBrowser(connectionId, returnTo, controller) {
+      const connection = await currentConnection(connectionId), endpoint = connection.metadata.document.web?.browser_session_endpoint;
+      if (!endpoint || !connection.sessionId || connection.status === 'disconnected' || connection.status === 'uncertain' || controller?.kind !== 'agent-controlled' || typeof controller.postForm !== 'function') throw new AuthFailure('invalid_browser', connectionId);
+      try { browserDestination(returnTo, connection.metadata.document.organization.domain); } catch { throw new AuthFailure('invalid_target', connectionId); }
+      const key = await loadDpopKey(connection.dpopKeyRef);
+      let value: string;
+      if (options.assertions && !connection.anonymous) {
+        try {
+          const result = await options.assertions.assert({ purpose: 'browser', operationId: randomId('op_'), issuer: connection.issuer, sessionId: connection.sessionId, returnTo });
+          if (!result.assertion || result.expiresAt * 1000 <= now() || result.expiresAt * 1000 > now() + 60000) throw 0;
+          value = result.assertion;
+        } catch { throw new AuthFailure('provider_unavailable', connectionId); }
+      } else value = await signIdentity({ typ: 'poppy-browser+jwt' }, { ...assertionClaims(connection.userId, endpoint), session_id: connection.sessionId, return_to: returnTo }, key.thumbprint);
+      try {
+        await controller.postForm({ url: endpoint, fields: { assertion: value }, validateRedirect(status, location) {
+          if (status !== 303 || location !== returnTo) throw new AuthFailure('invalid_browser_redirect', connectionId);
+          return returnTo;
+        } });
+      } catch { throw new AuthFailure('browser_failed', connectionId); }
+    },
+    async feedback(connectionId, report) {
+      validateFeedback(report);
+      const connection = await currentConnection(connectionId), endpoint = connection.metadata.document.feedback?.endpoint;
+      if (!endpoint) throw new AuthFailure('feedback_unavailable', connectionId);
+      const response = await sendAuthorized(connectionId, new Request(endpoint, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(report) }), { issuer: connection.issuer, endpoint }, [], 'DPoP', false);
+      if (response.status !== 202 || (await response.text()) !== '') throw new AuthFailure('feedback_failed', connectionId);
+    },
     async authorizedFetch(connectionId, request, target, requiredScopes = []) {
       const connection = await currentConnection(connectionId), expected = targetOf(connection);
       if (target.issuer !== expected.issuer || target.endpoint !== expected.endpoint || target.resource !== expected.resource) throw new AuthFailure('invalid_target', connectionId);
-      // Credentials go only to the endpoint itself or a slash-delimited child on the same origin.
-      const url = new URL(request.url), endpoint = new URL(expected.endpoint);
-      const base = endpoint.pathname.replace(/\/$/, '');
-      if (url.protocol !== 'https:' || url.hash || url.username || url.password || url.origin !== endpoint.origin || (url.pathname !== endpoint.pathname && !url.pathname.startsWith(`${base}/`))) throw new AuthFailure('invalid_target', connectionId);
-      if (connection.status === 'disconnected') throw new AuthFailure('disconnected', connectionId);
-      checkCooldown(connection);
-      const resource = expected.resource ?? null;
-      // A conversation long poll is held up to `wait` seconds (spec 7.3, 7.5); that hold must not count as a network timeout.
-      const wait = url.searchParams.get('wait');
-      const waitMs = wait !== null && /^\d+$/.test(wait) ? Math.min(Number(wait), MAX_WAIT_SECONDS) * 1000 : 0;
-      let credential = await credentialFor(connectionId, resource, null);
-      let nonceRetried = false, renewed = false;
-      for (;;) {
-        if (!requiredScopes.every(scope => credential.scopes.includes(scope))) {
-          const requirement = await api.authorization(connectionId, requiredScopes);
-          if (!renewed && requirement.sufficient) { renewed = true; credential = await renewShared(connectionId, resource); continue; }
-          throw new AuthFailure('insufficient_scope', connectionId);
-        }
-        const token = await secrets.read(credential.secretRef);
-        if (token === null) {
-          // A concurrent renewal replaced and removed this credential; take its successor once.
-          if (renewed) throw new AuthFailure('missing_credential', connectionId);
-          renewed = true; credential = await credentialFor(connectionId, resource, credential.secretRef);
-          continue;
-        }
-        const headers = new Headers(request.headers);
-        headers.set('authorization', `DPoP ${token}`);
-        headers.set('dpop', await proof(await loadDpopKey(credential.dpopKeyRef), request.method, request.url, token));
-        // Clone per attempt so the original body stays available for a bounded retry.
-        const authorized = new Request(request.clone(), { headers });
-        const streaming = request.headers.get('accept')?.split(',').some(value => value.trim().split(';')[0] === 'text/event-stream');
-        const response = await (streaming && transport.stream ? transport.stream(authorized) : transport.fetch(authorized, { waitMs }));
-        rememberNonce(request.url, response);
-        if (response.status === 429 || response.status === 503) await holdOff(connectionId, responseFailure(response, 'rate_limited'));
-        if (response.status !== 401) return response;
-        const error = dpopChallenge(response.headers.get('www-authenticate'))?.error;
-        if (error === 'use_dpop_nonce' && !nonceRetried && response.headers.has('dpop-nonce')) { await response.body?.cancel().catch(() => {}); nonceRetried = true; continue; }
-        if (error === 'invalid_token' && !renewed) { await response.body?.cancel().catch(() => {}); renewed = true; credential = await credentialFor(connectionId, resource, credential.secretRef); continue; }
-        return response;
-      }
+      return sendAuthorized(connectionId, request, expected, requiredScopes);
     },
   };
   return api;

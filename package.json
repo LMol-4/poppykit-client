@@ -28,7 +28,8 @@
     "STORAGE.md",
     "AUTH.md",
     "DELIVERY.md",
-    "PROVIDER.md"
+    "PROVIDER.md",
+    "INTEGRATIONS.md"
   ],
   "exports": {
     ".": {
@@ -56,3 +57,4 @@
     "jose": "6.2.12"
   }
 }
+

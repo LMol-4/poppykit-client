@@ -1,6 +1,6 @@
 // Reads the DPoP challenge from a WWW-Authenticate header (RFC 9110 11.6.1, spec 6); other schemes' params are ignored.
 const TOKEN = /[A-Za-z0-9!#$%&'*+.^_`|~-]+/y;
-export function dpopChallenge(header: string | null): { error?: string; scope?: string; extension?: string; conversation_id?: string } | undefined {
+export function schemeChallenge(header: string | null, scheme: 'DPoP' | 'Bearer'): { error?: string; scope?: string; extension?: string; conversation_id?: string } | undefined {
   if (!header) return undefined;
   let i = 0;
   let current: { scheme: string; params: Record<string, string> } | undefined;
@@ -17,7 +17,7 @@ export function dpopChallenge(header: string | null): { error?: string; scope?: 
     if (header[i] !== '=' || !current) {
       if (header[i] === '=') { i = afterToken; skip(/[=\s]/); continue; } // token68 or stray param before any scheme
       current = { scheme: match[0].toLowerCase(), params: {} };
-      if (current.scheme === 'dpop') found = current.params;
+      if (current.scheme === scheme.toLowerCase()) found = current.params;
       i = afterToken;
       continue;
     }
@@ -33,10 +33,11 @@ export function dpopChallenge(header: string | null): { error?: string; scope?: 
       i += value.length;
     }
     const name = match[0].toLowerCase();
-    if (current.scheme === 'dpop' && ['error', 'scope', 'extension', 'conversation_id'].includes(name)) current.params[name] = value;
+    if (current.scheme === scheme.toLowerCase() && ['error', 'scope', 'extension', 'conversation_id'].includes(name)) current.params[name] = value;
   }
   return found;
 }
+export const dpopChallenge = (header: string | null) => schemeChallenge(header, 'DPoP');
 
 export interface AuthChallenge { error?: string; requiredScopes: string[]; extensions: string[]; conversationId?: string }
 // Combine independent detail channels: a sparse JSON error must not erase header scopes/extensions.
