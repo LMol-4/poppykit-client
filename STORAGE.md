@@ -89,3 +89,11 @@ termination. It covers rollback, durable prepare, live-owner recovery and an ext
 synthetic effect followed by owner death. The latter becomes uncertain, not an
 exactly-once execution claim. Auth unit tests also retain staged-secret, generation,
 revocation-race and vault-failure coverage.
+
+## Conversation delivery lifetime
+
+See [DELIVERY.md](DELIVERY.md) for the retention table. Outbound records and
+checkpoints are retained until explicit local deletion; pending/uncertain retries
+must first be reconciled. Checkpoint acknowledgements use compare-and-set and do
+not acknowledge merely because a page or stream frame was read. Local deletion
+never deletes company history, revokes access or cancels accepted business work.

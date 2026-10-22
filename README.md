@@ -53,3 +53,6 @@ Creating this repository does not reserve a name on npm, PyPI, or crates.io.
 
 These are intended names, not reserved registry packages. Python and Rust implementations are not yet present.
 
+
+See [DELIVERY.md](DELIVERY.md) for bounded HTTPS pools, SSE/JSON conversation
+consumers, cancellation, metadata revalidation and record-specific retention.
