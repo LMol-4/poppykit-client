@@ -43,7 +43,7 @@ export interface Connection {
 export type OperationStatus = 'pending' | 'completed' | 'denied' | 'expired' | 'cancelled' | 'failed' | 'uncertain';
 export interface AuthOutcome {
   operationId: string; status: OperationStatus; connection: Connection;
-  error?: string; missingScopes?: string[];
+  error?: string; missingScopes?: string[]; retryAfterMs?: number;
   nextAction?: 'wait' | 'sign_in' | 'retry_cleanup';
 }
 export interface SignOutOutcome { connection: Connection; cleanup: 'complete' | 'pending' | 'uncertain' }
@@ -494,37 +494,42 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     replaceSlot(connection, operation.resource, { secretRef: staged.accessRef, tokenType: 'DPoP', dpopKeyRef: connection.dpopKeyRef, scopes: staged.scopes, expiresAt: staged.expiresAt, generation: connection.generation }, drop);
     return finish(state, operation, 'completed');
   }
-  function renewal(connection: ConnectionRecord, resource: string | null, scopes: string[] | null): Promise<AuthOutcome> {
-    if (connection.status === 'signed_out') {
-      if (scopes?.length) throw new AuthFailure('invalid_scope', connection.id);
-      return signedOutRenewal(connection, resource);
+  // Retry-After from the issuer (spec 4.3: the agent MUST wait). In memory: a restart forgets it, which costs at most one early request.
+  const retryAfter = new Map<string, number>(); // operation id -> ms, handed from refresh() to renewal()
+  const notBefore = new Map<string, number>(); // connection id -> earliest next token request
+  const MAX_RETRY_AFTER_MS = 3_600_000; // a huge or Infinity Retry-After must not block a connection until restart
+  function holdOff(connectionId: string, ms: number): number {
+    const clamped = Math.min(ms, MAX_RETRY_AFTER_MS);
+    notBefore.set(connectionId, now() + clamped);
+    return clamped;
+  }
+  // Every token-request path (internal refresh and public renew) goes through here, so all honour Retry-After.
+  async function renewal(connection: ConnectionRecord, resource: string | null, scopes: string[] | null): Promise<AuthOutcome> {
+    // Local failures first: a wait is only meaningful for a connection that can still send a token request.
+    if (connection.status === 'signed_out' && scopes?.length) throw new AuthFailure('invalid_scope', connection.id);
+    if (connection.status !== 'signed_out' && connection.status !== 'signed_in') throw new AuthFailure(connection.status === 'disconnected' ? 'disconnected' : 'grant_uncertain', connection.id);
+    const wait = (notBefore.get(connection.id) ?? 0) - now();
+    if (wait > 0) throw new AuthFailure('rate_limited', connection.id, wait);
+    let outcome: AuthOutcome;
+    try {
+      outcome = connection.status === 'signed_out' ? await signedOutRenewal(connection, resource) : await refresh(connection, resource, scopes);
+    } catch (error) {
+      if (error instanceof AuthFailure && error.retryAfterMs !== undefined) throw new AuthFailure(error.code, error.connectionId, holdOff(connection.id, error.retryAfterMs));
+      throw error;
     }
-    if (connection.status !== 'signed_in') throw new AuthFailure(connection.status === 'disconnected' ? 'disconnected' : 'grant_uncertain', connection.id);
-    return refresh(connection, resource, scopes);
+    const ms = retryAfter.get(outcome.operationId); retryAfter.delete(outcome.operationId);
+    return ms === undefined ? outcome : { ...outcome, retryAfterMs: holdOff(connection.id, ms) };
   }
 
   // In-process single flight: parallel requests on one stale slot share one renewal; the grant claim covers other processes.
   const renewing = new Map<string, Promise<CredentialRecord>>();
-  // Retry-After from the issuer (spec 4.3: the agent MUST wait). In memory: a restart forgets it, which costs at most one early request.
-  const retryAfter = new Map<string, number>(); // operation id -> ms, handed from refresh() to renewShared()
-  const notBefore = new Map<string, number>(); // connection id -> earliest next token request
   function renewShared(connectionId: string, resource: string | null): Promise<CredentialRecord> {
     const key = JSON.stringify([connectionId, resource]);
     let pending = renewing.get(key);
     if (!pending) {
       pending = (async () => {
-        const wait = (notBefore.get(connectionId) ?? 0) - now();
-        if (wait > 0) throw new AuthFailure('rate_limited', connectionId, wait);
-        let outcome: AuthOutcome;
-        try { outcome = await renewal(await record(connectionId), resource, null); } catch (error) {
-          if (error instanceof AuthFailure && error.retryAfterMs !== undefined) notBefore.set(connectionId, now() + error.retryAfterMs);
-          throw error;
-        }
-        if (outcome.status !== 'completed') {
-          const ms = retryAfter.get(outcome.operationId); retryAfter.delete(outcome.operationId);
-          if (ms !== undefined) notBefore.set(connectionId, now() + ms);
-          throw new AuthFailure(outcome.status === 'pending' ? 'renewal_pending' : outcome.error ?? 'renewal_failed', connectionId, ms);
-        }
+        const outcome = await renewal(await record(connectionId), resource, null);
+        if (outcome.status !== 'completed') throw new AuthFailure(outcome.status === 'pending' ? 'renewal_pending' : outcome.error ?? 'renewal_failed', connectionId, outcome.retryAfterMs);
         const slot = own((await record(connectionId)).slots, slotKey(outcome.connection.sessionId, resource));
         if (!slot) throw new AuthFailure('state_changed', connectionId);
         return slot;

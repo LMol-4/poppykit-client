@@ -1210,6 +1210,50 @@ test('a rate-limited signed-in refresh surfaces retryAfterMs and no token reques
   assert.equal((await auth.authorizedFetch(id, conversations(company), target)).status, 200);
 });
 
+test('public renew() returns retryAfterMs and sends no token request inside the Retry-After window', async () => {
+  const { auth, company, clock, id } = await signedIn();
+  const handle = company.handle; let tokenRequests = 0;
+  company.handle = async (request, init) => {
+    if (request.url !== company.tokenEndpoint) return handle(request, init);
+    tokenRequests++; return new Response('{"error":"rate_limited"}', { status: 429, headers: { 'retry-after': '30' } });
+  };
+  const outcome = await auth.renew(id);
+  assert.equal(outcome.status, 'failed'); assert.equal(outcome.retryAfterMs, 30000);
+  clock.t += 10_000;
+  await assert.rejects(auth.renew(id), error => error.code === 'rate_limited' && error.retryAfterMs === 20000);
+  assert.equal(tokenRequests, 1, 'no token request during the wait');
+  company.handle = handle; clock.t += 20_000;
+  assert.equal((await auth.renew(id)).status, 'completed');
+});
+
+test('inside a Retry-After window renew() still reports disconnected, not rate_limited', async () => {
+  const { auth, company, id } = await signedIn();
+  const handle = company.handle;
+  company.handle = async (request, init) => request.url === company.tokenEndpoint ? new Response('{"error":"rate_limited"}', { status: 429, headers: { 'retry-after': '30' } }) : handle(request, init);
+  assert.equal((await auth.renew(id)).retryAfterMs, 30000);
+  await auth.signOut(id);
+  await assert.rejects(auth.renew(id), error => error.code === 'disconnected');
+});
+
+test('a signed-out renew() with scopes reports invalid_scope inside a Retry-After window', async () => {
+  const { auth, company, clock } = await setup();
+  const { connection } = await auth.start(company.domain);
+  clock.t += 3_600_000;
+  const handle = company.handle;
+  company.handle = async (request, init) => request.url === company.tokenEndpoint ? new Response('{"error":"rate_limited"}', { status: 429, headers: { 'retry-after': '30' } }) : handle(request, init);
+  await assert.rejects(auth.renew(connection.id), error => error.retryAfterMs === 30000);
+  await assert.rejects(auth.renew(connection.id, { scopes: ['x'] }), error => error.code === 'invalid_scope');
+});
+
+test('a huge Retry-After is clamped to one hour', async () => {
+  const { auth, company, clock, id } = await signedIn();
+  const handle = company.handle;
+  company.handle = async (request, init) => request.url === company.tokenEndpoint ? new Response('{"error":"rate_limited"}', { status: 429, headers: { 'retry-after': '9'.repeat(30) } }) : handle(request, init);
+  assert.equal((await auth.renew(id)).retryAfterMs, 3_600_000);
+  company.handle = handle; clock.t += 3_600_000;
+  assert.equal((await auth.renew(id)).status, 'completed');
+});
+
 test('a host SecretStore ref that looks like a memory ref still reaches the host store', async () => {
   const secrets = memorySecrets(); const stage = secrets.stage;
   secrets.stage = async secret => { const ref = `mem:${await stage(secret)}`; secrets.map.set(ref, secrets.map.get(ref.slice(4))); return ref; };
