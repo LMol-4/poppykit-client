@@ -6,7 +6,7 @@ export interface PoppyDocument { protocol_version: '0.2'; organization: { name: 
 export interface AuthorizationMetadata { issuer: string; token_endpoint: string; revocation_endpoint: string; poppy_domains: string[]; authorization_endpoint?: string; device_authorization_endpoint?: string; dpop_signing_alg_values_supported?: string[]; client_id_metadata_document_supported?: boolean; [key: string]: unknown }
 export interface ClientMetadata { client_id: string; client_name: string; jwks_uri: string; redirect_uris: string[]; token_endpoint_auth_method: 'private_key_jwt'; [key: string]: unknown }
 export interface CompanyMetadata { document: PoppyDocument; authorization?: AuthorizationMetadata; url: string }
-export interface MetadataResolver { resolveCompany(domain: string): Promise<CompanyMetadata>; resolveClient(clientId: string): Promise<ClientMetadata>; resolveJwks(uri: string, options?: { refresh?: boolean }): Promise<JsonObject> }
+export interface MetadataResolver { resolveCompany(domain: string): Promise<CompanyMetadata>; resolveClient(clientId: string): Promise<ClientMetadata>; resolveJwks(uri: string, options?: { refresh?: boolean }): Promise<JsonObject>; invalidate?(target?: string): void }
 function url(value: unknown, field: string): string { const valueString = string(value, field); secureUrl(valueString); return valueString; }
 function strings(value: unknown, field: string, allowEmpty = false): string[] { if (!Array.isArray(value) || (!allowEmpty && !value.length)) throw new ValidationError(field); value.forEach(item => string(item, field)); return value; }
 function scopes(value: unknown): void { for (const scope of strings(value, 'scopes')) if (!/^[\x21\x23-\x5B\x5D-\x7E]+$/.test(scope)) throw new ValidationError('scopes'); }
@@ -89,8 +89,8 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
   const now = options.now ?? Date.now; const maxEntries = options.maxEntries ?? 1000;
   const maxConcurrent = options.maxConcurrentFetches ?? 16; const maxPerMinute = options.maxFetchesPerMinute ?? 120;
   const starts: number[] = [];
-  const cache = new Map<string, { value: unknown; url: string; expires: number }>();
-  const pending = new Map<string, Promise<{ value: unknown; url: string; expires: number }>>();
+  const cache = new Map<string, { value: unknown; url: string; expires: number; etag?: string; modified?: string }>();
+  const pending = new Map<string, Promise<{ value: unknown; url: string; expires: number; etag?: string; modified?: string }>>();
   const refreshes = new Map<string, number>();
   const authDocuments = new Map<string, Map<string, { auth: string; expires: number }>>();
   async function get(target: string, validate: (value: unknown, servedUrl: string) => unknown, mode: 'endpoint' | 'discovery', refresh = false) {
@@ -102,20 +102,22 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
       if (pending.size >= maxConcurrent || starts.length >= maxPerMinute) throw new ValidationError('metadata.rate_limited');
       starts.push(now()); if (refresh) remember(refreshes, target, now(), maxEntries, at => now() - at >= 60000);
       task = (async () => {
-        const response = await transport.fetch(new Request(target), { mode });
-        if (response.status !== 200) throw new ValidationError('metadata.status');
-        let value: unknown; try { value = parseJson(await response.text()); } catch { throw new ValidationError('metadata.json'); }
-        const servedUrl = response.url || target; validate(value, servedUrl);
+        const headers = new Headers(); if (cached?.etag) headers.set('if-none-match', cached.etag); else if (cached?.modified) headers.set('if-modified-since', cached.modified);
+        const response = await transport.fetch(new Request(target, { headers }), { mode });
+        if (response.status !== 200 && !(response.status === 304 && cached)) throw new ValidationError('metadata.status');
+        let value: unknown; try { value = response.status === 304 ? cached!.value : parseJson(await response.text()); } catch { throw new ValidationError('metadata.json'); }
+        const servedUrl = response.status === 304 ? cached!.url : response.url || target; validate(value, servedUrl);
         const control = response.headers.get('cache-control') ?? ''; const age = Number(response.headers.get('age') ?? 0);
         const seconds = Number(/(?:^|,)\s*max-age=(\d+)/i.exec(control)?.[1] ?? 60); // no max-age: 60 s floor (guide: at least a minute)
         const expires = now() + (/\b(?:no-store|no-cache)\b/i.test(control) ? 0 : Math.max(0, Math.min(300, seconds - (Number.isFinite(age) ? age : 0)))) * 1000;
-        const result = { value, url: servedUrl, expires }; if (expires > now()) remember(cache, key, result, maxEntries, entry => entry.expires <= now()); else cache.delete(key);
+        const result = { value, url: response.status === 304 ? cached!.url : servedUrl, expires, etag: response.headers.get('etag') ?? cached?.etag, modified: response.headers.get('last-modified') ?? cached?.modified }; if (!/\bno-store\b/i.test(control)) remember(cache, key, result, maxEntries, entry => entry.expires <= now()); else cache.delete(key);
         return result;
       })(); pending.set(key, task);
     }
     try { const result = await task; validate(result.value, result.url); return structuredClone(result); } finally { if (pending.get(key) === task) pending.delete(key); }
   }
   return {
+    invalidate(target?: string) { if (target === undefined) { cache.clear(); authDocuments.clear(); } else { for (const key of cache.keys()) if (key.endsWith(`:${target}`)) cache.delete(key); authDocuments.clear(); } },
     async resolveCompany(input) {
       if (!/^[a-z0-9.-]+(?::\d{1,5})?$/i.test(input)) throw new ValidationError('domain');
       const target = `https://${input}/.well-known/poppy.json`;

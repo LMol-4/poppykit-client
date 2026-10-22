@@ -589,3 +589,16 @@ test('a renewal that lost its connection (AuthFailure transport_error) is retrie
   assert.equal((await client.start({ ...msg, id: 'msg_v' })).conversation_id, 'cnv_1');
   assert.equal(calls, 3);
 });
+
+test('malformed waited page cannot fall back to a valid state and JSON errors retain header scope',async()=>{
+  const {client,server}=setup();
+  server.hooks.failures.push(json({conversation_id:'c1',status:'idle',responder:'agent',events:'bad',cursor:null,has_more:false},201));
+  await assert.rejects(client.start({id:'broken_wait',sender:'agent',text:'x'},{wait:1}),{code:'invalid_response'});
+  server.hooks.failures.push(json({error:'insufficient_scope'},403,{'www-authenticate':'DPoP error="insufficient_scope", scope="custom:read"'}));
+  await assert.rejects(client.read('c1'),{code:'insufficient_scope',scope:'custom:read'});
+});
+
+test('URL path append preserves encoded base path and query parameters',async()=>{
+  const seen=[];const client=createConversationClient({endpoint:'https://api.example/a%20b/conversations/?tenant=one%26two',connectionId:'c',issuer:'i',clock:{now:()=>0},store:memoryStore(),authorizedRequest:async request=>{seen.push(request.url);return json({conversation_id:'c1',events:[],cursor:null,has_more:false,status:'idle',responder:'agent'});}});
+  await client.read('c1');assert.equal(seen[0],'https://api.example/a%20b/conversations/c1/events?tenant=one%26two');
+});

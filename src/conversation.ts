@@ -1,6 +1,6 @@
 import type { ConversationStore } from './conversation-store.js';
 import { dpopChallenge } from './auth/challenge.js';
-import { TransportError } from './network/transport.js';
+import { secureUrl, TransportError } from './network/transport.js';
 import { canonical, id as parseId, parseJson, parseConversationRequest, parseConversationState, parseEventPage, parseMessage, parseProtocolError, retryAfterMilliseconds } from './protocol/wire.js';
 import type { ConversationRequest, ConversationState, EventPage, Message } from './protocol/wire.js';
 
@@ -18,7 +18,7 @@ export const initialConversationClientState = (): ConversationClientState => ({ 
 // Only known spec codes (7.13, 6) reach messages and callers; a company-chosen string never does.
 const knownCodes = new Set(['conversation_not_found', 'conversation_closed', 'direct_conversation_open', 'message_id_conflict', 'invalid_cursor', 'cursor_expired', 'invalid_request', 'extension_required', 'rate_limited', 'invalid_token', 'invalid_dpop_proof', 'use_dpop_nonce', 'sign_in_required', 'insufficient_scope']);
 export class ConversationError extends Error {
-  constructor(readonly code: string, readonly status?: number, readonly retryAfterMs?: number, readonly scope?: string, readonly conversationId?: string) { super(`Conversation ${code}`); this.name = 'ConversationError'; }
+  constructor(readonly code: string, readonly status?: number, readonly retryAfterMs?: number, readonly scope?: string, readonly conversationId?: string, readonly extension?: string) { super(`Conversation ${code}`); this.name = 'ConversationError'; }
 }
 export interface ConversationClientOptions {
   authorizedRequest(request: Request): Promise<Response>;
@@ -28,7 +28,7 @@ export interface ConversationClientOptions {
   newId?: () => string; sleep?: (ms: number) => Promise<void>; random?: () => number;
   maxAttempts?: number; baseDelayMs?: number; maxDelayMs?: number; maxPages?: number;
 }
-export interface ReadOptions extends ReadParams { consumer?: string }
+export interface ReadOptions extends ReadParams { consumer?: string; signal?: AbortSignal }
 export type OutboundInput = Omit<Message, 'id'> & { id?: string };
 
 // A definite rejection will not change on retry; anything else (auth, 408, 429, 5xx) leaves the operation retryable.
@@ -36,14 +36,14 @@ const definite = (status: number) => status >= 400 && status < 500 && ![401, 403
 
 export function createConversationClient(options: ConversationClientOptions) {
   const { authorizedRequest, store, clock, connectionId, issuer } = options;
-  const endpoint = options.endpoint.replace(/\/+$/, '');
+  const endpoint = secureUrl(options.endpoint).href;
   const newId = options.newId ?? (() => `msg_${Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('base64url')}`); // 128 random bits
   const random = options.random ?? Math.random;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
   const maxAttempts = options.maxAttempts ?? 4, baseDelayMs = options.baseDelayMs ?? 250, maxDelayMs = options.maxDelayMs ?? 60000, maxPages = options.maxPages ?? 1000;
   const key = { connectionId, issuer, endpoint };
   // Validated IDs only: '.' and '..' survive encodeURIComponent and would escape the endpoint.
-  const conversationUrl = (id: string, tail: string) => `${endpoint}/${parseId(id, 'conversation_id')}/${tail}`;
+  const conversationUrl = (id: string, tail: string) => { const url = new URL(endpoint); url.pathname = `${url.pathname.replace(/\/+$/, '')}/${parseId(id, 'conversation_id')}/${tail}`; return url.href; };
 
   // Idempotent by construction: callers reuse the same message ID, so retrying transport failures, 429 and 5xx is safe.
   // Auth failures (including a rate-limited token renewal and its retryAfterMs) are not ours to retry and propagate unchanged.
@@ -63,8 +63,9 @@ export function createConversationClient(options: ConversationClientOptions) {
     }
   }
   async function failure(response: Response): Promise<ConversationError> {
-    let code = '', scope: string | undefined, conversationId: string | undefined;
-    try { const body = parseProtocolError(parseJson(await response.text())); code = body.error; if (code === 'direct_conversation_open') conversationId = body.conversation_id; } catch { /* non-protocol body */ }
+    const challenge = dpopChallenge(response.headers.get('www-authenticate'));
+    let code = '', scope = challenge?.scope, conversationId: string | undefined, extension: string | undefined;
+    try { const body = parseProtocolError(parseJson(await response.text())); code = body.error; extension = body.extension; if (typeof body.scope === 'string') scope = body.scope; if (code === 'direct_conversation_open') conversationId = body.conversation_id; } catch { /* non-protocol body */ }
     if (!knownCodes.has(code)) {
       // Token errors (spec 6) arrive in WWW-Authenticate: DPoP error="...", scope="...".
       const challenge = dpopChallenge(response.headers.get('www-authenticate'));
@@ -72,7 +73,7 @@ export function createConversationClient(options: ConversationClientOptions) {
       scope = challenge?.scope;
     }
     if (!knownCodes.has(code)) code = 'http_error';
-    return new ConversationError(code, response.status, retryAfterMilliseconds(response.headers.get('retry-after'), clock.now()), code === 'insufficient_scope' ? scope : undefined, conversationId);
+    return new ConversationError(code, response.status, retryAfterMilliseconds(response.headers.get('retry-after'), clock.now()), scope, conversationId, extension);
   }
 
   // Pages handed to a consumer in this process; the checkpoint moves only when one of them is acked.
@@ -98,7 +99,7 @@ export function createConversationClient(options: ConversationClientOptions) {
       try {
         const body = parseJson(await response.text());
         // A 2xx means accepted; a company that ignores wait answers with a plain state.
-        try { state = record.read ? parseEventPage(body, record.read.cursor) : parseConversationState(body); } catch { state = parseConversationState(body); }
+        state = body && typeof body === 'object' && ['events', 'cursor', 'has_more'].some(key => key in body) ? parseEventPage(body, record.read?.cursor) : parseConversationState(body);
       } catch { throw new ConversationError('invalid_response', response.status); }
       await store.settleOutbound(key, id, { phase: 'accepted', response: state });
       return state;
@@ -145,7 +146,7 @@ export function createConversationClient(options: ConversationClientOptions) {
       const url = new URL(conversationUrl(conversationId, 'events'));
       if (cursor !== undefined) url.searchParams.set('cursor', cursor);
       if (opts.wait !== undefined) url.searchParams.set('wait', String(opts.wait));
-      const response = await call(() => new Request(url, { method: 'GET' }));
+      const response = await call(() => new Request(url, { method: 'GET', signal: opts.signal }));
       if (!response.ok) throw await failure(response); // cursor_expired (410) is the explicit history gap: see resetConsumer
       let page: EventPage;
       try { page = parseEventPage(parseJson(await response.text()), cursor); } catch { throw new ConversationError('invalid_response', response.status); }
