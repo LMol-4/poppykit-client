@@ -8,30 +8,34 @@ credential-storage adapters. PoppyKit supplies protocol behavior; it does not
 operate a managed agent or credential service. The CLI is optional.
 
 The SDK design supports explicitly selected independent connections, including
-multiple accounts at one company. The demo's one-active-account UI is a host
-policy. Discovery can be used without authentication dependencies; Direct Sign-In
+multiple accounts at one company. Account-selection UI is a host policy.
+Discovery can be used without authentication dependencies; Direct Sign-In
 is a separate capability. Interrupted exchanges and remote revocation failures
 have explicit outcomes rather than silently retrying or reconnecting.
 
-See [poppykit-demo](https://github.com/LMol-4/poppykit-demo) for the planned local integration example.
+Demo applications are deferred and are not dependencies of this SDK.
 
-Status: initial project scaffold. No SDK or CLI implementation is published yet.
+Status (2026-10-22): unpublished implementation of discovery, Direct Sign-In,
+session/credential lifecycle, and JSON conversations. Known correctness issues
+remain; passing tests do not establish complete protocol conformance.
 
-Targets the Personal Agent Protocol (Poppy): https://personalagentprotocol.org/docs/spec
+Targets the current [Personal Agent Protocol draft 0.2 specification](https://personalagentprotocol.org/docs/0.2/spec)
+and [guides](https://personalagentprotocol.org/docs/0.2/guides).
 
-Current design target (reviewed 2026-10-19): draft **0.2, in progress**, pinned to
-`30c476455c20c23c13b050c74c47d9b3269413c7`. Pre-1.0 versions require exact
-major.minor support; do not silently treat published 0.1 as compatible. Discovery
-must support optional issuer DPoP algorithm metadata, issuer paths, and safe
-HTTPS/address/redirect handling. Credential selection is resource-specific, and
-user sign-out/disconnection must prevent automatic re-sign-in without a new request.
-These are implementation requirements, not claims of implemented features.
+The October 19 source pin is historical evidence, not overriding authority.
+The reviewed implementation programme adds all three sign-in methods, anonymous
+browsing, streaming, feedback, API/browser hooks, targeted durable storage, and an
+optional hosted-identity adapter/reference entry point. These are planned
+capabilities, not features available in this checkout. Operators supply enrollment
+authentication and hosting; the SDK will not require a PoppyKit cloud service.
 
 The official repository now provides JSON Schemas and a partial implementation-kit
 validator. Their shape checks supplement the normative prose and behavioral tests;
 the schema's stale assertion-audience description must not override the issuer rule.
 
-This is an independent implementation. Protocol conformance has not yet been tested.
+This is an independent implementation with behavioral tests and a partial review;
+complete protocol conformance, clean-package installation, and production adapter
+guarantees have not been established.
 
 Creating this repository does not reserve a name on npm, PyPI, or crates.io.
 
