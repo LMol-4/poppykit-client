@@ -1586,3 +1586,26 @@ test('different full issuers sharing a host keep identities, keys and credential
   assert.ok(second.requests.length >= count, 'metadata refresh is allowed');
   current = first; assert.equal((await auth.renew(a.connection.id)).status, 'completed');
 });
+
+test('conversation Retry-After survives restart without dispatching early', async () => {
+  const env = await signedIn();
+  env.company.behavior.resourceHandler = async () => new Response('company rate limit', { status: 429, headers: { 'retry-after': '7200' } });
+  assert.equal((await env.auth.authorizedFetch(env.id, conversations(env.company), env.target)).status, 429);
+  const count = env.company.requests.length; env.clock.t += 3600000;
+  await assert.rejects(createClientAuth(env.options).authorizedFetch(env.id, conversations(env.company), env.target), error => error.code === 'rate_limited' && error.retryAfterMs === 3600000);
+  assert.equal(env.company.requests.filter(request => request.url === env.company.endpoint).length, 1);
+  assert.ok(env.company.requests.length >= count);
+});
+
+test('revocation Retry-After persists with its cleanup item across restart', async () => {
+  const env = await signedIn(), handle = env.company.handle;
+  let calls = 0;
+  env.company.handle = async (request, options) => {
+    if (request.url === `${env.company.issuer}/revoke`) { calls++; return new Response('HTML', { status: 503, headers: { 'retry-after': '7200' } }); }
+    return handle(request, options);
+  };
+  assert.equal((await env.auth.signOut(env.id)).cleanup, 'pending'); assert.equal(calls, 1);
+  env.clock.t += 3600000; assert.equal((await createClientAuth(env.options).retryCleanup(env.id)).cleanup, 'pending'); assert.equal(calls, 1);
+  env.company.handle = handle; env.clock.t += 3600000;
+  assert.equal((await createClientAuth(env.options).retryCleanup(env.id)).cleanup, 'complete');
+});

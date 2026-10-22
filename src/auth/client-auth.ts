@@ -144,6 +144,7 @@ export interface StagedRefresh {
 export interface CleanupRecord {
   id: string; connectionId: string; issuer: string; revocationEndpoint: string;
   secretRef: string; status: 'pending' | 'uncertain';
+  notBefore?: string;
 }
 export interface ClientAuthState {
   version: 1; epoch: string;
@@ -654,10 +655,18 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   // RFC 7009 revocation with a fresh client assertion (spec 4.9). Replay is safe, so anything but 200 stays pending.
   async function revoke(connection: ConnectionRecord, item: CleanupRecord, token: string): Promise<boolean> {
     try {
+      if (BigInt(item.notBefore ?? '0') > BigInt(Math.floor(now()))) return false;
       const key = await loadDpopKey(connection.dpopKeyRef);
       await verified(connection.metadata);
       const body = new URLSearchParams({ token, token_type_hint: 'refresh_token', client_id: clientId, client_assertion_type: CLIENT_ASSERTION, client_assertion: await assertion('client-authentication', item.issuer, key) });
       const response = await transport.fetch(new Request(item.revocationEndpoint, { method: 'POST', body, headers: { accept: 'application/json' } }));
+      if (response.status === 429 || response.status === 503) {
+        const deadline = responseFailure(response, 'rate_limited').retryAt;
+        if (deadline) await transaction({ connectionId: connection.id }, state => {
+          const current = own(state.cleanup, item.id);
+          if (current?.secretRef === item.secretRef && BigInt(deadline) > BigInt(current.notBefore ?? '0')) current.notBefore = deadline;
+        });
+      }
       await response.body?.cancel();
       return response.status === 200;
     } catch { return false; }
@@ -1186,12 +1195,13 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     retryCleanup: cleanupNow,
 
     async authorizedFetch(connectionId, request, target, requiredScopes = []) {
-      const expected = targetOf(await currentConnection(connectionId));
+      const connection = await currentConnection(connectionId), expected = targetOf(connection);
       if (target.issuer !== expected.issuer || target.endpoint !== expected.endpoint || target.resource !== expected.resource) throw new AuthFailure('invalid_target', connectionId);
       // Credentials go only to the endpoint itself or a slash-delimited child on the same origin.
       const url = new URL(request.url), endpoint = new URL(expected.endpoint);
       const base = endpoint.pathname.replace(/\/$/, '');
       if (url.protocol !== 'https:' || url.hash || url.username || url.password || url.origin !== endpoint.origin || (url.pathname !== endpoint.pathname && !url.pathname.startsWith(`${base}/`))) throw new AuthFailure('invalid_target', connectionId);
+      checkCooldown(connection);
       const resource = expected.resource ?? null;
       // A conversation long poll is held up to `wait` seconds (spec 7.3, 7.5); that hold must not count as a network timeout.
       const wait = url.searchParams.get('wait');
@@ -1217,6 +1227,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         // Clone per attempt so the original body stays available for a bounded retry.
         const response = await transport.fetch(new Request(request.clone(), { headers }), { waitMs });
         rememberNonce(request.url, response);
+        if (response.status === 429 || response.status === 503) await holdOff(connectionId, responseFailure(response, 'rate_limited'));
         if (response.status !== 401) return response;
         const error = dpopChallenge(response.headers.get('www-authenticate'))?.error;
         if (error === 'use_dpop_nonce' && !nonceRetried && response.headers.has('dpop-nonce')) { nonceRetried = true; continue; }
