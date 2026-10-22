@@ -389,3 +389,10 @@ test('304 inherits no-cache; invalidation fences an in-flight stale fetch',async
   const racing=createMetadataResolver({async fetch(){if(++calls===1){started();await gate;return Response.json(value);}return Response.json({...value,client_name:'new'});}});
   const old=racing.resolveClient(uri);await entered;racing.invalidate(uri);assert.equal((await racing.resolveClient(uri)).client_name,'new');release();await old;assert.equal((await racing.resolveClient(uri)).client_name,'new');assert.equal(calls,2);
 });
+
+test('invalidating pending metadata preserves the global active-fetch cap',async()=>{
+  let release,entered;const gate=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve);let calls=0;
+  const uri='https://agent.example/client';const value={client_id:uri,client_name:'A',jwks_uri:'https://agent.example/keys',redirect_uris:[],token_endpoint_auth_method:'private_key_jwt'};
+  const resolver=createMetadataResolver({async fetch(){calls++;entered();await gate;return Response.json(value);}},{maxConcurrentFetches:1});
+  const first=resolver.resolveClient(uri);await started;resolver.invalidate(uri);await assert.rejects(resolver.resolveClient(uri),{field:'metadata.rate_limited'});assert.equal(calls,1);release();await first;await resolver.resolveClient(uri);assert.equal(calls,2);
+});

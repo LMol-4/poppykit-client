@@ -88,7 +88,7 @@ function remember<V>(map: Map<string, V>, key: string, value: V, max: number, ex
 export function createMetadataResolver(transport: HttpTransport, options: { now?: () => number; maxEntries?: number; maxConcurrentFetches?: number; maxFetchesPerMinute?: number } = {}): MetadataResolver {
   const now = options.now ?? Date.now; const maxEntries = options.maxEntries ?? 1000;
   const maxConcurrent = options.maxConcurrentFetches ?? 16; const maxPerMinute = options.maxFetchesPerMinute ?? 120;
-  let epoch = 0;
+  let epoch = 0, fetching = 0;
   const starts: number[] = [];
   const cache = new Map<string, { value: unknown; url: string; expires: number; etag?: string; modified?: string; control?: string }>();
   const pending = new Map<string, Promise<{ value: unknown; url: string; expires: number; etag?: string; modified?: string; control?: string }>>();
@@ -100,8 +100,9 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
     let task = pending.get(key);
     if (!task) {
       while (starts.length && now() - starts[0] >= 60000) starts.shift();
-      if (pending.size >= maxConcurrent || starts.length >= maxPerMinute) throw new ValidationError('metadata.rate_limited');
+      if (fetching >= maxConcurrent || starts.length >= maxPerMinute) throw new ValidationError('metadata.rate_limited');
       starts.push(now()); if (refresh) remember(refreshes, target, now(), maxEntries, at => now() - at >= 60000);
+      fetching++;
       const startedEpoch = epoch;
       task = (async () => {
         const headers = new Headers(); if (cached?.etag) headers.set('if-none-match', cached.etag); else if (cached?.modified) headers.set('if-modified-since', cached.modified);
@@ -114,7 +115,7 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
         const expires = now() + (/\b(?:no-store|no-cache)\b/i.test(control) ? 0 : Math.max(0, Math.min(300, seconds - (Number.isFinite(age) ? age : 0)))) * 1000;
         const result = { value, control, url: response.status === 304 ? cached!.url : servedUrl, expires, etag: response.headers.get('etag') ?? cached?.etag, modified: response.headers.get('last-modified') ?? cached?.modified }; if (startedEpoch !== epoch) return result; if (!/\bno-store\b/i.test(control)) remember(cache, key, result, maxEntries, entry => entry.expires <= now()); else cache.delete(key);
         return result;
-      })(); pending.set(key, task);
+      })().finally(() => { fetching--; }); pending.set(key, task);
     }
     try { const result = await task; validate(result.value, result.url); return structuredClone(result); } finally { if (pending.get(key) === task) pending.delete(key); }
   }
