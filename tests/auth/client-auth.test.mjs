@@ -484,7 +484,7 @@ test('Direct Sign-In after both the Session and the Account Token ended binds to
 });
 
 test('the authorization request and code exchange carry PKCE, state, issuer and session', async () => {
-  const { auth, company, store, options } = await setup();
+  const { auth, company, store } = await setup();
   const { connection } = await auth.start(company.domain);
   let exchange;
   const original = company.handle;
@@ -1361,4 +1361,110 @@ test('anonymous sign-in creates regular connection/session and discards its ephe
   assert.equal(secrets.map.has(old.dpopKeyRef), false); assert.equal((await auth.get(old.id)).status, 'disconnected');
   const callbackUrl = company.authorize(begun.authorizationUrl, { account: 'acct_1' });
   assert.equal((await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER })).status, 'completed');
+});
+
+for (const method of ['direct', 'device', 'mediated']) test(`${method} staged sign-in survives activation failure and renews its memory-only Session Token after restart`, async () => {
+  const env = await setup({ method }); env.options.trustedInput = { collect: async () => ({ password: 'private-password' }) };
+  const auth = createClientAuth(env.options), { connection } = await auth.start(env.company.domain);
+  let operationId, complete;
+  if (method === 'direct') { const begun = await beginAndApprove(auth, env.company, connection.id); operationId = begun.begun.operationId; complete = () => auth.completeSignIn({ callbackUrl: begun.callbackUrl, browserBinding: BROWSER }); }
+  else if (method === 'device') { const begun = await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] }); operationId = begun.outcome.operationId; env.clock.t += 5000; complete = () => auth.continueSignIn(operationId); }
+  else complete = async () => (await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] })).outcome;
+  const stage = env.secrets.stage;
+  env.secrets.stage = async secret => {
+    const ref = await stage(secret);
+    if (env.company.grants.has(secret)) { assert.deepEqual(await createClientAuth(env.options).recover(), [], 'live owner remains alive through secret staging'); env.store.crashIn = 2; }
+    return ref;
+  };
+  await assert.rejects(complete(), /crash/);
+  const operation = Object.values(env.store.raw.operations).find(row => row.phase === 'staged'); assert.ok(operation);
+  operationId ??= operation.id;
+  env.secrets.stage = stage;
+  const restart = createClientAuth(env.options), recovered = await restart.recover();
+  assert.deepEqual(recovered.map(result => [result.operationId, result.status]), [[operationId, 'completed']]);
+  const count = exchanges(env.company);
+  assert.equal((await restart.authorizedFetch(connection.id, conversations(env.company), await restart.target(connection.id), ['poppy:read'])).status, 200);
+  assert.equal(exchanges(env.company), count + 1, 'durable Account Token renews vanished memory token');
+});
+
+test('Mediated cancel while awaiting trusted input prevents credential dispatch and clears input', async () => {
+  const env = await setup({ method: 'mediated' }); let deliver, requested;
+  const ready = new Promise(resolve => { requested = resolve; });
+  env.options.trustedInput = { collect: async request => { requested(request.operationId); return new Promise(resolve => { deliver = resolve; }); } };
+  const auth = createClientAuth(env.options), { connection } = await auth.start(env.company.domain);
+  const active = auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['poppy:read'] }), operationId = await ready;
+  assert.equal((await auth.cancelSignIn(operationId)).status, 'cancelled');
+  const credentials = { password: 'must-not-send' }; deliver(credentials);
+  assert.equal((await active).outcome.status, 'cancelled'); assert.deepEqual(credentials, {});
+  assert.equal(env.company.requests.filter(request => request.url.startsWith(`${env.company.issuer}/sign-in`)).length, 0);
+});
+
+for (const body of ['<html>rate limited</html>', '{"error":"invalid_grant"}']) test(`Mediated ${body.startsWith('<') ? 'HTML 429' : '503 after grant'} keeps Retry-After across restart`, async () => {
+  const env = await setup({ method: 'mediated' }); env.options.trustedInput = { collect: async () => ({ password: 'private-password' }) };
+  const auth = createClientAuth(env.options), { connection } = await auth.start(env.company.domain), handle = env.company.handle;
+  env.company.handle = async (request, options) => {
+    const result = await handle(request, options);
+    return request.url === `${env.company.issuer}/sign-in` ? new Response(body, { status: body.startsWith('<') ? 429 : 503, headers: { 'retry-after': '7200' } }) : result;
+  };
+  const { outcome } = await auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['poppy:read'] });
+  assert.equal(outcome.status, body.startsWith('<') ? 'failed' : 'uncertain');
+  env.company.handle = handle; env.clock.t += 3600000;
+  await assert.rejects(createClientAuth(env.options).renew(connection.id), error => error.code === 'rate_limited' && error.retryAfterMs === 3600000);
+});
+
+test('Mediated rejects cross-operation challenge substitution and redacts thrown trusted input errors', async () => {
+  const env = await setup({ method: 'mediated' }); env.company.signInBehavior.codeRequired = true;
+  env.options.trustedInput = { collect: async ({ challenge }) => challenge ? { code: 'wrong' } : { password: 'private-password' } };
+  const auth = createClientAuth(env.options), { connection } = await auth.start(env.company.domain);
+  const first = await auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['poppy:read'] }), handle = env.company.handle;
+  env.company.handle = async (request, options) => {
+    const result = await handle(request, options);
+    if (!request.url.includes('/sign-in/')) return result;
+    const body = await result.json(); body.sign_in_id = 'another-operation'; return new Response(JSON.stringify(body));
+  };
+  assert.equal((await auth.continueSignIn(first.outcome.operationId)).error, 'invalid_response');
+  env.options.trustedInput.collect = async () => { throw new Error('password-must-not-escape'); };
+  const failed = await auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['poppy:read'] });
+  assert.equal(failed.outcome.error, 'input_unavailable'); assert.equal(JSON.stringify(failed).includes('password-must-not-escape'), false);
+});
+
+test('Direct rejects insecure, cross-domain and response-parameter registered callbacks before creating work', async () => {
+  const env = await setup(), { connection } = await env.auth.start(env.company.domain), count = Object.keys(env.store.raw.operations).length;
+  for (const redirectUri of ['http://agent.test/cb', 'https://user@agent.test/cb', 'https://sub.agent.test/cb', 'https://agent.test/cb#fragment', 'https://agent.test/cb?state=reserved']) {
+    await assert.rejects(createClientAuth({ ...env.options, redirectUris: [redirectUri] }).beginSignIn(connection.id, { scopes: ['poppy:read'], redirectUri, browserBinding: BROWSER }), code('invalid_redirect'));
+  }
+  assert.equal(Object.keys(env.store.raw.operations).length, count);
+});
+
+test('existing connection metadata is refreshed, but changed saved endpoints never receive credentials', async () => {
+  const env = await setup(), { connection } = await env.auth.start(env.company.domain), resolve = env.options.metadata.resolveCompany;
+  const before = structuredClone(env.store.raw.connections[connection.id]);
+  env.options.metadata.resolveCompany = async domain => { const fresh = structuredClone(await resolve(domain)); fresh.document.auth.direct.scopes = ['poppy:write']; return fresh; };
+  assert.deepEqual((await env.auth.authorization(connection.id, ['poppy:write'])).methods[0].scopes, ['poppy:write']);
+  env.options.metadata.resolveCompany = async domain => { const fresh = structuredClone(await resolve(domain)); fresh.authorization.token_endpoint += '/new'; return fresh; };
+  const count = exchanges(env.company);
+  await assert.rejects(env.auth.renew(connection.id), code('metadata_changed'));
+  assert.equal(exchanges(env.company), count); assert.equal(env.store.raw.connections[connection.id].metadata.authorization.token_endpoint, before.metadata.authorization.token_endpoint);
+});
+
+test('provider assertions use derived identity; mixed anonymous never calls stable provider identity or signer', async () => {
+  const env = await setup(); let identityCalls = 0; const requests = [];
+  const options = { ...env.options, providerIdentity: { identity: async () => { identityCalls++; return { clientId: CLIENT_ID, userId: 'provider-derived-user' }; } },
+    assertions: { assert: async request => {
+      requests.push(request); assert.deepEqual(Object.keys(request).sort(), ['issuer', 'operationId', 'purpose']);
+      const iat = Math.floor(env.clock.t / 1000), assertion = await new CompactSign(new TextEncoder().encode(JSON.stringify({ iss: CLIENT_ID, sub: request.purpose === 'session' ? 'provider-derived-user' : CLIENT_ID, aud: request.issuer, iat, exp: iat + 60, jti: randomUUID() }))).setProtectedHeader({ typ: request.purpose === 'session' ? 'JWT' : 'client-authentication+jwt', alg: 'ES256', kid: env.signer.kid }).sign(env.signer.privateKey);
+      return { assertion, expiresAt: iat + 60 };
+    } } };
+  const auth = createClientAuth(options), regular = await auth.start(env.company.domain);
+  assert.equal(env.store.raw.connections[regular.connection.id].userId, 'provider-derived-user');
+  const count = requests.length, anonymous = await auth.start(env.company.domain, { anonymous: true });
+  assert.equal(identityCalls, 1); assert.equal(requests.length, count);
+  assert.notEqual(env.store.raw.connections[anonymous.connection.id].userId, 'provider-derived-user');
+  await assert.rejects(createClientAuth({ ...options, identity: undefined }).start(env.company.domain, { anonymous: true }), code('anonymous_unavailable'));
+});
+
+test('a narrow Session Token renews from a sufficient grant without another sign-in', async () => {
+  const { auth, company, id, target } = await signedIn();
+  await auth.renew(id, { scopes: ['poppy:read'] });
+  assert.equal((await auth.authorizedFetch(id, conversations(company), target, ['poppy:write'])).status, 200);
 });

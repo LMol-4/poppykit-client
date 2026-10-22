@@ -228,11 +228,12 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
           if (!input.credentials.password) return json(200, { status: 'failed' });
           if (behavior.status === 'access_denied') return json(200, { status: 'failed' });
           if (behavior.codeRequired) {
-            const id = randomUUID(); company.challenges.set(id, { sessionId: bound.sessionId });
+            const id = randomUUID(); company.challenges.set(id, { sessionId: bound.sessionId, scopes: input.scope.split(' ') });
             return json(200, { status: 'code_required', sign_in_id: id, code: { sent_to: 'Your phone' }, expires_at: new Date(now() + 60_000).toISOString() });
           }
         }
-        const result = await issueSignedIn(bound.sessionId, jkt, behavior.account, behavior.scopes, bound.resource);
+        const requested = challengeId ? company.challenges.get(challengeId).scopes : input.scope.split(' ');
+        const result = await issueSignedIn(bound.sessionId, jkt, behavior.account, behavior.scopes.filter(scope => requested.includes(scope)), bound.resource);
         return json(200, { status: 'complete', ...await result.json() });
       }
       if (url.href === tokenEndpoint && request.method === 'POST') return await token(request);

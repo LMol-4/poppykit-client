@@ -265,7 +265,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   }
   async function currentConnection(id: string): Promise<ConnectionRecord> {
     const found = await record(id), metadata = await verified(found.metadata);
-    return transaction({ connectionId: id }, state => {
+    return await transaction({ connectionId: id }, state => {
       const current = own(state.connections, id)!;
       if (destinations(current.metadata) !== destinations(metadata)) throw new AuthFailure('state_changed', id);
       current.metadata = metadata; return current;
@@ -348,7 +348,8 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       body.set('client_assertion', localIdentity ? await signIdentity({ typ: 'client-authentication+jwt' }, assertionClaims(clientId, authorization.issuer), key.thumbprint) : await assertion('client-authentication', authorization.issuer, key));
       const request = new Request(endpoint, { method: 'POST', body, headers: { accept: 'application/json', dpop: await proof(key, 'POST', endpoint) } });
       let response: Response, text: string;
-      try { response = await transport.fetch(request); text = await response.text(); } catch { throw new AuthFailure('transport_error'); }
+      try { response = await transport.fetch(request); } catch { throw new AuthFailure('transport_error'); }
+      try { text = await response.text(); } catch { throw responseFailure(response, 'transport_error'); }
       rememberNonce(endpoint, response);
       let json: unknown;
       try { json = parseJson(text); } catch { /* reported below */ }
@@ -384,7 +385,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     const { kty, crv, x, y, d } = await crypto.subtle.exportKey('jwk', pair.privateKey);
     const dpopKeyRef = await secrets.stage(JSON.stringify({ kty, crv, x, y, d }));
     let userId = randomId('usr_');
-    if (options.providerIdentity) {
+    if (options.providerIdentity && !anonymous) {
       try { const bound = await options.providerIdentity.identity(issuer); if (bound.clientId !== clientId || typeof bound.userId !== 'string' || !bound.userId) throw 0; userId = bound.userId; }
       catch { await secrets.remove(dpopKeyRef); throw new AuthFailure('provider_unavailable'); }
     }
@@ -747,7 +748,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     const granted = token.scope.split(' ').filter(Boolean);
     let refreshRef: string | null = null;
     try { if (token.refresh_token !== undefined) refreshRef = await secrets.stage(token.refresh_token); }
-    catch { return terminate(operationId, 'uncertain', 'storage_error'); }
+    catch { return await terminate(operationId, 'uncertain', 'storage_error'); }
     if (token.token_type !== 'DPoP' || token.signed_in !== true || token.session_id !== operation.signInSessionId || !refreshRef ||
       !granted.length || new Set(granted).size !== granted.length || granted.some(scope => !operation.scopes.includes(scope))) {
       return commit({ operationId }, [], (state, drop) => {
@@ -772,17 +773,18 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     });
   }
 
-  async function claimSignIn(operationId: string, executionOwner: OperationOwner): Promise<{ operation: OperationRecord; connection: ConnectionRecord } | AuthOutcome> {
+  async function claimSignIn(operationId: string, executionOwner: OperationOwner, preSend = false): Promise<{ operation: OperationRecord; connection: ConnectionRecord } | AuthOutcome> {
     const snapshot = await load({ operationId }), operation = own(snapshot.operations, operationId)!;
     await currentConnection(operation.connectionId);
-    return transaction({ operationId }, state => {
+    return await transaction({ operationId }, state => {
       const current = own(state.operations, operationId)!;
       if (current.phase !== 'prepared') return outcomeOf(state, current);
+      if (current.owner && (options.ownerAlive ?? localOwnerAlive)(current.owner)) return outcomeOf(state, current);
       const connection = own(state.connections, current.connectionId)!;
       if (current.expiresAt <= now()) return finish(state, current, 'expired');
       if (current.connectionGeneration !== connection.generation || current.signInSessionId !== connection.sessionId) return finish(state, current, 'failed', { error: 'state_changed' });
       checkCooldown(connection);
-      current.phase = 'dispatched'; current.owner = executionOwner;
+      if (!preSend) current.phase = 'dispatched'; current.owner = executionOwner;
       return { operation: current, connection };
     });
   }
@@ -790,7 +792,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     const operation = own((await load({ operationId })).operations, operationId)!;
     if (error instanceof AuthFailure) await holdOff(operation.connectionId, error);
     const code = error instanceof AuthFailure ? error.code : 'local_error';
-    return terminate(operationId, AMBIGUOUS.has(code) ? 'uncertain' : 'failed', AMBIGUOUS.has(code) ? 'lost_response' : code);
+    return await terminate(operationId, AMBIGUOUS.has(code) ? 'uncertain' : 'failed', AMBIGUOUS.has(code) ? 'lost_response' : code);
   }
   async function beginDevice(operationId: string): Promise<SignInStart> {
     const executionOwner = acquireOwner();
@@ -826,7 +828,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   async function pollDevice(operationId: string): Promise<AuthOutcome> {
     const snapshot = await load({ operationId }), found = own(snapshot.operations, operationId)!;
     if (!found.device) throw new AuthFailure('invalid_operation');
-    if (found.expiresAt <= now()) return terminate(operationId, 'expired');
+    if (found.expiresAt <= now()) return await terminate(operationId, 'expired');
     const wait = found.device.nextPollAt - now();
     if (wait > 0) return { ...outcomeOf(snapshot, found), retryAfterMs: wait };
     const executionOwner = acquireOwner();
@@ -834,14 +836,15 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const claim = await claimSignIn(operationId, executionOwner);
       if (!('operation' in claim)) return claim;
       const { operation, connection } = claim, code = await secrets.read(operation.device!.codeRef);
-      if (!code) return terminate(operationId, 'failed', 'missing_credential');
+      if (!code) return await terminate(operationId, 'failed', 'missing_credential');
       const issuedAt = now(), fields: Record<string, string> = { grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: code, session_id: operation.signInSessionId! };
       if (operation.resource) fields.resource = operation.resource;
-      try { return await acceptSignIn(operationId, await tokenRequest(connection.metadata, connection.dpopKeyRef, fields, null), issuedAt); }
+      let token: TokenResponse;
+      try { token = await tokenRequest(connection.metadata, connection.dpopKeyRef, fields, null); }
       catch (error) {
         if (error instanceof AuthFailure && ['authorization_pending', 'slow_down', 'rate_limited'].includes(error.code)) {
           await holdOff(connection.id, error);
-          return transaction({ operationId }, state => {
+          return await transaction({ operationId }, state => {
             const current = own(state.operations, operationId)!;
             if (current.phase !== 'dispatched') return outcomeOf(state, current);
             if (error.code === 'slow_down') current.device!.intervalMs += 5000;
@@ -850,34 +853,43 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
             return { ...outcomeOf(state, current), retryAfterMs: current.device!.nextPollAt - now() };
           });
         }
-        if (error instanceof AuthFailure && ['access_denied', 'expired_token'].includes(error.code)) return terminate(operationId, error.code === 'access_denied' ? 'denied' : 'expired', error.code);
-        return remoteFailure(operationId, error);
+        if (error instanceof AuthFailure && ['access_denied', 'expired_token'].includes(error.code)) return await terminate(operationId, error.code === 'access_denied' ? 'denied' : 'expired', error.code);
+        return await remoteFailure(operationId, error);
       }
+      return await acceptSignIn(operationId, token, issuedAt);
     } finally { releaseOwner(executionOwner); }
   }
   async function continueMediated(operationId: string): Promise<AuthOutcome> {
     const executionOwner = acquireOwner();
     let sensitive: Record<string, string> | null = null;
     try {
-      const claim = await claimSignIn(operationId, executionOwner);
+      const claim = await claimSignIn(operationId, executionOwner, true);
       if (!('operation' in claim)) return claim;
       const { operation, connection } = claim, mediated = connection.metadata.document.auth!.mediated!;
-      if (!options.trustedInput) return terminate(operationId, 'failed', 'trusted_input_required');
+      if (!options.trustedInput) return await terminate(operationId, 'failed', 'trusted_input_required');
       const fields = operation.mediated ? [{ name: 'code', label: 'One-time code', secret: true }] : mediated.fields;
       let values: Record<string, string> | null;
       try { values = await options.trustedInput.collect({ operationId, issuer: connection.issuer, organization: { ...connection.metadata.document.organization }, fields: structuredClone(fields),
         ...(operation.mediated ? { challenge: { id: operation.mediated.challengeId, sentTo: operation.mediated.sentTo, expiresAt: operation.expiresAt } } : {}) }); }
-      catch { return terminate(operationId, 'failed', 'input_unavailable'); }
+      catch { return await terminate(operationId, 'failed', 'input_unavailable'); }
       sensitive = values;
-      if (values === null) return terminate(operationId, 'cancelled');
-      if (!values || Object.keys(values).length !== fields.length || !fields.every(field => Object.hasOwn(values!, field.name) && typeof values![field.name] === 'string' && values![field.name].length > 0 && values![field.name].length <= 4096)) return terminate(operationId, 'failed', 'invalid_input');
+      if (values === null) return await terminate(operationId, 'cancelled');
+      if (!values || Object.keys(values).length !== fields.length || !fields.every(field => Object.hasOwn(values!, field.name) && typeof values![field.name] === 'string' && values![field.name].length > 0 && values![field.name].length <= 4096)) return await terminate(operationId, 'failed', 'invalid_input');
       const endpoint = operation.mediated ? `${mediated.endpoint.replace(/\/$/, '')}/${encodeURIComponent(operation.mediated.challengeId)}` : mediated.endpoint;
       let credential = await credentialFor(connection.id, operation.resource, null), token = await secrets.read(credential.secretRef);
       if (!token) { credential = await credentialFor(connection.id, operation.resource, credential.secretRef); token = await secrets.read(credential.secretRef); }
-      if (!token) return terminate(operationId, 'failed', 'missing_credential');
-      if (connection.sessionId !== (await record(connection.id)).sessionId || now() >= operation.expiresAt) return terminate(operationId, 'expired');
+      if (!token) return await terminate(operationId, 'failed', 'missing_credential');
+      if (connection.sessionId !== (await record(connection.id)).sessionId || now() >= operation.expiresAt) return await terminate(operationId, 'expired');
       let response: Response | undefined, json: Record<string, unknown>;
       const issuedAt = now(), key = await loadDpopKey(connection.dpopKeyRef);
+      const dispatch = await transaction({ operationId }, state => {
+        const current = own(state.operations, operationId)!;
+        if (current.phase !== 'prepared' || current.owner?.id !== executionOwner.id) return false;
+        const live = own(state.connections, current.connectionId)!;
+        if (live.generation !== current.connectionGeneration || live.sessionId !== current.signInSessionId || current.expiresAt <= now()) { finish(state, current, 'cancelled'); return false; }
+        current.phase = 'dispatched'; return true;
+      });
+      if (!dispatch) return (await api.operation(operationId))!;
       try {
         // Bounded nonce retry only; credentials remain exclusively within this trusted call.
         for (let attempt = 0; attempt < 2; attempt++) {
@@ -887,29 +899,30 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
           if (response.status === 401 && attempt === 0 && dpopChallenge(response.headers.get('www-authenticate'))?.error === 'use_dpop_nonce' && response.headers.has('dpop-nonce')) { await response.body?.cancel(); continue; }
           break;
         }
+        if (response!.status === 429 || response!.status === 503) await holdOff(connection.id, responseFailure(response!, 'rate_limited'));
         json = parseJson(await response!.text()) as Record<string, unknown>;
-      } catch { return terminate(operationId, 'uncertain', 'lost_response'); }
+      } catch { return await terminate(operationId, response?.status === 429 ? 'failed' : 'uncertain', response?.status === 429 ? 'rate_limited' : 'lost_response'); }
       const echoed = Object.values(values); for (const name of Object.keys(values)) delete values[name]; values = null;
       if (response!.status !== 200) {
-        const error = responseFailure(response!, response!.status === 429 ? 'rate_limited' : typeof json?.error === 'string' && SAFE_ERRORS.has(json.error) ? json.error : 'token_error');
-        return remoteFailure(operationId, error);
+        const error = responseFailure(response!, response!.status === 429 ? 'rate_limited' : response!.status >= 400 && response!.status < 500 && typeof json?.error === 'string' && SAFE_ERRORS.has(json.error) ? json.error : 'token_error');
+        return await remoteFailure(operationId, error);
       }
       if (json?.status === 'complete') {
-        let result: TokenResponse; try { result = parseTokenResponse(json); } catch { return terminate(operationId, 'uncertain', 'invalid_response'); }
-        return acceptSignIn(operationId, result, issuedAt);
+        let result: TokenResponse; try { result = parseTokenResponse(json); } catch { return await terminate(operationId, 'uncertain', 'invalid_response'); }
+        return await acceptSignIn(operationId, result, issuedAt);
       }
-      if (json?.status === 'failed' || json?.status === 'expired') return terminate(operationId, json.status === 'expired' ? 'expired' : 'denied');
+      if (json?.status === 'failed' || json?.status === 'expired') return await terminate(operationId, json.status === 'expired' ? 'expired' : 'denied');
       const code = json?.code as Record<string, unknown> | undefined, expiresAt = typeof json?.expires_at === 'string' ? Date.parse(json.expires_at) : NaN;
       if (json?.status !== 'code_required' || typeof json.sign_in_id !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(json.sign_in_id) ||
-        (operation.mediated && operation.mediated.challengeId !== json.sign_in_id) || typeof code?.sent_to !== 'string' || code.sent_to.length > 512 || !Number.isFinite(expiresAt) || expiresAt <= now()) return terminate(operationId, 'failed', 'invalid_response');
+        (operation.mediated && operation.mediated.challengeId !== json.sign_in_id) || typeof code?.sent_to !== 'string' || code.sent_to.length > 512 || !Number.isFinite(expiresAt) || expiresAt <= now()) return await terminate(operationId, 'failed', 'invalid_response');
       const sentTo = echoed.some(value => value.length > 2 && (code.sent_to as string).includes(value)) ? 'The company sent a one-time code.' : code.sent_to;
-      return transaction({ operationId }, state => {
+      return await transaction({ operationId }, state => {
         const current = own(state.operations, operationId)!;
         if (current.phase !== 'dispatched') return outcomeOf(state, current);
         current.phase = 'prepared'; delete current.owner; current.expiresAt = Math.min(current.expiresAt, expiresAt);
         current.mediated = { challengeId: json.sign_in_id as string, sentTo }; return outcomeOf(state, current);
       });
-    } catch (error) { return remoteFailure(operationId, error); }
+    } catch (error) { if (!(error instanceof AuthFailure)) throw error; return await remoteFailure(operationId, error); }
     finally { if (sensitive) for (const name of Object.keys(sensitive)) delete sensitive[name]; releaseOwner(executionOwner); }
   }
 
@@ -987,7 +1000,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (requirement.sufficient && !input.force) return { outcome: { operationId: '', status: 'completed', connection: publicConnection(await load({ connectionId }), found), grantedScopes: requirement.grantedScopes, missingScopes: [] } };
       checkCooldown(found);
       if (method === 'mediated' && !options.trustedInput) throw new AuthFailure('trusted_input_required', connectionId);
-      if (method === 'direct' && (typeof redirectUri !== 'string' || !options.redirectUris.includes(redirectUri) || !URL.canParse(redirectUri) || !safeHttps(redirectUri) || !allowedHost(redirectUri, [new URL(clientId).hostname]))) throw new AuthFailure('invalid_redirect', connectionId);
+      if (method === 'direct' && (typeof redirectUri !== 'string' || !options.redirectUris.includes(redirectUri) || !URL.canParse(redirectUri) || !safeHttps(redirectUri) || new URL(redirectUri).hostname !== new URL(clientId).hostname || CALLBACK_PARAMS.some(name => new URL(redirectUri).searchParams.has(name)))) throw new AuthFailure('invalid_redirect', connectionId);
       // The host derives this from its authenticated browser session; a short value would be guessable.
       if (method === 'direct' && (typeof browserBinding !== 'string' || browserBinding.length < 22)) throw new AuthFailure('invalid_binding', connectionId);
       // Ask for the conversation resource up front so the signed-in token is usable there (spec 4.3 "Narrower tokens").
@@ -1177,7 +1190,11 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       let credential = await credentialFor(connectionId, resource, null);
       let nonceRetried = false, renewed = false;
       for (;;) {
-        if (!requiredScopes.every(scope => credential.scopes.includes(scope))) throw new AuthFailure('insufficient_scope', connectionId);
+        if (!requiredScopes.every(scope => credential.scopes.includes(scope))) {
+          const requirement = await api.authorization(connectionId, requiredScopes);
+          if (!renewed && requirement.sufficient) { renewed = true; credential = await renewShared(connectionId, resource); continue; }
+          throw new AuthFailure('insufficient_scope', connectionId);
+        }
         const token = await secrets.read(credential.secretRef);
         if (token === null) {
           // A concurrent renewal replaced and removed this credential; take its successor once.
