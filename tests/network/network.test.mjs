@@ -288,7 +288,7 @@ test('authDocuments inner and outer maps are bounded; live entries still conflic
 
 test('parseJson rejects duplicate member names at any depth and accepts look-alikes', () => {
   assert.deepEqual(wire.parseJson('{"a":1,"b":{"a":2},"c":[{"a":1},{"a":2}],"d":"a\\":1,\\"a"}'), { a: 1, b: { a: 2 }, c: [{ a: 1 }, { a: 2 }], d: 'a":1,"a' });
-  for (const text of ['{"a":1,"a":2}', '{"x":{"a":1,"a":2}}', '[{"a":1,"\u0061":2}]', '{"a":{"b":1},"a":1}']) assert.throws(() => wire.parseJson(text), { field: 'json.duplicate_member' }, text);
+  for (const text of ['{"a":1,"a":2}', '{"x":{"a":1,"a":2}}', '[{"a":1,"\\u0061":2}]', '{"a":{"b":1},"a":1}']) assert.throws(() => wire.parseJson(text), { field: 'json.duplicate_member' }, text);
   assert.throws(() => wire.parseJson('{"a":'), SyntaxError);
 });
 test('canonical sorts keys but keeps array order', () => {
