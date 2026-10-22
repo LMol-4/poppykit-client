@@ -48,11 +48,15 @@ function exact(value: Row, keys: string[]): void { if (value.version !== 1 || Ob
 function object(value: unknown): Row { if (!value || typeof value !== 'object' || Array.isArray(value)) fail('binding_conflict'); return value as Row; }
 function https(value: string): URL { try { return secureUrl(value); } catch { return fail('binding_conflict'); } }
 function onDomain(value: string, domain: string): boolean { const host = https(value).hostname; return host === domain || host.endsWith(`.${domain}`); }
+function publicKey(value: Row): Row {
+  if(value.kty!=='EC'||value.crv!=='P-256'||typeof value.x!=='string'||typeof value.y!=='string'||'d'in value||'k'in value)fail('unavailable');
+  return {kty:value.kty,crv:value.crv,x:value.x,y:value.y,kid:text(value.kid),alg:'ES256',use:'sig'};
+}
 
 export function createProvider(options: ProviderOptions) {
   const { store, cipher } = options, now = options.now ?? Date.now;
   const client = https(options.clientId);
-  if ([options.callbackUrl, options.jwksUri].some(value => https(value).hostname !== client.hostname)) throw new Error('provider metadata endpoints must share client domain');
+  if ([options.callbackUrl, options.jwksUri].some(value => https(value).hostname !== client.hostname) || https(options.callbackUrl).search) throw new Error('provider metadata endpoints must share client domain; callback cannot contain query');
   function auth(tx: ProviderTransaction, credential: string, installationId: string): Row {
     const [enrollmentId, secret, extra] = credential.split('.');
     const row = enrollmentId ? tx.get('enrollment', enrollmentId) : undefined;
@@ -172,7 +176,7 @@ export function createProvider(options: ProviderOptions) {
     },
     callback(callbackUrl: string) {
       const url = new URL(callbackUrl), base = new URL(options.callbackUrl);
-      if (url.origin !== base.origin || url.pathname !== base.pathname || url.hash || [...url.searchParams.keys()].some(key => !['state', 'iss', 'code', 'error'].includes(key)) || ['state', 'iss', 'code', 'error'].some(key => url.searchParams.getAll(key).length > 1)) fail('binding_conflict');
+      if (url.origin !== base.origin || url.pathname !== base.pathname || url.username || url.password || url.hash || [...url.searchParams.keys()].some(key => !['state', 'iss', 'code', 'error'].includes(key)) || ['state', 'iss', 'code', 'error'].some(key => url.searchParams.getAll(key).length > 1)) fail('binding_conflict');
       const state = text(url.searchParams.get('state')), issuer = text(url.searchParams.get('iss'));
       if (!!url.searchParams.get('code') === !!url.searchParams.get('error') || callbackUrl.length > 8192) fail('binding_conflict');
       return store.transaction(tx => {
@@ -217,7 +221,7 @@ export function createProvider(options: ProviderOptions) {
       const headers = { 'cache-control': 'no-store', 'content-type': 'application/json' };
       try {
         if (request.url === options.clientId && request.method === 'GET') return Response.json({ client_id: options.clientId, client_name: options.clientName, jwks_uri: options.jwksUri, redirect_uris: [options.callbackUrl], token_endpoint_auth_method: 'private_key_jwt' }, { headers });
-        if (request.url === options.jwksUri && request.method === 'GET') return Response.json({ keys: options.publishedKeys ? await options.publishedKeys() : [{ ...await options.signer.publicJwk(), kid: options.signer.kid, alg: 'ES256', use: 'sig' }] }, { headers });
+        if (request.url === options.jwksUri && request.method === 'GET') return Response.json({ keys: (options.publishedKeys ? await options.publishedKeys() : [{ ...await options.signer.publicJwk(), kid: options.signer.kid }]).map(publicKey) }, { headers });
         const url = new URL(request.url);
         if (url.origin === new URL(options.callbackUrl).origin && url.pathname === new URL(options.callbackUrl).pathname && request.method === 'GET') { api.callback(request.url); return Response.json({ status: 'received' }, { headers }); }
         if (request.method !== 'POST' || !request.headers.get('content-type')?.startsWith('application/json')) fail('binding_conflict');
