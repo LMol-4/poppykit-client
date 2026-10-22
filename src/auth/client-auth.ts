@@ -1226,13 +1226,15 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         headers.set('authorization', `DPoP ${token}`);
         headers.set('dpop', await proof(await loadDpopKey(credential.dpopKeyRef), request.method, request.url, token));
         // Clone per attempt so the original body stays available for a bounded retry.
-        const response = await transport.fetch(new Request(request.clone(), { headers }), { waitMs });
+        const authorized = new Request(request.clone(), { headers });
+        const streaming = request.headers.get('accept')?.split(',').some(value => value.trim().split(';')[0] === 'text/event-stream');
+        const response = await (streaming && transport.stream ? transport.stream(authorized) : transport.fetch(authorized, { waitMs }));
         rememberNonce(request.url, response);
         if (response.status === 429 || response.status === 503) await holdOff(connectionId, responseFailure(response, 'rate_limited'));
         if (response.status !== 401) return response;
         const error = dpopChallenge(response.headers.get('www-authenticate'))?.error;
-        if (error === 'use_dpop_nonce' && !nonceRetried && response.headers.has('dpop-nonce')) { nonceRetried = true; continue; }
-        if (error === 'invalid_token' && !renewed) { renewed = true; credential = await credentialFor(connectionId, resource, credential.secretRef); continue; }
+        if (error === 'use_dpop_nonce' && !nonceRetried && response.headers.has('dpop-nonce')) { await response.body?.cancel().catch(() => {}); nonceRetried = true; continue; }
+        if (error === 'invalid_token' && !renewed) { await response.body?.cancel().catch(() => {}); renewed = true; credential = await credentialFor(connectionId, resource, credential.secretRef); continue; }
         return response;
       }
     },

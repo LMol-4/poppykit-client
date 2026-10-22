@@ -629,3 +629,31 @@ test('watch handles JSON fallback, explicit history-gap recovery and method-inde
   const events=[];for await(const item of client.watch('c1',{cursor:'old',onHistoryGap:()=>true}))events.push(item.event.id);assert.deepEqual(events,['e1']);
   assert.deepEqual(await client.authorization({...streamEvent('a','authorization'),scope:'read write'}),{id:'c',scopes:['read','write'],methods:['device']});
 });
+
+test('watch drains JSON has_more immediately beyond reconnect budget, including closed history',async()=>{
+  let calls=0,sleeps=0;const client=createConversationClient({endpoint:EP,connectionId:'c',issuer:'i',store:memoryStore(),clock:{now:()=>0},sleep:async()=>sleeps++,authorizedRequest:async()=>{calls++;return json({conversation_id:'c1',events:[streamEvent('e'+calls)],cursor:'e'+calls,has_more:calls<8,status:'closed',responder:'agent'});}});
+  const items=[];for await(const item of client.watch('c1',{maxReconnects:0}))items.push(item.event.id);assert.equal(items.length,8);assert.equal(sleeps,0);
+});
+
+test('watch skips unknown and duplicate events without rewinding durable acks',async()=>{
+  const store=memoryStore(),events=[streamEvent('e1'),streamEvent('e2'),streamEvent('e1'),streamEvent('future','new-kind'),{...streamEvent('e3'),status:'closed'}];
+  const client=createConversationClient({endpoint:EP,connectionId:'c',issuer:'i',store,clock:{now:()=>0},authorizedRequest:async()=>streamResponse(events.map(eventFrame).join(''))});
+  const received=[];for await(const item of client.watch('c1',{consumer:'ui'})){received.push(item.event.id);await item.ack();}assert.deepEqual(received,['e1','e2','e3']);assert.equal(await store.getCheckpoint({connectionId:'c',issuer:'i'},'c1','ui'),'e3');
+});
+
+test('watch reports reconnect exhaustion, and retry/drain backoff is promptly cancellable',async()=>{
+  const client=createConversationClient({endpoint:EP,connectionId:'c',issuer:'i',store:memoryStore(),clock:{now:()=>0},authorizedRequest:async()=>streamResponse('')});
+  await assert.rejects(async()=>{for await(const _ of client.watch('c1',{maxReconnects:0})){}},{code:'reconnect_exhausted'});
+  const abort=new AbortController();let entered;const started=new Promise(resolve=>entered=resolve);
+  const retrying=createConversationClient({endpoint:EP,connectionId:'c',issuer:'i',store:memoryStore(),clock:{now:()=>0},baseDelayMs:60000,maxDelayMs:60000,random:()=>1,authorizedRequest:async request=>{entered(request.signal);return json({error:'rate_limited'},429,{'retry-after':'60'});}});
+  const draining=retrying.drain('c1',{signal:abort.signal});assert.equal((await started).aborted,false);abort.abort();await assert.rejects(draining,{name:'AbortError'});
+});
+
+test('watch backoff cancellation releases immediately and JSON fallback has its own byte budget',async()=>{
+  const abort=new AbortController();let entered;const waiting=new Promise(resolve=>entered=resolve);
+  const client=createConversationClient({endpoint:EP,connectionId:'c',issuer:'i',store:memoryStore(),clock:{now:()=>0},baseDelayMs:60000,maxDelayMs:60000,authorizedRequest:async()=>{entered();return streamResponse('');}});
+  const watching=(async()=>{for await(const _ of client.watch('c1',{signal:abort.signal})){} })();await waiting;await new Promise(resolve=>setTimeout(resolve,1));abort.abort();await assert.rejects(watching,{name:'AbortError'});
+  const huge=createConversationClient({endpoint:EP,connectionId:'c',issuer:'i',store:memoryStore(),clock:{now:()=>0},authorizedRequest:async()=>new Response(' '.repeat(1048577),{headers:{'content-type':'application/json'}})});
+  await assert.rejects(async()=>{for await(const _ of huge.watch('c1')){}},{code:'body_limit'});
+  const frames=[];for await(const frame of parseEventStream(streamResponse(eventFrame({...streamEvent('closed'),status:'closed'}).replaceAll('\n','\r'),1).body))frames.push(frame);assert.equal(frames.length,1);
+});

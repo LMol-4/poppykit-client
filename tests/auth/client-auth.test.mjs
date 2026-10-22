@@ -1611,3 +1611,23 @@ test('revocation Retry-After persists with its cleanup item across restart', asy
   env.company.handle = handle; env.clock.t += 3600000;
   assert.equal((await createClientAuth(env.options).retryCleanup(env.id)).cleanup, 'complete');
 });
+
+import { createConversationClient } from '../../dist/conversation.js';
+import { MemoryConversationStore } from '../../dist/memory.js';
+test('real auth lifecycle selects streaming, cancels nonce failures and sends fresh DPoP',async()=>{
+  const env=await setup(),{connection}=await env.auth.start(env.company.domain);let streams=0,canceled=0;const proofs=[];
+  env.company.behavior.requireNonce=true;
+  env.company.behavior.resourceHandler=()=>new Response('id: final\ndata: {"id":"final","created_at":"2026-10-22T00:00:00Z","type":"state","status":"closed","responder":"agent"}\n\n',{headers:{'content-type':'text/event-stream'}});
+  env.transport.stream=async request=>{streams++;proofs.push(request.headers.get('dpop'));const response=await env.transport.fetch(request);if(response.status===401)return new Response(new ReadableStream({cancel(){canceled++;}}),{status:401,headers:response.headers});return response;};
+  const target=await env.auth.target(connection.id),store=new MemoryConversationStore();
+  const client=createConversationClient({...target,connectionId:connection.id,store,clock:{now:()=>env.clock.t},authorizedRequest:request=>env.auth.authorizedFetch(connection.id,request,target)});
+  const events=[];for await(const item of client.watch('c1'))events.push(item.event.id);
+  assert.deepEqual(events,['final']);assert.equal(streams,2);assert.equal(canceled,1);assert.notEqual(proofs[0],proofs[1]);
+});
+for(const method of ['device','mediated'])test(`conversation errors use real ${method}-only authorization lifecycle`,async()=>{
+  const env=await setup({method});env.options.trustedInput={collect:async()=>({password:'private-password'})};const auth=createClientAuth(env.options),{connection}=await auth.start(env.company.domain),target=await auth.target(connection.id);
+  env.company.behavior.resourceHandler=(_request,bound)=>bound.account?Response.json({conversation_id:'c1',events:[],cursor:null,has_more:false,status:'idle',responder:'agent'}):Response.json({error:'sign_in_required'},{status:403,headers:{'www-authenticate':'DPoP error="sign_in_required", scope="poppy:read"'}});
+  const client=createConversationClient({...target,connectionId:connection.id,store:new MemoryConversationStore(),clock:{now:()=>env.clock.t},authorizedRequest:request=>auth.authorizedFetch(connection.id,request,target),authorization:(id,scopes)=>auth.authorization(id,scopes)});
+  let error;try{await client.read('c1');}catch(value){error=value;}const requirement=await client.authorization(error);assert.deepEqual(requirement.methods,[{method,scopes:['poppy:read','poppy:write']}]);assert.deepEqual(requirement.requiredScopes,['poppy:read']);
+  const begun=await auth.beginSignIn(connection.id,{method,scopes:requirement.requiredScopes});if(method==='device'){env.clock.t+=5000;await auth.continueSignIn(begun.outcome.operationId);}assert.equal((await client.read('c1')).conversation_id,'c1');
+});

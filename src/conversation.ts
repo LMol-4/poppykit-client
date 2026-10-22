@@ -1,7 +1,8 @@
+import type { AuthorizationRequirement } from './auth/client-auth.js';
 import { parseEventStream } from './protocol/sse.js';
 import type { ConversationEvent } from './protocol/wire.js';
 import type { ConversationStore } from './conversation-store.js';
-import { dpopChallenge } from './auth/challenge.js';
+import { authChallenge } from './auth/challenge.js';
 import { secureUrl, TransportError } from './network/transport.js';
 import { canonical, id as parseId, parseJson, parseConversationRequest, parseConversationState, parseEventPage, parseMessage, parseProtocolError, retryAfterMilliseconds, ValidationError } from './protocol/wire.js';
 import type { ConversationRequest, ConversationState, EventPage, Message } from './protocol/wire.js';
@@ -11,7 +12,7 @@ export interface OutboundRecord {
   phase: 'pending' | 'accepted' | 'rejected'; read?: ReadParams; response?: ConversationState | EventPage; error?: { code: string; status: number; conversationId?: string };
 }
 // POST ?wait/?cursor, persisted with the record so a retry repeats the original read parameters (spec 7.3).
-export interface ReadParams { wait?: number; cursor?: string }
+export interface ReadParams { wait?: number; cursor?: string; signal?: AbortSignal }
 // A named consumer's durable checkpoint; only ack() moves it.
 export interface ConsumerCheckpoint { connectionId: string; issuer: string; conversationId: string; name: string; cursor: string }
 export interface ConversationClientState { version: 1; outbound: OutboundRecord[]; consumers: ConsumerCheckpoint[] }
@@ -20,7 +21,8 @@ export const initialConversationClientState = (): ConversationClientState => ({ 
 // Only known spec codes (7.13, 6) reach messages and callers; a company-chosen string never does.
 const knownCodes = new Set(['conversation_not_found', 'conversation_closed', 'direct_conversation_open', 'message_id_conflict', 'invalid_cursor', 'cursor_expired', 'invalid_request', 'extension_required', 'rate_limited', 'invalid_token', 'invalid_dpop_proof', 'use_dpop_nonce', 'sign_in_required', 'insufficient_scope']);
 export class ConversationError extends Error {
-  constructor(readonly code: string, readonly status?: number, readonly retryAfterMs?: number, readonly scope?: string, readonly conversationId?: string, readonly extension?: string) { super(`Conversation ${code}`); this.name = 'ConversationError'; }
+  constructor(readonly code: string, readonly status?: number, readonly retryAfterMs?: number, readonly scope?: string, readonly conversationId?: string, readonly extension?: string, readonly extensions: string[] = extension ? [extension] : []) { super(`Conversation ${code}`); this.name = 'ConversationError'; }
+  get requiredScopes(): string[] { return this.scope?.split(' ').filter(Boolean) ?? []; }
 }
 export interface ConversationClientOptions {
   authorizedRequest(request: Request): Promise<Response>;
@@ -29,7 +31,7 @@ export interface ConversationClientOptions {
   clock: { now(): number };
   newId?: () => string; sleep?: (ms: number) => Promise<void>; random?: () => number;
   /** Optional safe UI hook supplied by the single authentication lifecycle. */
-  authorization?: (connectionId: string, scopes: string[]) => Promise<unknown>;
+  authorization?: (connectionId: string, scopes: string[]) => Promise<AuthorizationRequirement>;
   maxAttempts?: number; baseDelayMs?: number; maxDelayMs?: number; maxPages?: number;
 }
 export interface ReadOptions extends ReadParams { consumer?: string; signal?: AbortSignal }
@@ -56,7 +58,9 @@ export function createConversationClient(options: ConversationClientOptions) {
   async function call(make: () => Request): Promise<Response> {
     for (let attempt = 1; ; attempt++) {
       let response: Response | undefined;
-      try { response = await authorizedRequest(make()); } catch (error) { // A renewal's lost connection is an AuthFailure('transport_error'); it is as retryable as a lost request.
+      const request = make(); request.signal.throwIfAborted();
+      try { response = await authorizedRequest(request); } catch (error) { // A renewal's lost connection is an AuthFailure('transport_error'); it is as retryable as a lost request.
+        request.signal.throwIfAborted();
         if (!(error instanceof TransportError || (error as { code?: unknown })?.code === 'transport_error')) throw error; if (attempt >= maxAttempts) throw new ConversationError('network_error'); }
       let delay = Math.min(maxDelayMs, random() * baseDelayMs * 2 ** (attempt - 1)); // full jitter
       if (response) {
@@ -65,23 +69,40 @@ export function createConversationClient(options: ConversationClientOptions) {
         // A very long Retry-After would stall the caller; surface it instead of waiting.
         if (attempt >= maxAttempts || delay > maxDelayMs) return response;
       }
-      await sleep(delay);
+      await response?.body?.cancel().catch(() => {});
+      await pause(delay,request.signal);
     }
+  }
+  async function responseText(response: Response): Promise<string> {
+    if(!response.body)return '';
+    const reader=response.body.getReader(),decoder=new TextDecoder('utf-8',{fatal:true});let text='',bytes=0;
+    try { for(;;){const part=await reader.read();if(part.done)break;bytes+=part.value.byteLength;if(bytes>1048576)throw new ConversationError('body_limit');text+=decoder.decode(part.value,{stream:true});}return text+decoder.decode(); }
+    finally { await reader.cancel().catch(()=>{});reader.releaseLock(); }
   }
   async function failure(response: Response): Promise<ConversationError> {
-    const challenge = dpopChallenge(response.headers.get('www-authenticate'));
-    let code = '', scope = challenge?.scope, conversationId: string | undefined, extension: string | undefined;
-    try { const body = parseProtocolError(parseJson(await response.text())); code = body.error; extension = body.extension ?? (challenge as { extension?: string } | undefined)?.extension; if (typeof body.scope === 'string') scope = body.scope; if (code === 'direct_conversation_open') conversationId = body.conversation_id; } catch { /* non-protocol body */ }
-    if (!knownCodes.has(code)) {
-      // Token errors (spec 6) arrive in WWW-Authenticate: DPoP error="...", scope="...".
-      const challenge = dpopChallenge(response.headers.get('www-authenticate'));
-      code = challenge?.error ?? '';
-      scope ??= challenge?.scope;
-    }
-    if (!knownCodes.has(code)) code = 'http_error';
-    return new ConversationError(code, response.status, retryAfterMilliseconds(response.headers.get('retry-after'), clock.now()), scope, conversationId, extension);
+    let body: unknown;
+    try { body = parseJson(await responseText(response)); } catch { /* The header can carry the complete challenge. */ }
+    const challenge = authChallenge(response.headers.get('www-authenticate'),body);
+    const raw = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
+    let code = challenge.error ?? (typeof raw.error === 'string' && knownCodes.has(raw.error) ? raw.error : 'http_error');
+    let conversationId: string | undefined;
+    try { if(challenge.conversationId)conversationId=parseId(challenge.conversationId,'conversation_id'); } catch { /* Invalid peer detail is never used as a destination. */ }
+    if(code==='direct_conversation_open'&&!conversationId)code='http_error';
+    return new ConversationError(code,response.status,retryAfterMilliseconds(response.headers.get('retry-after'),clock.now()),challenge.requiredScopes.join(' ')||undefined,conversationId,challenge.extensions[0],challenge.extensions);
   }
 
+  async function pause(ms: number, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    if (!signal) return sleep(ms);
+    await new Promise<void>((resolve,reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const done = () => { clearTimeout(timer); signal.removeEventListener('abort',abort); resolve(); };
+      const abort = () => { clearTimeout(timer); signal.removeEventListener('abort',abort); reject(signal.reason); };
+      signal.addEventListener('abort',abort,{once:true});
+      if(options.sleep) options.sleep(ms).then(done,error=>{signal.removeEventListener('abort',abort);reject(error);}); else timer=setTimeout(done,ms);
+      if(signal.aborted)abort();
+    });
+  }
   // Pages handed to a consumer in this process; the checkpoint moves only when one of them is acked.
   const delivered = new WeakMap<EventPage, { conversationId: string; consumer: string; chain: (string | undefined)[] }>();
   async function checkpoint(conversationId: string, consumer: string): Promise<string | undefined> {
@@ -89,7 +110,7 @@ export function createConversationClient(options: ConversationClientOptions) {
     return store.getCheckpoint(key, conversationId, consumer);
   }
 
-  async function dispatch(id: string): Promise<ConversationState> {
+  async function dispatch(id: string, signal?: AbortSignal): Promise<ConversationState> {
     parseId(id, 'message.id');
     const record = await store.getOutbound(key, id);
     if (!record) throw new ConversationError('unknown_operation');
@@ -99,11 +120,11 @@ export function createConversationClient(options: ConversationClientOptions) {
     const url = new URL(record.target === null ? endpoint : conversationUrl(record.target, 'messages'));
     if (record.read?.cursor !== undefined) url.searchParams.set('cursor', record.read.cursor);
     if (record.read?.wait !== undefined) url.searchParams.set('wait', String(record.read.wait));
-    const response = await call(() => new Request(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(record.request) }));
+    const response = await call(() => new Request(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(record.request), signal }));
     if (response.status >= 200 && response.status < 300) {
       let state: ConversationState | EventPage;
       try {
-        const body = parseJson(await response.text());
+        const body = parseJson(await responseText(response));
         // A 2xx means accepted; a company that ignores wait answers with a plain state.
         state = body && typeof body === 'object' && ['events', 'cursor', 'has_more'].some(key => key in body) ? parseEventPage(body, record.read?.cursor) : parseConversationState(body);
       } catch { throw new ConversationError('invalid_response', response.status); }
@@ -123,31 +144,33 @@ export function createConversationClient(options: ConversationClientOptions) {
     if (read.cursor !== undefined) { parseId(read.cursor, 'cursor'); if (read.wait === undefined) throw new ConversationError('invalid_request'); } // spec 7.3 adds cursor alongside wait
     const message = parseMessage({ ...input, id: input.id ?? newId() }) as Message;
     const request = parseConversationRequest({ message, ...(parent === undefined ? {} : { parent_conversation_id: parent }) });
+    if(Buffer.byteLength(JSON.stringify(request))>1048576)throw new ConversationError('body_limit');
     const fingerprint = canonical({ target, request });
     const existing = await store.prepareOutbound(key, { connectionId, issuer, endpoint, id: message.id, target, request, fingerprint, phase: 'pending', ...(read.wait === undefined && read.cursor === undefined ? {} : { read: { ...(read.wait === undefined ? {} : { wait: read.wait }), ...(read.cursor === undefined ? {} : { cursor: read.cursor }) } }) });
     if (existing.fingerprint !== fingerprint || existing.endpoint !== endpoint) throw new ConversationError('message_id_conflict');
-    return { ...(await dispatch(message.id)), messageId: message.id };
+    return { ...(await dispatch(message.id,read.signal)), messageId: message.id };
   }
 
-  async function simplePost(conversationId: string, tail: 'handoff' | 'close'): Promise<ConversationState> {
+  async function simplePost(conversationId: string, tail: 'handoff' | 'close', signal?: AbortSignal): Promise<ConversationState> {
     parseId(conversationId, 'conversation_id');
-    const response = await call(() => new Request(conversationUrl(conversationId, tail), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }));
+    const response = await call(() => new Request(conversationUrl(conversationId, tail), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}', signal }));
     if (!response.ok) throw await failure(response);
-    try { return parseConversationState(parseJson(await response.text())); } catch { throw new ConversationError('invalid_response', response.status); }
+    try { return parseConversationState(parseJson(await responseText(response))); } catch { throw new ConversationError('invalid_response', response.status); }
   }
 
   const client = {
-    async authorization(event: ConversationEvent): Promise<unknown> {
-      if (event.type !== 'authorization' || !options.authorization) throw new ConversationError('authorization_unavailable');
-      return options.authorization(connectionId,typeof event.scope === 'string' ? event.scope.split(' ').filter(Boolean) : []);
+    async authorization(event: ConversationEvent | ConversationError): Promise<AuthorizationRequirement> {
+      if (!(event instanceof ConversationError) && event.type !== 'authorization' || !options.authorization) throw new ConversationError('authorization_unavailable');
+      return options.authorization(connectionId,event instanceof ConversationError ? event.requiredScopes : typeof event.scope === 'string' ? event.scope.split(' ').filter(Boolean) : []);
     },
     async *watch(conversationId: string, opts: WatchOptions = {}): AsyncGenerator<WatchedEvent> {
       parseId(conversationId,'conversation_id');
       if(opts.consumer !== undefined && opts.cursor !== undefined)throw new ConversationError('invalid_request');
       let cursor = opts.lastEventId ?? (opts.consumer === undefined ? opts.cursor : await checkpoint(conversationId,opts.consumer));
-      let reconnects=0, attempts=0;
+      let reconnects=0, attempts=0, pages=0, recovered=false;
       const maxReconnects=opts.maxReconnects ?? 4;
       if(!Number.isSafeInteger(maxReconnects)||maxReconnects<0)throw new ConversationError('invalid_request');
+      const knownEvents = new Set(['message','state','authorization','user_requested','direct_opened','direct_closed']);
       const seen = new Set<string>(); // Bounded per watch; durable consumers ack explicitly.
       const eventAck = (event: ConversationEvent, previous: string | undefined): WatchedEvent => ({event, async ack() { if(opts.consumer!==undefined) await store.advanceCheckpoint(key,{connectionId,issuer,conversationId,name:opts.consumer,cursor:event.id},[previous]); }});
       for (;;) {
@@ -156,9 +179,9 @@ export function createConversationClient(options: ConversationClientOptions) {
         const headers=new Headers({accept:'text/event-stream'}); if(cursor!==undefined)headers.set('last-event-id',cursor);
         let response: Response;
         try { response=await authorizedRequest(new Request(url,{headers,signal:opts.signal})); }
-        catch(error){opts.onPartial?.(null);opts.signal?.throwIfAborted();if(!(error instanceof TransportError)||reconnects++>=maxReconnects)throw error;await sleep(Math.min(maxDelayMs,baseDelayMs*2**attempts++));continue;}
-        if(!response.ok){const error=await failure(response);if(error.code==='cursor_expired'&&await opts.onHistoryGap?.()){cursor=undefined;opts.cursor=undefined;seen.clear();if(opts.consumer!==undefined)await client.resetConsumer(conversationId,opts.consumer);continue;}throw error;}
-        let closed=false;
+        catch(error){opts.onPartial?.(null);opts.signal?.throwIfAborted();if(!(error instanceof TransportError)||reconnects++>=maxReconnects)throw error;await pause(Math.min(maxDelayMs,baseDelayMs*2**attempts++),opts.signal);continue;}
+        if(!response.ok){const error=await failure(response);if(error.code==='cursor_expired'&&!recovered&&await opts.onHistoryGap?.()){recovered=true;cursor=undefined;opts.cursor=undefined;seen.clear();if(opts.consumer!==undefined)await client.resetConsumer(conversationId,opts.consumer);continue;}throw error;}
+        let closed=false, more=false;
         try {
           if(response.headers.get('content-type')?.split(';')[0].trim()==='text/event-stream') {
             if(!response.body)throw new ConversationError('invalid_response');
@@ -166,17 +189,24 @@ export function createConversationClient(options: ConversationClientOptions) {
             for await(const frame of parseEventStream(response.body,{signal:opts.signal})){
               if(frame.kind==='delta'){partialBytes+=Buffer.byteLength(frame.text);if(partialBytes>1048576)throw new ConversationError('body_limit');opts.onPartial?.({messageId:frame.messageId,text:frame.text});continue;}
               const event=frame.event,previous=cursor;
-              if(!seen.has(event.id)){if(seen.size>=10000)throw new ConversationError('too_many_events');seen.add(event.id);if(event.type==='message')opts.onPartial?.(null);yield eventAck(event,previous);}
+              if(seen.has(event.id))continue;
+              if(seen.size>=10000)throw new ConversationError('too_many_events');seen.add(event.id);if(event.type==='message')opts.onPartial?.(null);if(knownEvents.has(event.type))yield eventAck(event,previous);else await eventAck(event,previous).ack();
               cursor=event.id;closed=event.type==='state'&&event.status==='closed';
             }
           } else {
-            const page=parseEventPage(parseJson(await response.text()),cursor);
-            for(const event of page.events){const previous=cursor;if(!seen.has(event.id)){if(seen.size>=10000)throw new ConversationError('too_many_events');seen.add(event.id);yield eventAck(event,previous);}cursor=event.id;}
-            closed=page.status==='closed';
+            if(++pages>maxPages)throw new ConversationError('too_many_pages');
+            const beforePage=cursor;
+            const page=parseEventPage(parseJson(await responseText(response)),cursor);
+            more=page.has_more;
+            for(const event of page.events){if(seen.has(event.id))continue;const previous=cursor;if(seen.size>=10000)throw new ConversationError('too_many_events');seen.add(event.id);if(knownEvents.has(event.type))yield eventAck(event,previous);else await eventAck(event,previous).ack();cursor=event.id;}
+            closed=page.status==='closed'&&!more;
+            if(more&&(!page.events.length||page.cursor===beforePage))throw new ConversationError('invalid_response');
           }
-        } catch(error) { opts.signal?.throwIfAborted(); if(error instanceof ValidationError || error instanceof ConversationError)throw error; } finally { opts.onPartial?.(null); await response.body?.cancel().catch(()=>{}); }
-        if(closed||reconnects++>=maxReconnects)return;
-        opts.signal?.throwIfAborted(); await sleep(Math.min(maxDelayMs,baseDelayMs*2**attempts++));
+        } catch(error) { opts.signal?.throwIfAborted(); if(!(error instanceof TransportError || ['ECONNRESET','ERR_STREAM_PREMATURE_CLOSE'].includes((error as {code?:string})?.code ?? '')))throw error; } finally { opts.onPartial?.(null); await response.body?.cancel().catch(()=>{}); }
+        if(closed)return;
+        if(more)continue;
+        if(reconnects++>=maxReconnects)throw new ConversationError('reconnect_exhausted');
+        opts.signal?.throwIfAborted(); await pause(Math.min(maxDelayMs,baseDelayMs*2**attempts++),opts.signal);
       }
     },
     start: (message: OutboundInput, opts: ReadParams & { parentConversationId?: string } = {}) => submit(message, null, opts, opts.parentConversationId),
@@ -184,8 +214,8 @@ export function createConversationClient(options: ConversationClientOptions) {
     /** Re-dispatch a pending outbound operation with its original ID and content. */
     retry: dispatch,
     async operation(messageId: string): Promise<OutboundRecord | undefined> { return store.getOutbound(key, messageId); },
-    handoff: (conversationId: string) => simplePost(conversationId, 'handoff'),
-    close: (conversationId: string) => simplePost(conversationId, 'close'),
+    handoff: (conversationId: string, opts: { signal?: AbortSignal } = {}) => simplePost(conversationId, 'handoff',opts.signal),
+    close: (conversationId: string, opts: { signal?: AbortSignal } = {}) => simplePost(conversationId, 'close',opts.signal),
     /** Reads one whole page. Explicit `cursor`, or the checkpoint of a named `consumer` (not both). Never acknowledges. */
     async read(conversationId: string, opts: ReadOptions = {}): Promise<EventPage> {
       parseId(conversationId, 'conversation_id');
@@ -197,7 +227,7 @@ export function createConversationClient(options: ConversationClientOptions) {
       const response = await call(() => new Request(url, { method: 'GET', signal: opts.signal }));
       if (!response.ok) throw await failure(response); // cursor_expired (410) is the explicit history gap: see resetConsumer
       let page: EventPage;
-      try { page = parseEventPage(parseJson(await response.text()), cursor); } catch { throw new ConversationError('invalid_response', response.status); }
+      try { page = parseEventPage(parseJson(await responseText(response)), cursor); } catch { throw new ConversationError('invalid_response', response.status); }
       if (opts.consumer !== undefined) delivered.set(page, { conversationId, consumer: opts.consumer, chain: [cursor] });
       return page;
     },
@@ -208,7 +238,7 @@ export function createConversationClient(options: ConversationClientOptions) {
       let cursor = opts.consumer === undefined ? opts.cursor : await checkpoint(conversationId, opts.consumer);
       const chain = [cursor]; // checkpoints this page may legitimately advance from
       for (; pages.length < maxPages; ) {
-        const page = await client.read(conversationId, { cursor, wait: pages.length ? 0 : opts.wait });
+        const page = await client.read(conversationId, { cursor, wait: pages.length ? 0 : opts.wait, signal: opts.signal });
         if (opts.consumer !== undefined) delivered.set(page, { conversationId, consumer: opts.consumer, chain: [...chain] });
         pages.push(page);
         if (!page.has_more) return pages;

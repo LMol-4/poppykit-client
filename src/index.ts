@@ -14,3 +14,7 @@ export type { OperationOwner } from './auth/ownership.js';
 export type { WatchOptions, WatchedEvent } from './conversation.js';
 export { parseEventStream } from './protocol/sse.js';
 export type { StreamFrame } from './protocol/sse.js';
+
+export type { AssertionRequest, AssertionProvider, ProviderIdentity, TrustedInput, SignInMethod, SignInInput, SignInStart, AuthorizationRequirement } from './auth/client-auth.js';
+export { authChallenge } from './auth/challenge.js';
+export type { AuthChallenge } from './auth/challenge.js';
