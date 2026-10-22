@@ -1,5 +1,6 @@
 import { dpopChallenge } from './auth/challenge.js';
-import { id as parseId, parseConversationRequest, parseConversationState, parseEventPage, parseMessage, parseProtocolError, retryAfterMilliseconds } from './protocol/wire.js';
+import { TransportError } from './network/transport.js';
+import { canonical, id as parseId, parseJson, parseConversationRequest, parseConversationState, parseEventPage, parseMessage, parseProtocolError, retryAfterMilliseconds } from './protocol/wire.js';
 import type { ConversationRequest, ConversationState, EventPage, Message } from './protocol/wire.js';
 
 export interface StateStore<State> { read(): Promise<State>; transaction<Result>(change: (draft: State) => Result): Promise<Result> }
@@ -24,40 +25,33 @@ export interface ConversationClientOptions {
   endpoint: string; connectionId: string; issuer: string;
   store: StateStore<ConversationClientState>;
   clock: { now(): number };
-  newId?: () => string; sleep?: (ms: number) => Promise<void>;
+  newId?: () => string; sleep?: (ms: number) => Promise<void>; random?: () => number;
   maxAttempts?: number; baseDelayMs?: number; maxDelayMs?: number; maxPages?: number; keepCompleted?: number;
 }
 export interface ReadOptions extends ReadParams { consumer?: string }
 export type OutboundInput = Omit<Message, 'id'> & { id?: string };
 
-// Sorted keys so structural equality ignores key order but keeps arrays, text and unknown members exact.
-function canonical(value: unknown): string {
-  return walk(JSON.parse(JSON.stringify(value))); // same shape as the wire (drops undefined members)
-}
-function walk(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(walk).join(',')}]`;
-  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${walk((value as Record<string, unknown>)[key])}`).join(',')}}`;
-  return JSON.stringify(value);
-}
 // A definite rejection will not change on retry; anything else (auth, 408, 429, 5xx) leaves the operation retryable.
 const definite = (status: number) => status >= 400 && status < 500 && ![401, 403, 408, 429].includes(status);
 
 export function createConversationClient(options: ConversationClientOptions) {
   const { authorizedRequest, store, clock, connectionId, issuer } = options;
   const endpoint = options.endpoint.replace(/\/+$/, '');
-  const newId = options.newId ?? (() => `msg_${crypto.randomUUID().replaceAll('-', '')}`);
+  const newId = options.newId ?? (() => `msg_${Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('base64url')}`); // 128 random bits
+  const random = options.random ?? Math.random;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
   const maxAttempts = options.maxAttempts ?? 4, baseDelayMs = options.baseDelayMs ?? 250, maxDelayMs = options.maxDelayMs ?? 60000, maxPages = options.maxPages ?? 1000, keepCompleted = options.keepCompleted ?? 100;
   const mine = (r: { connectionId: string; issuer: string }) => r.connectionId === connectionId && r.issuer === issuer;
   // Validated IDs only: '.' and '..' survive encodeURIComponent and would escape the endpoint.
   const conversationUrl = (id: string, tail: string) => `${endpoint}/${parseId(id, 'conversation_id')}/${tail}`;
 
-  // Idempotent by construction: callers reuse the same message ID, so retrying network errors, 429 and 5xx is safe.
+  // Idempotent by construction: callers reuse the same message ID, so retrying transport failures, 429 and 5xx is safe.
+  // Auth failures (including a rate-limited token renewal and its retryAfterMs) are not ours to retry and propagate unchanged.
   async function call(make: () => Request): Promise<Response> {
     for (let attempt = 1; ; attempt++) {
       let response: Response | undefined;
-      try { response = await authorizedRequest(make()); } catch { if (attempt >= maxAttempts) throw new ConversationError('network_error'); }
-      let delay = baseDelayMs * 2 ** (attempt - 1);
+      try { response = await authorizedRequest(make()); } catch (error) { if (!(error instanceof TransportError)) throw error; if (attempt >= maxAttempts) throw new ConversationError('network_error'); }
+      let delay = Math.min(maxDelayMs, random() * baseDelayMs * 2 ** (attempt - 1)); // full jitter
       if (response) {
         if (response.status !== 429 && response.status < 500) return response;
         delay = retryAfterMilliseconds(response.headers.get('retry-after'), clock.now()) ?? delay;
@@ -69,7 +63,7 @@ export function createConversationClient(options: ConversationClientOptions) {
   }
   async function failure(response: Response): Promise<ConversationError> {
     let code = '', scope: string | undefined, conversationId: string | undefined;
-    try { const body = parseProtocolError(await response.json()); code = body.error; if (code === 'direct_conversation_open') conversationId = body.conversation_id; } catch { /* non-protocol body */ }
+    try { const body = parseProtocolError(parseJson(await response.text())); code = body.error; if (code === 'direct_conversation_open') conversationId = body.conversation_id; } catch { /* non-protocol body */ }
     if (!knownCodes.has(code)) {
       // Token errors (spec 6) arrive in WWW-Authenticate: DPoP error="...", scope="...".
       const challenge = dpopChallenge(response.headers.get('www-authenticate'));
@@ -100,7 +94,7 @@ export function createConversationClient(options: ConversationClientOptions) {
     if (response.status >= 200 && response.status < 300) {
       let state: ConversationState | EventPage;
       try {
-        const body = await response.json();
+        const body = parseJson(await response.text());
         // A 2xx means accepted; a company that ignores wait answers with a plain state.
         try { state = record.read ? parseEventPage(body, record.read.cursor) : parseConversationState(body); } catch { state = parseConversationState(body); }
       } catch { throw new ConversationError('invalid_response', response.status); }
@@ -137,7 +131,7 @@ export function createConversationClient(options: ConversationClientOptions) {
     parseId(conversationId, 'conversation_id');
     const response = await call(() => new Request(conversationUrl(conversationId, tail), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }));
     if (!response.ok) throw await failure(response);
-    try { return parseConversationState(await response.json()); } catch { throw new ConversationError('invalid_response', response.status); }
+    try { return parseConversationState(parseJson(await response.text())); } catch { throw new ConversationError('invalid_response', response.status); }
   }
 
   const client = {
@@ -159,7 +153,7 @@ export function createConversationClient(options: ConversationClientOptions) {
       const response = await call(() => new Request(url, { method: 'GET' }));
       if (!response.ok) throw await failure(response); // cursor_expired (410) is the explicit history gap: see resetConsumer
       let page: EventPage;
-      try { page = parseEventPage(await response.json(), cursor); } catch { throw new ConversationError('invalid_response', response.status); }
+      try { page = parseEventPage(parseJson(await response.text()), cursor); } catch { throw new ConversationError('invalid_response', response.status); }
       if (opts.consumer !== undefined) delivered.set(page, { conversationId, consumer: opts.consumer, chain: [cursor] });
       return page;
     },
