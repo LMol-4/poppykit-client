@@ -396,3 +396,10 @@ test('invalidating pending metadata preserves the global active-fetch cap',async
   const resolver=createMetadataResolver({async fetch(){calls++;entered();await gate;return Response.json(value);}},{maxConcurrentFetches:1});
   const first=resolver.resolveClient(uri);await started;resolver.invalidate(uri);await assert.rejects(resolver.resolveClient(uri),{field:'metadata.rate_limited'});assert.equal(calls,1);release();await first;await resolver.resolveClient(uri);assert.equal(calls,2);
 });
+
+test('close during DNS prevents a resumed lookup from opening any connection',async()=>{
+  const original=dns.lookup;let release,entered;const ready=new Promise(resolve=>entered=resolve);let connects=0;const connect=tls.connect;
+  dns.lookup=(_host,_opts,callback)=>{release=()=>callback(null,[{address:'8.8.8.8',family:4}]);entered();};tls.connect=(...args)=>{connects++;return connect(...args);};syncBuiltinESMExports();
+  const transport=createNodeTransport();
+  try{const pending=transport.fetch(new Request('https://late.example/'));await ready;transport.close();release();await assert.rejects(pending,{code:'closed'});assert.equal(connects,0);}finally{dns.lookup=original;tls.connect=connect;syncBuiltinESMExports();transport.close();}
+});

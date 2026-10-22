@@ -58,6 +58,7 @@ export function createNodeTransport(options: NetworkOptions = {}): HttpTransport
   const pools = new Map<string, { agent: Agent; active: number; origin: string; mode: string }>();
   let active = 0, closed = false;
   const connecting = new Set<TLSSocket>();
+  const shutdown = new AbortController();
   const allowed = (hostname: string, address: string) => isPublicAddress(address) || !!options.localExceptions?.some(entry => entry.hostname.toLowerCase() === hostname.toLowerCase() && entry.addresses.some(ip => normalizedAddress(ip) === normalizedAddress(address)));
   async function execute(request: Request, settings: { mode?: 'endpoint' | 'discovery'; waitMs?: number } = {}, streaming = false): Promise<Response> {
     if (closed) throw new TransportError('closed');
@@ -66,7 +67,7 @@ export function createNodeTransport(options: NetworkOptions = {}): HttpTransport
     const timeoutMs = streaming ? limits.maxStreamMs : (discovery ? Math.min(limits.timeoutMs, 5000) : limits.timeoutMs) + (settings.waitMs ?? 0);
     if (!Number.isSafeInteger(settings.waitMs ?? 0) || (settings.waitMs ?? 0) < 0 || timeoutMs > 2147483647) throw new TypeError('Invalid transport wait');
     active++;
-    const controller = new AbortController(), signal = AbortSignal.any([request.signal, controller.signal]);
+    const controller = new AbortController(), signal = AbortSignal.any([request.signal, controller.signal, shutdown.signal]);
     const timer = setTimeout(() => controller.abort(new TransportError('timeout')), timeoutMs);
     let transferred = false, finished = false;
     const finish = () => { if (!finished) { finished = true; active--; clearTimeout(timer); } };
@@ -160,8 +161,8 @@ export function createNodeTransport(options: NetworkOptions = {}): HttpTransport
         const location = response.headers.get('location'); if (!location) return response;
         url = secureUrl(new URL(location, url).href);
       }
-    } catch (error) { if (error instanceof TransportError) throw error; throw new TransportError(controller.signal.aborted ? 'timeout' : 'network_error'); }
+    } catch (error) { if (closed) throw new TransportError('closed'); if (error instanceof TransportError) throw error; throw new TransportError(controller.signal.aborted ? 'timeout' : 'network_error'); }
     finally { if (!transferred) finish(); }
   }
-  return { fetch: (request, settings) => execute(request, settings), stream: request => execute(request, {}, true), close() { closed = true; for (const socket of connecting) socket.destroy(); connecting.clear(); for (const pool of pools.values()) pool.agent.destroy(); pools.clear(); } };
+  return { fetch: (request, settings) => execute(request, settings), stream: request => execute(request, {}, true), close() { closed = true; shutdown.abort(new TransportError('closed')); for (const socket of connecting) socket.destroy(); connecting.clear(); for (const pool of pools.values()) pool.agent.destroy(); pools.clear(); } };
 }
