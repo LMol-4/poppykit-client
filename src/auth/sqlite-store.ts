@@ -92,4 +92,3 @@ export class SqliteAuthStore implements AuthStore {
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 }
-

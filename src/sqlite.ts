@@ -60,4 +60,3 @@ export class SqliteConversationStore implements ConversationStore {
     this.db.prepare('DELETE FROM checkpoints WHERE connection=? AND issuer=? AND endpoint=? AND conversation=? AND name=?').run(key.connectionId, key.issuer, key.endpoint, conversation, name);
   }
 }
-
