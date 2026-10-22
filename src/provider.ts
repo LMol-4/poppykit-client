@@ -82,6 +82,10 @@ export function createProvider(options: ProviderOptions) {
     if (starts.length >= 60) throw new ProviderError('rate_limited', starts[0]! + 60000);
     starts.push(now()); tx.put('enrollment', enrollment.enrollmentId, { ...enrollment, starts });
   }
+  function authorizeCompany(credential: string, input: Row): void {
+    const domain = text(input.domain); text(input.issuer);
+    store.transaction(tx => { const enrollment = auth(tx, credential, text(input.installationId)); if (!enrollment.allowedCompanies.includes(domain)) fail('unauthorized'); });
+  }
   const api = {
     async enroll(request: Request, input: Row) {
       exact(input, ['version', 'installationId', 'idempotencyKey']);
@@ -101,6 +105,7 @@ export function createProvider(options: ProviderOptions) {
     },
     async identity(credential: string, input: Row) {
       exact(input, ['version', 'installationId', 'domain', 'issuer']);
+      authorizeCompany(credential, input);
       const metadata = await verified(text(input.domain), text(input.issuer));
       return store.transaction(tx => {
         const enrollment = auth(tx, credential, text(input.installationId));
@@ -111,12 +116,17 @@ export function createProvider(options: ProviderOptions) {
     async begin(credential: string, input: Row) {
       exact(input, ['version', 'installationId', 'operationId', 'domain', 'issuer', 'purpose', 'sessionId', 'returnTo', 'state']);
       if (!['client-authentication', 'session', 'browser', 'direct'].includes(input.purpose)) fail('binding_conflict');
-      const metadata = await verified(text(input.domain), text(input.issuer));
+      text(input.operationId);
+      if (input.sessionId !== undefined) text(input.sessionId);
+      authorizeCompany(credential, input);
       if (input.purpose === 'client-authentication' && (input.sessionId !== undefined || input.returnTo !== undefined)) fail('binding_conflict');
       if (input.purpose !== 'browser' && input.returnTo !== undefined) fail('binding_conflict');
       if (input.purpose !== 'direct' && input.state !== undefined) fail('binding_conflict');
       if (input.purpose === 'direct' && (typeof input.state !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(input.state) || !input.sessionId)) fail('binding_conflict');
-      if (input.purpose === 'browser' && (!input.sessionId || !onDomain(text(input.returnTo), metadata.document.organization.domain) || !metadata.document.web?.browser_session_endpoint)) fail('binding_conflict');
+      if (input.purpose === 'browser' && !input.sessionId) fail('binding_conflict');
+      if (input.purpose === 'browser') text(input.returnTo);
+      const metadata = await verified(text(input.domain), text(input.issuer));
+      if (input.purpose === 'browser' && (!onDomain(input.returnTo, metadata.document.organization.domain) || !metadata.document.web?.browser_session_endpoint)) fail('binding_conflict');
       const identity = store.transaction(tx => {
         const enrollment = auth(tx, credential, text(input.installationId));
         if (!enrollment.allowedCompanies.includes(metadata.document.organization.domain)) fail('unauthorized');
@@ -127,9 +137,11 @@ export function createProvider(options: ProviderOptions) {
       return store.transaction(tx => {
         const enrollment = auth(tx, credential, text(input.installationId)), key = `${enrollment.enrollmentId}:${text(input.operationId)}`, existing = tx.get('operation', key);
         if (existing) { if (!same(existing.binding, binding)) fail('binding_conflict'); operation(tx, enrollment, input.operationId); return { expiresAt: existing.expiresAt }; }
-        const rows = tx.list('operation', `${enrollment.enrollmentId}:`, 1000);
+        const rows = tx.list('operation', `${enrollment.enrollmentId}:`, 1001);
         // Bounded cleanup preserves tombstones until expiry plus clock tolerance.
         for (const row of rows) if (row.value.expiresAt + 30000 <= now()) { tx.remove('operation', row.id); if (row.value.binding.stateHash) tx.remove('state', row.value.binding.stateHash); }
+        // A hard retained-row cap keeps every quota/revocation scan complete, including tombstones.
+        if (rows.filter(row => row.value.expiresAt + 30000 > now()).length >= 1000) throw new ProviderError('rate_limited', now() + 60000);
         if (rows.filter(row => row.value.expiresAt > now() && ['pending', 'ready'].includes(row.value.status)).length >= 10) throw new ProviderError('rate_limited', now() + 60000);
         const expiresAt = now() + 600000;
         if (binding.stateHash && tx.get('state', binding.stateHash)) fail('binding_conflict');

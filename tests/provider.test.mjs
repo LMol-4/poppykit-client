@@ -4,6 +4,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 import { decodeJwt, decodeProtectedHeader, importJWK, jwtVerify } from 'jose';
 import { createProvider, createProviderClient, createResultCipher } from '../dist/provider.js';
 import { SqliteProviderStore } from '../dist/provider-sqlite.js';
@@ -87,4 +88,44 @@ test('revocation races KMS signing; issued assertions remain cryptographically v
 });
 test('bound HTTP client uses authenticated versioned handlers without raw-byte signing',async()=>{
   const f=await fixture();try{const a=await f.enroll();const transport={fetch:req=>f.api.handle(req)};const client=createProviderClient({url:'https://identity.example/v1',domain,installationId:'install-a',credential:async()=>a.credential,transport});assert.equal((await client.identity(issuer)).clientId,clientId);const result=await client.assert({operationId:'from-sdk',issuer,purpose:'session'});assert.equal(decodeJwt(result.assertion).aud,issuer);}finally{f.close();}
+});
+test('authentication and policy precede metadata; malformed sessions never reach session hook',async()=>{
+  const f=await fixture();try{
+    let resolves=0,hooks=0;const original=f.options.metadata.resolveCompany;
+    const api=createProvider({...f.options,metadata:{resolveCompany:async d=>{resolves++;return original(d);}},verifySession:async()=>{hooks++;return true;}});
+    const a=await f.enroll(),base={version:1,installationId:'install-a',operationId:'browser',issuer,domain,purpose:'browser',sessionId:'owned',returnTo:'https://company.example/'};
+    for(const input of [{...base,installationId:'wrong'},{...base,domain:'evil.example'}])await assert.rejects(api.begin(a.credential,input));
+    await assert.rejects(api.identity('invalid',{version:1,installationId:'install-a',issuer,domain}));
+    for(const sessionId of [{},[],false,1,'', 'x'.repeat(2049)]){
+      const response=await api.handle(new Request('https://identity.example/v1/begin',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${a.credential}`},body:JSON.stringify({...base,sessionId})}));assert.equal(response.status,409);
+    }
+    assert.equal(resolves,0);assert.equal(hooks,0);
+  }finally{f.close();}
+});
+test('tombstone flooding cannot hide quota records or ciphertext from revocation',async()=>{
+  const f=await fixture();try{
+    const a=await f.enroll(),base={version:1,installationId:'install-a',domain,issuer,purpose:'session'};
+    // Install retained tombstones through the same store contract to reach the hard cap quickly.
+    f.store.transaction(tx=>{for(let i=0;i<999;i++)tx.put('operation',`${a.enrollmentId}:a${i.toString().padStart(4,'0')}`,{binding:{stateHash:null},expiresAt:1600000,status:'canceled',result:null});});
+    const state=randomBytes(32).toString('base64url');await f.api.begin(a.credential,{...base,operationId:'z-last',purpose:'direct',sessionId:'owned',state});
+    f.api.callback(`${callbackUrl}?state=${state}&iss=${encodeURIComponent(issuer)}&code=PRIVATE`);
+    await assert.rejects(f.api.begin(a.credential,{...base,operationId:'zz-overflow'}),{code:'rate_limited'});
+    f.api.revokeEnrollment(a.credential,{version:1,installationId:'install-a'});
+    const rows=f.store.transaction(tx=>tx.list('operation',`${a.enrollmentId}:`,1001));assert.equal(rows.length,1000);assert.ok(rows.every(row=>row.value.result===null&&row.value.status==='canceled'));
+  }finally{f.close();}
+});
+test('real processes atomically race result consumption and revoke against callback',async()=>{
+  const f=await fixture();try{
+    const a=await f.enroll(),state=randomBytes(32).toString('base64url'),base={version:1,installationId:'install-a',operationId:'race',issuer,domain,purpose:'direct',sessionId:'owned',state};await f.api.begin(a.credential,base);
+    const callback=`${callbackUrl}?state=${state}&iss=${encodeURIComponent(issuer)}&code=PRIVATE_RACE`;f.api.callback(callback);
+    const worker=action=>new Promise((resolve,reject)=>{
+      const source=`const {createProvider}=await import(process.env.PROVIDER_MODULE);const {SqliteProviderStore}=await import(process.env.STORE_MODULE);const store=new SqliteProviderStore(process.env.DB_PATH);const p=createProvider({clientId:${JSON.stringify(clientId)},callbackUrl:${JSON.stringify(callbackUrl)},jwksUri:'https://identity.example/jwks',store,cipher:{open:()=> 'private',seal:()=> 'encrypted'},now:()=>1000000});try{const input=JSON.parse(process.env.TASK);const value=input.action==='take'?p.takeResult(input.credential,input.body):input.action==='revoke'?p.revokeEnrollment(input.credential,input.body):p.callback(input.callback);process.stdout.write(JSON.stringify({status:value.status}));}catch(e){process.stdout.write(JSON.stringify({error:e.code}));}finally{store.close();}`;
+      const child=spawn(process.execPath,['--input-type=module','--eval',source],{env:{...process.env,PROVIDER_MODULE:new URL('../dist/provider.js',import.meta.url).href,STORE_MODULE:new URL('../dist/provider-sqlite.js',import.meta.url).href,DB_PATH:f.path,TASK:JSON.stringify(action)},windowsHide:true});let out='',err='';child.stdout.on('data',d=>out+=d);child.stderr.on('data',d=>err+=d);child.on('error',reject);child.on('close',code=>{try{assert.equal(code,0,err);resolve(JSON.parse(out));}catch(e){reject(e);}});
+    });
+    const take={action:'take',credential:a.credential,body:{version:1,installationId:'install-a',operationId:'race',issuer,sessionId:'owned'}};
+    const results=await Promise.all([worker(take),worker(take)]);assert.equal(results.filter(r=>r.status==='completed').length,1);assert.equal(results.filter(r=>r.error==='consumed').length,1);
+    const secondState=randomBytes(32).toString('base64url');await f.api.begin(a.credential,{...base,operationId:'race2',state:secondState});
+    await Promise.all([worker({action:'callback',callback:`${callbackUrl}?state=${secondState}&iss=${encodeURIComponent(issuer)}&code=PRIVATE`}),worker({action:'revoke',credential:a.credential,body:{version:1,installationId:'install-a'}})]);
+    assert.ok(f.store.transaction(tx=>tx.list('operation',`${a.enrollmentId}:`,1000)).every(row=>row.value.result===null));
+  }finally{f.close();}
 });
