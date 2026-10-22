@@ -78,7 +78,9 @@ before delivery. External stores/KMS are separate failure boundaries.
 
 Defaults bound enrollments globally to 10,000, pending operations to ten per
 enrollment, assertions to 60/minute, operation lifetime to ten minutes and request
-bodies to 16 KiB. Expired operations are cleaned in bounded batches on begin;
+bodies to 16 KiB. A hard cap of 1,000 retained operations per enrollment keeps
+quota/cleanup/revocation scans complete even under tombstone flooding. Expired
+operations are cleaned in bounded batches on begin;
 tombstones survive expiry plus 30 seconds. Hosts must additionally enforce
 per-human enrollment rate limits, ingress rate/connection/time limits, total
 database retention, and authenticated account recovery. Rate-limit responses

@@ -87,7 +87,9 @@ test('revocation races KMS signing; issued assertions remain cryptographically v
   }finally{f.close();}
 });
 test('bound HTTP client uses authenticated versioned handlers without raw-byte signing',async()=>{
-  const f=await fixture();try{const a=await f.enroll();const transport={fetch:req=>f.api.handle(req)};const client=createProviderClient({url:'https://identity.example/v1',domain,installationId:'install-a',credential:async()=>a.credential,transport});assert.equal((await client.identity(issuer)).clientId,clientId);const result=await client.assert({operationId:'from-sdk',issuer,purpose:'session'});assert.equal(decodeJwt(result.assertion).aud,issuer);}finally{f.close();}
+  const f=await fixture();try{const a=await f.enroll();const transport={fetch:req=>f.api.handle(req)};const client=createProviderClient({url:'https://identity.example/v1',domain,installationId:'install-a',credential:async()=>a.credential,transport});assert.equal((await client.identity(issuer)).clientId,clientId);const result=await client.assert({operationId:'from-sdk',issuer,purpose:'session'});assert.equal(decodeJwt(result.assertion).aud,issuer);
+    const unsafe=createProvider({...f.options,publishedKeys:async()=>[{...await f.options.signer.publicJwk(),kid:'key',d:'PRIVATE_KEY'}]});const response=await unsafe.handle(new Request('https://identity.example/jwks'));assert.equal(response.status,503);assert.ok(!(await response.text()).includes('PRIVATE_KEY'));
+  }finally{f.close();}
 });
 test('authentication and policy precede metadata; malformed sessions never reach session hook',async()=>{
   const f=await fixture();try{
