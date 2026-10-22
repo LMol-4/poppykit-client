@@ -1201,6 +1201,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const url = new URL(request.url), endpoint = new URL(expected.endpoint);
       const base = endpoint.pathname.replace(/\/$/, '');
       if (url.protocol !== 'https:' || url.hash || url.username || url.password || url.origin !== endpoint.origin || (url.pathname !== endpoint.pathname && !url.pathname.startsWith(`${base}/`))) throw new AuthFailure('invalid_target', connectionId);
+      if (connection.status === 'disconnected') throw new AuthFailure('disconnected', connectionId);
       checkCooldown(connection);
       const resource = expected.resource ?? null;
       // A conversation long poll is held up to `wait` seconds (spec 7.3, 7.5); that hold must not count as a network timeout.

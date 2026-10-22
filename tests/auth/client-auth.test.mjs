@@ -1605,6 +1605,8 @@ test('revocation Retry-After persists with its cleanup item across restart', asy
     return handle(request, options);
   };
   assert.equal((await env.auth.signOut(env.id)).cleanup, 'pending'); assert.equal(calls, 1);
+  assert.equal((await env.auth.get(env.id)).status, 'disconnected');
+  await assert.rejects(env.auth.authorizedFetch(env.id, conversations(env.company), env.target), code('disconnected'));
   env.clock.t += 3600000; assert.equal((await createClientAuth(env.options).retryCleanup(env.id)).cleanup, 'pending'); assert.equal(calls, 1);
   env.company.handle = handle; env.clock.t += 3600000;
   assert.equal((await createClientAuth(env.options).retryCleanup(env.id)).cleanup, 'complete');
