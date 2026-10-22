@@ -18,3 +18,5 @@ export type { StreamFrame } from './protocol/sse.js';
 export type { AssertionRequest, AssertionProvider, ProviderIdentity, TrustedInput, SignInMethod, SignInInput, SignInStart, AuthorizationRequirement } from './auth/client-auth.js';
 export { authChallenge } from './auth/challenge.js';
 export type { AuthChallenge } from './auth/challenge.js';
+export type { ApiTarget, AgentBrowserController, FeedbackReport } from './integrations.js';
+export { protectedResourceMetadataUrl } from './integrations.js';
