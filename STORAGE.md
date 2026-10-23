@@ -1,6 +1,6 @@
 # Persistence and recovery
 
-J1 introduces breaking storage contracts for this unpublished package. Node 24.12.0
+This unpublished package uses targeted storage contracts. Node 24.12.0
 or later is required. The optional `@poppykit/client/sqlite` entry point exports
 `SqliteAuthStore` and `SqliteConversationStore`; importing the client core does not
 load SQLite. `node:sqlite` is experimental in the tested Node 24.12.0 runtime.

@@ -83,4 +83,5 @@ response can mean accepted; callers decide whether to repeat because the protoco
 defines no deduplication key. Prefer one report per unfulfilled task.
 
 The executable generic caller/controller fixtures are `tests/integrations.test.mjs`.
-They are representative CLI-style SDK wiring; actual CLI integration belongs to J5.
+They exercise the same hooks used by the CLI; installed CLI integration is
+verified separately against immutable candidate tarballs.
