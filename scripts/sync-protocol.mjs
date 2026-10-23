@@ -11,7 +11,7 @@ const destination = resolve(target);
 if (existsSync(destination) && realpathSync(destination) === realpathSync(source)) { console.error('destination is the source repo'); process.exit(2); }
 if (!existsSync(join(destination, 'package.json'))) { console.error('not a repo: ' + destination); process.exit(2); }
 const shared = ['src/protocol', 'src/network', 'tests/network'];
-const list = dir => existsSync(dir) ? readdirSync(dir, { recursive: true, withFileTypes: true }).filter(e => e.isFile()).map(e => relative(dir, join(e.parentPath, e.name)).split(sep).join('/')).sort() : [];
+const list = dir => existsSync(dir) ? readdirSync(dir, { recursive: true, withFileTypes: true }).filter(e => e.isFile() && !(dir.replaceAll('\\','/').endsWith('/tests/network') && /\.mjs(?:\.map)?$/.test(e.name))).map(e => relative(dir, join(e.parentPath, e.name)).split(sep).join('/')).sort() : [];
 // Compare ignoring CRLF: git checkouts convert line endings per worktree.
 const text = file => readFileSync(file).toString('latin1').replaceAll('\r\n', '\n');
 

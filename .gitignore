@@ -57,3 +57,5 @@ coverage/
 /harness-manifest.json
 
 /scripts/install-candidate.mjs
+
+/tests/sync-protocol.test.mjs

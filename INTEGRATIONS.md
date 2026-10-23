@@ -82,6 +82,6 @@ There are no automatic POST retries (including nonce/auth rejection). A lost
 response can mean accepted; callers decide whether to repeat because the protocol
 defines no deduplication key. Prefer one report per unfulfilled task.
 
-The executable generic caller/controller fixtures are `tests/integrations.test.mjs`.
+The executable generic caller/controller fixtures are `tests/integrations.test.mts`.
 They exercise the same hooks used by the CLI; installed CLI integration is
 verified separately against immutable candidate tarballs.

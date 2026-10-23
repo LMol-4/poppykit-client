@@ -84,7 +84,7 @@ aside its database and WAL/SHM files and the matching host-managed secret namesp
 before creating a fresh store. Never reset live credentials by deleting a database
 behind a running process. Old stores are not silently deleted or reinterpreted.
 
-`tests/storage.test.mjs` uses actual child processes, SQLite contention and forced
+`tests/storage.test.mts` uses actual child processes, SQLite contention and forced
 termination. It covers rollback, durable prepare, live-owner recovery and an external
 synthetic effect followed by owner death. The latter becomes uncertain, not an
 exactly-once execution claim. Auth unit tests also retain staged-secret, generation,
