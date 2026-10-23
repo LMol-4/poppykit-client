@@ -1,6 +1,6 @@
 # Persistence and recovery
 
-This unpublished package uses targeted storage contracts. Node 24.12.0
+Use targeted storage contracts. Node 24.12.0
 or later is required. The optional `@poppykit/client/sqlite` entry point exports
 `SqliteAuthStore` and `SqliteConversationStore`; importing the client core does not
 load SQLite. `node:sqlite` is experimental in the tested Node 24.12.0 runtime.
@@ -44,8 +44,8 @@ records its endpoint. Retry rejects an endpoint change before sending. Preparati
 returns the existing record instead of replacing content; terminal outcomes cannot
 be overwritten by a late sender. Checkpoints include endpoint, conversation and
 consumer. Receipts remain available for retries: the old `keepCompleted` deletion
-behavior is removed. J3 owns retention with preserved message identity and bounded
-payload cleanup; no automatic age-based deletion is currently performed.
+behavior is removed. Retention preserves message identity and bounds payload cleanup; no automatic
+age-based deletion is performed.
 
 `MemoryConversationStore` from `@poppykit/client/memory` is non-durable and confined
 to one process. The SQLite adapters also accept `:memory:` for non-durable tests;
@@ -84,11 +84,8 @@ aside its database and WAL/SHM files and the matching host-managed secret namesp
 before creating a fresh store. Never reset live credentials by deleting a database
 behind a running process. Old stores are not silently deleted or reinterpreted.
 
-`tests/storage.test.mts` uses actual child processes, SQLite contention and forced
-termination. It covers rollback, durable prepare, live-owner recovery and an external
-synthetic effect followed by owner death. The latter becomes uncertain, not an
-exactly-once execution claim. Auth unit tests also retain staged-secret, generation,
-revocation-race and vault-failure coverage.
+Contract tests cover real child-process contention, crash recovery, uncertain
+external effects, staged secrets and revocation races; see [contributing](CONTRIBUTING.md).
 
 ## Conversation delivery lifetime
 

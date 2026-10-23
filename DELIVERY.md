@@ -67,33 +67,14 @@ the durable cursor and fresh authorization.
 Metadata caching remains bounded and honors freshness, Age, validators, no-cache
 and no-store, with a 300-second upper bound. Expired entries revalidate; 304s retain
 prior caching directives. `resolver.invalidate(target?)` fences old pending cache
-writes without bypassing fetch concurrency/rate limits. J2 rejects changed saved
+writes without bypassing fetch concurrency/rate limits. The auth lifecycle rejects changed saved
 issuer/endpoint/resource bindings rather than rerouting persisted work.
 
-## Company service and retention
+## Peer retention
 
-The server accepts `supportedScopes`, the union offered by its actual sign-in
-methods. `directScopes` remains a compatibility alias. One coordinator must still
-cover authority checks and durable conversation reads/mutations.
-
-Default JSON/request/frame budget is 1 MiB; the maximum encoded event is
-1 MiB minus 1025 bytes. Page sizing reserves 1024 bytes for worst-case IDs, cursors
-and envelopes and counts UTF-8 bytes. Company events and client messages that
-cannot fit are rejected before commit; no receipt/work survives a rejected write.
-Do not reduce configured budgets below those used for retained accepted events.
-
-Notifications are post-commit hints. Subscribe before reading; reconcile durable
-state on wake or every 1000 ms by default. `createConversationNotifications` is
-local acceleration only. Multiple processes work without a broker through targeted
-SQLite reconciliation; deployments can implement the same notification contract
-with their own distributed adapter. Lost/duplicate hints cannot erase a commit.
-SQLite event windows and append operations do not reload complete event histories.
-
-Server streams default to 30 seconds and apply pull backpressure, rechecking
-current authority before further pages. This bounded-connection policy omits
-periodic idle comments; proxies may close an idle stream sooner, and the client
-reconnects. Longer-lived deployments should supply heartbeat handling at their
-HTTP adapter. Hosts must propagate disconnect/AbortSignal and body cancellation.
+The [server delivery guide](https://github.com/LMol-4/poppykit-server/blob/main/DELIVERY.md)
+describes service configuration, byte budgets, notifications and bounded streams.
+Keep the following distinct lifetimes when choosing an operator retention policy:
 
 | Record | Lifetime / deletion rule |
 | --- | --- |
