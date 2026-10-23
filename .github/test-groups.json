@@ -1,20 +1,21 @@
 {
   "unit": [
-    "tests/auth/challenge.test.mjs"
+    "tests/auth/challenge.test.mts"
   ],
   "contracts": [
-    "tests/auth/client-auth.test.mjs",
-    "tests/storage.test.mjs",
-    "tests/network/network.test.mjs",
-    "tests/conversation.test.mjs",
-    "tests/provider.test.mjs"
+    "tests/auth/client-auth.test.mts",
+    "tests/storage.test.mts",
+    "tests/network/network.test.mts",
+    "tests/conversation.test.mts",
+    "tests/provider.test.mts"
   ],
   "integration": [
-    "tests/integrations.test.mjs"
+    "tests/integrations.test.mts"
   ],
   "validation": [
-    "tests/release.test.mjs",
-    "tests/workflows.test.mjs",
-    "tests/registry.test.mjs"
+    "tests/release.test.mts",
+    "tests/workflows.test.mts",
+    "tests/registry.test.mts",
+    "tests/harness.test.mts"
   ]
 }

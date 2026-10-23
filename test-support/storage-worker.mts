@@ -1,3 +1,6 @@
+import assert from 'node:assert/strict';
+import type {OutboundRecord} from '../dist/conversation.js';
+import { expectValue, publicEcJwk } from './assertions.mjs';
 import { SqliteAuthStore, SqliteConversationStore } from '../dist/sqlite.js';
 import { createClientAuth, createMetadataResolver } from '../dist/index.js';
 import { createFakeCompany, fakeTransport } from '../tests/auth/fake-issuer.mjs';
@@ -5,25 +8,25 @@ import { DatabaseSync } from 'node:sqlite';
 
 const [mode, path] = process.argv.slice(2);
 const key = { connectionId: 'c', issuer: 'https://issuer.test/one', endpoint: 'https://company.test/conversations' };
-const row = { ...key, id: 'message', target: null, request: { message: { id: 'message', sender: 'agent', text: 'hello' } }, fingerprint: 'same', phase: 'pending' };
+const row:OutboundRecord = { ...key, id: 'message', target: null, request: { message: { id: 'message', sender: 'agent', text: 'hello' } }, fingerprint: 'same', phase: 'pending' };
 const pause = () => new Promise(() => { setInterval(() => {}, 1000); });
 if (mode === 'prepare') {
   const store = new SqliteConversationStore(path);
   await store.prepareOutbound(key, row); store.close();
-  process.send({ ready: true });
+  expectValue(process.send).call(process, { ready: true });
 } else if (mode === 'before-commit') {
   const store = new SqliteAuthStore(path);
   await store.transaction({ issuer: 'uncommitted' }, state => {
     state.identities.uncommitted = { userId: 'u', dpopKeyRef: 'reference' };
-    process.send({ ready: true });
+    expectValue(process.send).call(process, { ready: true });
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
   });
 } else {
   const store = new SqliteAuthStore(path);
   const secrets = new Map();
   const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
-  const jwk = { ...await crypto.subtle.exportKey('jwk', pair.publicKey), kid: 'test-key', alg: 'ES256' };
-  const identity = { kid: jwk.kid, publicJwk: async () => jwk, sign: async input => new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, pair.privateKey, input)) };
+  const jwk = { ...await publicEcJwk(pair.publicKey), kid: 'test-key', alg: 'ES256' };
+  const identity = { kid: jwk.kid, publicJwk: async () => jwk, sign: async (input:Uint8Array) => new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, pair.privateKey, new Uint8Array(input))) };
   const clientId = 'https://agent.test/client.json', redirectUri = 'https://agent.test/callback', browserBinding = 'browser-binding-for-test-only';
   const company = createFakeCompany({ jwks: { keys: [jwk] }, clientId, redirectUris: [redirectUri], now: Date.now });
   const transport = fakeTransport(company);
@@ -32,11 +35,11 @@ if (mode === 'prepare') {
     transport, metadata: createMetadataResolver(transport) });
   if (mode === 'recover') {
     const results = await auth.recover(); store.close();
-    process.send({ results: results.map(r => ({ status: r.status, operationId: r.operationId })) });
+    expectValue(process.send).call(process, { results: results.map(r => ({ status: r.status, operationId: r.operationId })) });
   } else {
     const { connection } = await auth.start(company.domain);
     const begun = await auth.beginSignIn(connection.id, { scopes: ['poppy:read'], redirectUri, browserBinding });
-    const callbackUrl = company.authorize(begun.authorizationUrl, { account: 'account' });
+    const callbackUrl = company.authorize(expectValue(begun.authorizationUrl), { account: 'account' });
     if (mode === 'rotation') await auth.completeSignIn({ callbackUrl, browserBinding });
     const handle = company.handle;
     company.handle = async (request, options) => {
@@ -46,9 +49,9 @@ if (mode === 'prepare') {
         // Synthetic external side effect commits independently of SDK completion.
         const external = new DatabaseSync(path + '.external');
         external.exec('CREATE TABLE IF NOT EXISTS effects (id TEXT PRIMARY KEY)');
-        external.prepare('INSERT INTO effects VALUES (?)').run(active.id);
+        external.prepare('INSERT INTO effects VALUES (?)').run(expectValue(active).id);
         external.close();
-        process.send({ ready: true, operationId: active.id });
+        expectValue(process.send).call(process,{ ready: true, operationId: expectValue(active).id });
         await pause();
       }
       return response;

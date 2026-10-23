@@ -1,10 +1,15 @@
+import type {ProviderOptions} from '../dist/provider.js';
+import {createMetadataResolver} from '../dist/index.js';
+import { expectValue, publicEcJwk } from '../test-support/assertions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import type { ProviderRaceAction } from '../test-support/provider-worker.mjs';
 import { decodeJwt, decodeProtectedHeader, importJWK, jwtVerify } from 'jose';
 import { createProvider, createProviderClient, createResultCipher } from '../dist/provider.js';
 import { SqliteProviderStore } from '../dist/provider-sqlite.js';
@@ -14,21 +19,21 @@ async function fixture() {
   const dir=mkdtempSync(join(tmpdir(),'provider-')), path=join(dir,'provider.sqlite'), store=new SqliteProviderStore(path);
   let at=1000000, subject='alice', allowSession=true;
   const key=await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},true,['sign','verify']);
-  const publicJwk=await crypto.subtle.exportKey('jwk',key.publicKey);
-  const metadata={resolveCompany:async d=>{assert.equal(d,domain);return {document:{organization:{domain,name:'Generic'},web:{browser_session_endpoint:'https://company.example/join'}},authorization:{issuer}};}};
-  const options={clientId,callbackUrl,jwksUri:'https://identity.example/jwks',clientName:'Generic provider',store,cipher:createResultCipher(randomBytes(32)),metadata,now:()=>at,
-    authenticateEnrollment:async request=>request.headers.get('x-human')==='authenticated'?{subject,allowedCompanies:[domain]}:null,
-    verifySession:async b=>allowSession&&b.sessionId==='owned',
-    signer:{kid:'key-1',publicJwk:async()=>publicJwk,sign:async bytes=>new Uint8Array(await crypto.subtle.sign({name:'ECDSA',hash:'SHA-256'},key.privateKey,bytes))}};
+  const publicJwk=await publicEcJwk(key.publicKey);
+  const metadata={...createMetadataResolver({async fetch(){throw new Error('unexpected metadata fetch');}}),resolveCompany:async(d:string)=>{assert.equal(d,domain);return {url:'https://company.example/.well-known/poppy.json',document:{protocol_version:'0.2' as const,organization:{domain,name:'Generic'},web:{browser_session_endpoint:'https://company.example/join'}},authorization:{issuer,token_endpoint:issuer+'/token',revocation_endpoint:issuer+'/revoke',poppy_domains:[domain]}};}};
+  const options:ProviderOptions={clientId,callbackUrl,jwksUri:'https://identity.example/jwks',clientName:'Generic provider',store,cipher:createResultCipher(randomBytes(32)),metadata,now:()=>at,
+    authenticateEnrollment:async request =>request.headers.get('x-human')==='authenticated'?{subject,allowedCompanies:[domain]}:null,
+    verifySession:async (b: { sessionId: string; }) =>allowSession&&b.sessionId==='owned',
+    signer:{kid:'key-1',publicJwk:async()=>publicJwk,sign:async (bytes:Uint8Array) =>new Uint8Array(await crypto.subtle.sign({name:'ECDSA',hash:'SHA-256'},key.privateKey,new Uint8Array(bytes)))}};
   const api=createProvider(options), req=new Request('https://identity.example/v1/enroll',{headers:{'x-human':'authenticated'}});
   async function enroll(installationId='install-a'){return api.enroll(req,{version:1,installationId,idempotencyKey:randomBytes(20).toString('hex')});}
-  return {api,options,store,path,dir,enroll,setSubject:v=>subject=v,setTime:v=>at=v,setSession:v=>allowSession=v,close:()=>{store.close();rmSync(dir,{recursive:true,force:true});}};
+  return {api,options,store,path,dir,enroll,setSubject:(v: string) =>subject=v,setTime:(v: number) =>at=v,setSession:(v: boolean) =>allowSession=v,close:()=>{store.close();rmSync(dir,{recursive:true,force:true});}};
 }
 test('authenticated enrollment, visitor/issuer identity and installation isolation',async()=>{
   const f=await fixture();try{
     await assert.rejects(f.api.enroll(new Request(clientId),{version:1,installationId:'a',idempotencyKey:'key'}),{code:'unauthorized'});
     const a=await f.enroll(), b=await f.enroll('install-b');
-    const identity=(credential,installationId)=>f.api.identity(credential,{version:1,installationId,domain,issuer});
+    const identity=(credential: string,installationId: string)=>f.api.identity(credential,{version:1,installationId,domain,issuer});
     assert.deepEqual(await identity(a.credential,'install-a'),await identity(b.credential,'install-b'));
     await assert.rejects(identity(a.credential,'install-b'),{code:'unauthorized'});
     f.setSubject('bob');const c=await f.enroll('install-c');assert.notDeepEqual(await identity(a.credential,'install-a'),await identity(c.credential,'install-c'));
@@ -41,7 +46,7 @@ test('constrained signing rejects claims, purposes, companies and unverified bro
     for(const change of [{subject:'attacker'},{audience:'https://evil.example'},{purpose:'raw'},{issuer:'https://evil.example'},{domain:'evil.example'}])await assert.rejects(f.api.begin(a.credential,{...binding,...change}));
     await f.api.begin(a.credential,binding);
     const result=await f.api.assert(a.credential,{version:1,installationId:'install-a',operationId:'sign',purpose:'session'});
-    const payload=decodeJwt(result.assertion);assert.equal(payload.aud,issuer);assert.equal(payload.iss,clientId);assert.equal(payload.exp-payload.iat,60);assert.ok(payload.jti.length>=22);assert.equal(decodeProtectedHeader(result.assertion).typ,'JWT');
+    const payload=decodeJwt(result.assertion);assert.equal(payload.aud,issuer);assert.equal(payload.iss,clientId);assert.equal(expectValue(payload.exp)-expectValue(payload.iat),60);assert.ok(expectValue(payload.jti).length>=22);assert.equal(decodeProtectedHeader(result.assertion).typ,'JWT');
     await jwtVerify(result.assertion,await importJWK(await f.options.signer.publicJwk(),'ES256'),{issuer:clientId,audience:issuer,currentDate:new Date(1000000)});
     await assert.rejects(f.api.assert(a.credential,{version:1,installationId:'install-a',operationId:'sign',purpose:'client-authentication'}),{code:'binding_conflict'});
     await assert.rejects(f.api.begin(a.credential,{...binding,purpose:'browser',operationId:'browser',sessionId:'other',returnTo:'https://company.example/'}),{code:'unauthorized'});
@@ -73,12 +78,42 @@ test('callback results encrypted, correlated, atomic, one time; restart, replay,
     f.setTime(1600001);assert.throws(()=>f.api.takeResult(a.credential,take),{code:'expired'});
   }finally{f.close();}
 });
+
+test('operation retries retain original binding and expiry without extending authorization',async()=>{
+  const f=await fixture();try{
+    const a=await f.enroll(),state=randomBytes(32).toString('base64url'),input={version:1,installationId:'install-a',operationId:'idempotent',issuer,domain,purpose:'direct',sessionId:'owned',state};
+    const started=await f.api.begin(a.credential,input);f.setTime(1100000);
+    assert.deepEqual(await f.api.begin(a.credential,input),started);
+    for(const change of [{sessionId:'another'},{state:randomBytes(32).toString('base64url')}])await assert.rejects(f.api.begin(a.credential,{...input,...change}),{code:'binding_conflict'});
+    f.setTime(started.expiresAt);await assert.rejects(f.api.begin(a.credential,input),{code:'expired'});
+  }finally{f.close();}
+});
+
+test('expired callback tombstones retain state through grace and cleanup cannot remove live operations',async()=>{
+  const f=await fixture();try{
+    const a=await f.enroll(),state=randomBytes(32).toString('base64url'),input={version:1,installationId:'install-a',operationId:'old',issuer,domain,purpose:'direct',sessionId:'owned',state};
+    const old=await f.api.begin(a.credential,input);
+    f.setTime(old.expiresAt+29999);
+    await assert.rejects(f.api.begin(a.credential,{...input,operationId:'too-soon'}),{code:'binding_conflict'});
+    const liveState=randomBytes(32).toString('base64url');await f.api.begin(a.credential,{...input,operationId:'live',state:liveState});
+    f.setTime(old.expiresAt+30000);
+    const replacementState=randomBytes(32).toString('base64url');await f.api.begin(a.credential,{...input,operationId:'replacement',state:replacementState});
+    const oldCallback=`${callbackUrl}?state=${state}&iss=${encodeURIComponent(issuer)}&code=PRIVATE`;
+    assert.throws(()=>f.api.callback(oldCallback),{code:'binding_conflict'});
+    const replacementCallback=`${callbackUrl}?state=${replacementState}&iss=${encodeURIComponent(issuer)}&code=NEW`;assert.equal(f.api.callback(replacementCallback).status,'ready');
+    const take={version:1,installationId:'install-a',operationId:'replacement',issuer,sessionId:'owned'};
+    assert.equal(f.api.takeResult(a.credential,take).callbackUrl,replacementCallback);
+    assert.throws(()=>f.api.takeResult(a.credential,{...take,operationId:'old'}),{code:'binding_conflict'});
+    assert.equal(f.api.callback(`${callbackUrl}?state=${liveState}&iss=${encodeURIComponent(issuer)}&code=LIVE`).status,'ready');
+    assert.equal(f.api.takeResult(a.credential,{...take,operationId:'live'}).status,'completed');
+  }finally{f.close();}
+});
 test('revocation races KMS signing; issued assertions remain cryptographically valid',async()=>{
   const f=await fixture();try{
     const a=await f.enroll();await f.api.begin(a.credential,{version:1,installationId:'install-a',operationId:'sign',domain,issuer,purpose:'client-authentication'});
     const input={version:1,installationId:'install-a',operationId:'sign',purpose:'client-authentication'};
     const issued=await f.api.assert(a.credential,input);
-    let release,started;const ready=new Promise(r=>started=r),gate=new Promise(r=>release=r),sign=f.options.signer.sign;
+    let release!:()=>void,started!:()=>void;const ready=new Promise<void>(r=>started=r),gate=new Promise<void>(r=>release=r),sign=f.options.signer.sign;
     const racing=createProvider({...f.options,signer:{...f.options.signer,sign:async bytes=>{started();await gate;return sign(bytes);}}});
     const pending=racing.assert(a.credential,input);await ready;f.api.revokeEnrollment(a.credential,{version:1,installationId:'install-a'});release();await assert.rejects(pending,{code:'unauthorized'});
     await jwtVerify(issued.assertion,await importJWK(await f.options.signer.publicJwk(),'ES256'),{currentDate:new Date(1000000)});
@@ -87,14 +122,14 @@ test('revocation races KMS signing; issued assertions remain cryptographically v
   }finally{f.close();}
 });
 test('bound HTTP client uses authenticated versioned handlers without raw-byte signing',async()=>{
-  const f=await fixture();try{const a=await f.enroll();const transport={fetch:req=>f.api.handle(req)};const client=createProviderClient({url:'https://identity.example/v1',domain,installationId:'install-a',credential:async()=>a.credential,transport});assert.equal((await client.identity(issuer)).clientId,clientId);const result=await client.assert({operationId:'from-sdk',issuer,purpose:'session'});assert.equal(decodeJwt(result.assertion).aud,issuer);
+  const f=await fixture();try{const a=await f.enroll();const transport={fetch:(req: Request) =>f.api.handle(req)};const client=createProviderClient({url:'https://identity.example/v1',domain,installationId:'install-a',credential:async()=>a.credential,transport});assert.equal((await client.identity(issuer)).clientId,clientId);const result=await client.assert({operationId:'from-sdk',issuer,purpose:'session'});assert.equal(decodeJwt(result.assertion).aud,issuer);
     const unsafe=createProvider({...f.options,publishedKeys:async()=>[{...await f.options.signer.publicJwk(),kid:'key',d:'PRIVATE_KEY'}]});const response=await unsafe.handle(new Request('https://identity.example/jwks'));assert.equal(response.status,503);assert.ok(!(await response.text()).includes('PRIVATE_KEY'));
   }finally{f.close();}
 });
 test('authentication and policy precede metadata; malformed sessions never reach session hook',async()=>{
   const f=await fixture();try{
     let resolves=0,hooks=0;const original=f.options.metadata.resolveCompany;
-    const api=createProvider({...f.options,metadata:{resolveCompany:async d=>{resolves++;return original(d);}},verifySession:async()=>{hooks++;return true;}});
+    const api=createProvider({...f.options,metadata:{...f.options.metadata,resolveCompany:async d=>{resolves++;return original(d);}},verifySession:async()=>{hooks++;return true;}});
     const a=await f.enroll(),base={version:1,installationId:'install-a',operationId:'browser',issuer,domain,purpose:'browser',sessionId:'owned',returnTo:'https://company.example/'};
     for(const input of [{...base,installationId:'wrong'},{...base,domain:'evil.example'}])await assert.rejects(api.begin(a.credential,input));
     await assert.rejects(api.identity('invalid',{version:1,installationId:'install-a',issuer,domain}));
@@ -120,11 +155,14 @@ test('real processes atomically race result consumption and revoke against callb
   const f=await fixture();try{
     const a=await f.enroll(),state=randomBytes(32).toString('base64url'),base={version:1,installationId:'install-a',operationId:'race',issuer,domain,purpose:'direct',sessionId:'owned',state};await f.api.begin(a.credential,base);
     const callback=`${callbackUrl}?state=${state}&iss=${encodeURIComponent(issuer)}&code=PRIVATE_RACE`;f.api.callback(callback);
-    const worker=action=>new Promise((resolve,reject)=>{
-      const source=`const {createProvider}=await import(process.env.PROVIDER_MODULE);const {SqliteProviderStore}=await import(process.env.STORE_MODULE);const store=new SqliteProviderStore(process.env.DB_PATH);const p=createProvider({clientId:${JSON.stringify(clientId)},callbackUrl:${JSON.stringify(callbackUrl)},jwksUri:'https://identity.example/jwks',store,cipher:{open:()=> 'private',seal:()=> 'encrypted'},now:()=>1000000});try{const input=JSON.parse(process.env.TASK);const value=input.action==='take'?p.takeResult(input.credential,input.body):input.action==='revoke'?p.revokeEnrollment(input.credential,input.body):p.callback(input.callback);process.stdout.write(JSON.stringify({status:value.status}));}catch(e){process.stdout.write(JSON.stringify({error:e.code}));}finally{store.close();}`;
-      const child=spawn(process.execPath,['--input-type=module','--eval',source],{env:{...process.env,PROVIDER_MODULE:new URL('../dist/provider.js',import.meta.url).href,STORE_MODULE:new URL('../dist/provider-sqlite.js',import.meta.url).href,DB_PATH:f.path,TASK:JSON.stringify(action)},windowsHide:true});let out='',err='';child.stdout.on('data',d=>out+=d);child.stderr.on('data',d=>err+=d);child.on('error',reject);child.on('close',code=>{try{assert.equal(code,0,err);resolve(JSON.parse(out));}catch(e){reject(e);}});
+    const worker=(action:ProviderRaceAction)=>new Promise<{status?:string;error?:string}>((resolve,reject)=>{
+      const child=spawn(process.execPath,[fileURLToPath(new URL('../test-support/provider-worker.mjs',import.meta.url))],{env:{...process.env,DB_PATH:f.path,TASK:JSON.stringify(action)},windowsHide:true});let out='',err='';child.stdout.on('data',d=>out+=d);child.stderr.on('data',d=>err+=d);child.on('error',reject);child.on('close',code=>{try{
+        assert.equal(code,0,err);const result:unknown=JSON.parse(out);assert.ok(result&&typeof result==='object');
+        if('status' in result){assert.ok(typeof result.status==='string');resolve({status:result.status});}
+        else{assert.ok('error' in result&&typeof result.error==='string');resolve({error:result.error});}
+      }catch(e){reject(e);}});
     });
-    const take={action:'take',credential:a.credential,body:{version:1,installationId:'install-a',operationId:'race',issuer,sessionId:'owned'}};
+    const take:ProviderRaceAction={action:'take',credential:a.credential,body:{version:1,installationId:'install-a',operationId:'race',issuer,sessionId:'owned'}};
     const results=await Promise.all([worker(take),worker(take)]);assert.equal(results.filter(r=>r.status==='completed').length,1);assert.equal(results.filter(r=>r.error==='consumed').length,1);
     const secondState=randomBytes(32).toString('base64url');await f.api.begin(a.credential,{...base,operationId:'race2',state:secondState});
     await Promise.all([worker({action:'callback',callback:`${callbackUrl}?state=${secondState}&iss=${encodeURIComponent(issuer)}&code=PRIVATE`}),worker({action:'revoke',credential:a.credential,body:{version:1,installationId:'install-a'}})]);
