@@ -9,7 +9,9 @@
     "tests/storage.test.mts",
     "tests/network/network.test.mts",
     "tests/conversation.test.mts",
-    "tests/provider.test.mts"
+    "tests/provider.test.mts",
+    "tests/postgres.test.mts",
+    "tests/adapter-contract.test.mts"
   ],
   "integration": [
     "tests/integrations.test.mts"

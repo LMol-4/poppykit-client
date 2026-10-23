@@ -3,7 +3,7 @@
 Import `createProvider`, `createProviderClient`, and `createResultCipher` from
 `@poppykit/client/provider`; durable `SqliteProviderStore` is separately exported
 from `@poppykit/client/provider/sqlite`. Neither is loaded by the core import.
-This is PoppyKit provider contract **v1**, not a Personal Agent Protocol extension.
+The wire protocol remains PoppyKit provider **v1**; the 0.2 TypeScript API uses async storage, not a Personal Agent Protocol extension.
 Node 24.12+ is required for the SQLite reference adapter.
 
 An operator supplies HTTPS hosting, a provider client metadata URL, JWKS URL,
@@ -65,7 +65,7 @@ issuer, and exactly one code/error; result ciphertext is sealed atomically with
 the immutable binding. Identical pending callbacks are harmless; conflicting,
 canceled, expired and consumed callbacks fail. `takeResult` requires enrollment,
 installation, operation, issuer and exact session; it consumes within the same
-SQLite transaction before returning private callback data. Lost retrieval delivery
+storage transaction before returning private callback data. Lost retrieval delivery
 is uncertain, never a reason to exchange or retrieve again. SDK code owns PKCE and
 the exchange. Never log request URLs or responses on this route.
 
@@ -97,3 +97,26 @@ Account Tokens or DPoP keys. Revoke company authorization **before** disabling
 provider signing, or use authenticated company account controls afterward.
 This is scoped authority, redaction and provider key custody; it does not isolate
 authority from unrestricted programs running as the same OS user.
+
+## Migrating provider code to 0.2
+
+Await every provider operation, including `callback`, `takeResult`, `cancel` and
+`revokeEnrollment`; HTTP callback success is returned only after storage commits.
+Use rejected-Promise assertions for failures. Signer, enrollment authentication,
+metadata and session verification stay outside storage transactions; ResultCipher
+remains synchronous local cryptography.
+
+`ProviderSelection` declares enroll, identity, operation, begin, callback or revoke.
+Remote stores load and lock only that aggregate; out-of-selection access and thenable
+callbacks reject. Enroll locks a namespace capacity counter; identity mapping locks
+visitor/full-issuer keys across installations; callbacks re-resolve state after the
+enrollment fence. Begin/revoke inspect at most 1,001 operation rows. All valid Unicode
+operation IDs count toward limits and revocation. Existing SQLite databases retain
+records and initialize the capacity counter from their enrollment rows.
+
+For an existing local synchronous custom store, explicitly wrap it with
+`adaptLegacyProviderStore(legacyStore)`. This migration helper ignores selections
+and cannot turn local synchronous I/O into remote persistence. New remote/custom
+stores implement the targeted contract directly. The bundled Postgres adapter is
+`PostgresProviderStore` from `@poppykit/client/provider/postgres`; see
+[storage](STORAGE.md) for explicit migrations, TLS and lifecycle.

@@ -1,0 +1,16 @@
+CREATE SCHEMA poppy_client;
+CREATE TABLE poppy_client.schema_version (version integer PRIMARY KEY CHECK(version > 0));
+INSERT INTO poppy_client.schema_version VALUES (1);
+CREATE TABLE poppy_client.records (ns text NOT NULL, kind text NOT NULL, id text NOT NULL, body text NOT NULL CHECK (body::jsonb IS NOT NULL), ordinal bigint GENERATED ALWAYS AS IDENTITY, PRIMARY KEY(ns,kind,id));
+CREATE INDEX by_conversation ON poppy_client.records (ns,kind,(body::jsonb->>'conversationId'));
+CREATE INDEX by_binding ON poppy_client.records (ns,kind,(body::jsonb->>'bindingId'));
+CREATE INDEX by_client ON poppy_client.records (ns,kind,(body::jsonb->>'clientId'));
+CREATE INDEX by_account ON poppy_client.records (ns,kind,(body::jsonb->>'accountId'));
+CREATE INDEX by_grant ON poppy_client.records (ns,kind,(body::jsonb->>'grantId'));
+CREATE INDEX by_phase ON poppy_client.records (ns,kind,(body::jsonb->>'phase'));
+CREATE INDEX by_expiry ON poppy_client.records (ns,kind,((body::jsonb->>'expiresAt')::double precision));
+CREATE INDEX by_connection ON poppy_client.records (ns,kind,(body::jsonb->>'connectionId'));
+CREATE INDEX by_callback ON poppy_client.records (ns,kind,(body::jsonb#>>'{direct,stateHash}'));
+CREATE TABLE poppy_client.outbound (ns text NOT NULL, connection text NOT NULL, issuer text NOT NULL, id text NOT NULL, body text NOT NULL, PRIMARY KEY(ns,connection,issuer,id));
+CREATE TABLE poppy_client.checkpoints (ns text NOT NULL, connection text NOT NULL, issuer text NOT NULL, endpoint text NOT NULL, conversation text NOT NULL, name text NOT NULL, cursor text NOT NULL, PRIMARY KEY(ns,connection,issuer,endpoint,conversation,name));
+CREATE UNIQUE INDEX auth_callback ON poppy_client.records(ns,((body::jsonb)#>>'{direct,stateHash}')) WHERE kind='operations';

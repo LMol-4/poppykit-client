@@ -94,3 +94,63 @@ checkpoints are retained until explicit local deletion; pending/uncertain retrie
 must first be reconciled. Checkpoint acknowledgements use compare-and-set and do
 not acknowledge merely because a page or stream frame was read. Local deletion
 never deletes company history, revokes access or cancels accepted business work.
+
+## Postgres (0.2 API)
+
+The optional `@poppykit/client/postgres` exports `PostgresAuthStore` and
+`PostgresConversationStore`; `/provider/postgres` exports `PostgresProviderStore`.
+Install the optional peer `pg@8.23.1` only when choosing these subpaths.
+Protocol-only imports load neither pg nor SQLite. PostgreSQL 17 and Node 24.12+
+are supported; plain PostgreSQL and Supabase transaction pooling use the same adapter.
+There is no Supabase Auth or application dependency.
+
+```ts
+import { createPostgresPool, migratePostgres, PostgresAuthStore,
+  PostgresConversationStore } from '@poppykit/client/postgres';
+import { PostgresProviderStore } from '@poppykit/client/provider/postgres';
+const pool = createPostgresPool({ connectionString: process.env.DATABASE_URL });
+// Explicit deployment administration, once before accepting traffic:
+await migratePostgres(pool, 'poppy_client');
+await migratePostgres(pool, 'poppy_provider');
+const auth = new PostgresAuthStore(pool, 'installation:user');
+const conversations = new PostgresConversationStore(pool, 'installation:user');
+const provider = new PostgresProviderStore(pool, 'provider-instance');
+// After requests finish:
+await auth.close(); await conversations.close(); await provider.close();
+await pool.end();
+```
+
+A supplied pool belongs to the caller: adapter `close` stops that adapter and
+never ends the pool. `createPostgresPool` returns a pool owned by its caller.
+Defaults: two connections, 3s acquisition, 10s idle, verified TLS. Supply a CA via
+`ssl: { ca, rejectUnauthorized: true }` for a private root. TLS URL overrides and
+`rejectUnauthorized: false` are rejected; `ssl: false` is an explicit trusted-local
+server choice. Caller-created pools are the caller's responsibility. Queries are
+unnamed/parameterized, and each transaction uses one checked-out connection.
+Transaction/statement limits are 5s and lock waits 2s. No session locks, named
+prepared statements, LISTEN or session state are required by transaction pooling.
+Do not perform HTTP, model or KMS calls in storage callbacks.
+
+Versioned SQL ships at `migrations/postgres/0001_poppy_client.sql` and
+`0001_poppy_provider.sql`. `postgresMigration(schema)` returns its SQL for review;
+`migratePostgres` explicitly applies it atomically or accepts existing version 1.
+Construction/request paths never create or upgrade schemas. Unknown/missing
+versions fail closed. Version checks do not certify arbitrary operator edits to
+table definitions: inspect deployment migration history and stop on schema drift.
+Applied migration files are immutable; corrections require a new migration/version.
+Keep SQL and the deployment's applied-migration ledger under version control.
+Back up and rehearse before applying to durable data. Roll back application code
+only to a compatible schema/API; restore a reviewed backup for destructive reversal.
+No automatic SQLite import, live reset, schema drop or downgrade is supplied.
+
+Auth uses its namespace owner/epoch fence and indexed connection/operation selectors.
+Provider uses indexed enrollment/state/mapping selectors, an atomic capacity counter,
+and bounded per-enrollment operations. These are individual row records, not a
+whole-database snapshot. `cleanup` preserves pending/uncertain auth operations.
+Namespaces are constructor configuration, never request-supplied authority.
+
+Custom backends can run `runClientConversationAdapterContract` and
+`runProviderAdapterContract` from `@poppykit/client/adapter-contract` with two
+handles to a fresh shared namespace. Real process death and engine atomicity still
+need backend-specific checks. Database credentials and encryption keys stay outside
+records, prompts and logs; provider callback URLs remain encrypted by ResultCipher.

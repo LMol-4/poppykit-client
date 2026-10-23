@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.0 (release candidate)
+
+Add bundled Postgres auth/conversation/provider stores and explicit migrations. Provider APIs and targeted storage transactions are asynchronous; await callback/result/revocation operations. SQLite and explicit legacy local-store migration remain supported.
+
 ## 0.1.1
 
 Documentation refresh: registry installation, runnable quickstarts, focused guides

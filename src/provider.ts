@@ -12,8 +12,23 @@ export interface ProviderTransaction {
   remove(kind: string, id: string): void;
   list(kind: string, prefix: string, limit: number): { id: string; value: Row }[];
 }
-/** Must commit synchronously, atomically across processes; callback must not perform I/O. */
-export interface ProviderStore { transaction<T>(action: (tx: ProviderTransaction) => T): T }
+export type ProviderSelection =
+  | { kind: 'enroll'; subjectHash: string; requestHash: string }
+  | { kind: 'identity'; enrollmentId: string; issuer: string }
+  | { kind: 'operation'; enrollmentId: string; operationId: string }
+  | { kind: 'begin'; enrollmentId: string; operationId: string; issuer: string; stateHash?: string; at: number }
+  | { kind: 'callback'; stateHash: string }
+  | { kind: 'revoke'; enrollmentId: string };
+/** Atomic asynchronous I/O around a pure synchronous, selection-bounded callback. */
+export interface ProviderStore { transaction<T>(selection: ProviderSelection, action: (tx: ProviderTransaction) => T): Promise<T> }
+/** Explicit migration aid for existing local synchronous stores; unsuitable for remote I/O. */
+export function adaptLegacyProviderStore(store: { transaction<T>(action: (tx: ProviderTransaction) => T): T }): ProviderStore {
+  return { async transaction(_selection, action) { return store.transaction(tx => {
+    const result = action(tx);
+    if (result && typeof (result as { then?: unknown }).then === 'function') throw new TypeError('provider transaction must be synchronous');
+    return structuredClone(result);
+  }); } };
+}
 export interface ResultCipher { seal(value: string): string; open(value: string): string }
 export function createResultCipher(key: Uint8Array): ResultCipher {
   if (key.length !== 32) throw new Error('provider encryption key must be 32 bytes');
@@ -86,9 +101,11 @@ export function createProvider(options: ProviderOptions) {
     if (starts.length >= 60) throw new ProviderError('rate_limited', starts[0]! + 60000);
     starts.push(now()); tx.put('enrollment', enrollment.enrollmentId, { ...enrollment, starts });
   }
-  function authorizeCompany(credential: string, input: Row): void {
+  const enrollmentId = (credential: string) => credential.split('.')[0] ?? '';
+  const selectedOperation = (credential: string, input: Row): ProviderSelection => ({ kind: 'operation', enrollmentId: enrollmentId(credential), operationId: text(input.operationId) });
+  async function authorizeCompany(credential: string, input: Row): Promise<void> {
     const domain = text(input.domain); text(input.issuer);
-    store.transaction(tx => { const enrollment = auth(tx, credential, text(input.installationId)); if (!enrollment.allowedCompanies.includes(domain)) fail('unauthorized'); });
+    await store.transaction({ kind: 'identity', enrollmentId: enrollmentId(credential), issuer: input.issuer }, tx => { const enrollment = auth(tx, credential, text(input.installationId)); if (!enrollment.allowedCompanies.includes(domain)) fail('unauthorized'); });
   }
   const api = {
     async enroll(request: Request, input: Row) {
@@ -96,10 +113,12 @@ export function createProvider(options: ProviderOptions) {
       const human = await options.authenticateEnrollment(request);
       if (!human?.subject || !human.allowedCompanies.length) fail('unauthorized');
       const installationId = text(input.installationId), key = hash(JSON.stringify([human.subject, text(input.idempotencyKey)]));
-      return store.transaction(tx => {
+      return store.transaction({ kind: 'enroll', subjectHash: hash(human.subject), requestHash: key }, tx => {
         if (tx.get('enrollmentRequest', key)) fail('consumed'); // Credential delivery cannot be replayed from a verifier.
         const subjectKey = hash(human.subject), visitor = tx.get('visitor', subjectKey)?.id ?? id();
-        if (tx.list('enrollment', '', (options.maxEnrollments ?? 10000) + 1).length >= (options.maxEnrollments ?? 10000)) throw new ProviderError('rate_limited', now() + 60000);
+        const count = tx.get('capacity', 'enrollments')?.count ?? 0;
+        if (count >= (options.maxEnrollments ?? 10000)) throw new ProviderError('rate_limited', now() + 60000);
+        tx.put('capacity', 'enrollments', { count: count + 1 });
         tx.put('visitor', subjectKey, { id: visitor });
         const enrollmentId = id(), secret = id();
         tx.put('enrollment', enrollmentId, { installationId, visitor, verifier: hash(secret), allowedCompanies: [...new Set(human.allowedCompanies)], revoked: false, starts: [] });
@@ -109,9 +128,9 @@ export function createProvider(options: ProviderOptions) {
     },
     async identity(credential: string, input: Row) {
       exact(input, ['version', 'installationId', 'domain', 'issuer']);
-      authorizeCompany(credential, input);
+      await authorizeCompany(credential, input);
       const metadata = await verified(text(input.domain), text(input.issuer));
-      return store.transaction(tx => {
+      return store.transaction({ kind: 'identity', enrollmentId: enrollmentId(credential), issuer: input.issuer }, tx => {
         const enrollment = auth(tx, credential, text(input.installationId));
         if (!enrollment.allowedCompanies.includes(metadata.document.organization.domain)) fail('unauthorized');
         return { clientId: options.clientId, userId: user(tx, enrollment.visitor, input.issuer) };
@@ -122,7 +141,7 @@ export function createProvider(options: ProviderOptions) {
       if (!['client-authentication', 'session', 'browser', 'direct'].includes(input.purpose)) fail('binding_conflict');
       text(input.operationId);
       if (input.sessionId !== undefined) text(input.sessionId);
-      authorizeCompany(credential, input);
+      await authorizeCompany(credential, input);
       if (input.purpose === 'client-authentication' && (input.sessionId !== undefined || input.returnTo !== undefined)) fail('binding_conflict');
       if (input.purpose !== 'browser' && input.returnTo !== undefined) fail('binding_conflict');
       if (input.purpose !== 'direct' && input.state !== undefined) fail('binding_conflict');
@@ -131,14 +150,14 @@ export function createProvider(options: ProviderOptions) {
       if (input.purpose === 'browser') text(input.returnTo);
       const metadata = await verified(text(input.domain), text(input.issuer));
       if (input.purpose === 'browser' && (!onDomain(input.returnTo, metadata.document.organization.domain) || !metadata.document.web?.browser_session_endpoint)) fail('binding_conflict');
-      const identity = store.transaction(tx => {
+      const identity = await store.transaction({ kind: 'identity', enrollmentId: enrollmentId(credential), issuer: input.issuer }, tx => {
         const enrollment = auth(tx, credential, text(input.installationId));
         if (!enrollment.allowedCompanies.includes(metadata.document.organization.domain)) fail('unauthorized');
         return { enrollment, userId: user(tx, enrollment.visitor, input.issuer) };
       });
       if (input.purpose === 'browser' && !await options.verifySession?.({ clientId: options.clientId, userId: identity.userId, issuer: input.issuer, sessionId: input.sessionId })) fail('unauthorized');
       const binding = { issuer: input.issuer, domain: metadata.document.organization.domain, purpose: input.purpose, sessionId: input.sessionId ?? null, returnTo: input.returnTo ?? null, stateHash: input.state ? hash(input.state) : null, userId: identity.userId, browserEndpoint: metadata.document.web?.browser_session_endpoint ?? null };
-      return store.transaction(tx => {
+      return store.transaction({ kind: 'begin', enrollmentId: enrollmentId(credential), operationId: input.operationId, issuer: input.issuer, ...(binding.stateHash ? { stateHash: binding.stateHash } : {}), at: now() }, tx => {
         const enrollment = auth(tx, credential, text(input.installationId)), key = `${enrollment.enrollmentId}:${text(input.operationId)}`, existing = tx.get('operation', key);
         if (existing) { if (!same(existing.binding, binding)) fail('binding_conflict'); operation(tx, enrollment, input.operationId); return { expiresAt: existing.expiresAt }; }
         const rows = tx.list('operation', `${enrollment.enrollmentId}:`, 1001);
@@ -156,7 +175,7 @@ export function createProvider(options: ProviderOptions) {
     },
     async assert(credential: string, input: Row) {
       exact(input, ['version', 'installationId', 'operationId', 'purpose']);
-      const snapshot = store.transaction(tx => {
+      const snapshot = await store.transaction(selectedOperation(credential, input), tx => {
         const enrollment = auth(tx, credential, text(input.installationId)), op = operation(tx, enrollment, text(input.operationId));
         if (op.binding.purpose !== input.purpose || !['client-authentication', 'session', 'browser'].includes(input.purpose)) fail('binding_conflict');
         throttle(tx, enrollment); return { enrollment, op };
@@ -171,15 +190,15 @@ export function createProvider(options: ProviderOptions) {
       const signature = await options.signer.sign(new TextEncoder().encode(unsigned));
       if (signature.length !== 64) fail('unavailable');
       // A revoke/cancel racing external KMS signing wins before the assertion leaves the provider.
-      store.transaction(tx => { const enrollment = auth(tx, credential, input.installationId), op = operation(tx, enrollment, input.operationId); tx.put('operation', `${enrollment.enrollmentId}:${input.operationId}`, { ...op, status: 'signed' }); });
+      await store.transaction(selectedOperation(credential, input), tx => { const enrollment = auth(tx, credential, input.installationId), op = operation(tx, enrollment, input.operationId); tx.put('operation', `${enrollment.enrollmentId}:${input.operationId}`, { ...op, status: 'signed' }); });
       return { assertion: `${unsigned}.${Buffer.from(signature).toString('base64url')}`, expiresAt: exp };
     },
-    callback(callbackUrl: string) {
+    async callback(callbackUrl: string) {
       const url = new URL(callbackUrl), base = new URL(options.callbackUrl);
       if (url.origin !== base.origin || url.pathname !== base.pathname || url.username || url.password || url.hash || [...url.searchParams.keys()].some(key => !['state', 'iss', 'code', 'error'].includes(key)) || ['state', 'iss', 'code', 'error'].some(key => url.searchParams.getAll(key).length > 1)) fail('binding_conflict');
       const state = text(url.searchParams.get('state')), issuer = text(url.searchParams.get('iss'));
       if (!!url.searchParams.get('code') === !!url.searchParams.get('error') || callbackUrl.length > 8192) fail('binding_conflict');
-      return store.transaction(tx => {
+      return store.transaction({ kind: 'callback', stateHash: hash(state) }, tx => {
         const lookup = tx.get('state', hash(state)); if (!lookup) fail('binding_conflict');
         const enrollment = tx.get('enrollment', lookup.enrollmentId); if (!enrollment || enrollment.revoked) fail('unauthorized');
         const op = operation(tx, { enrollmentId: lookup.enrollmentId }, lookup.operationId);
@@ -190,9 +209,9 @@ export function createProvider(options: ProviderOptions) {
         return { status: 'ready' };
       });
     },
-    takeResult(credential: string, input: Row) {
+    async takeResult(credential: string, input: Row) {
       exact(input, ['version', 'installationId', 'operationId', 'issuer', 'sessionId']);
-      return store.transaction(tx => {
+      return store.transaction(selectedOperation(credential, input), tx => {
         const enrollment = auth(tx, credential, text(input.installationId)), op = operation(tx, enrollment, text(input.operationId));
         if (op.binding.issuer !== input.issuer || op.binding.sessionId !== input.sessionId || op.binding.purpose !== 'direct') fail('binding_conflict');
         if (op.status !== 'ready') return { status: 'pending' };
@@ -201,17 +220,17 @@ export function createProvider(options: ProviderOptions) {
         return { status: 'completed', callbackUrl };
       });
     },
-    cancel(credential: string, input: Row) {
+    async cancel(credential: string, input: Row) {
       exact(input, ['version', 'installationId', 'operationId']);
-      return store.transaction(tx => {
+      return store.transaction(selectedOperation(credential, input), tx => {
         const enrollment = auth(tx, credential, text(input.installationId)), key = `${enrollment.enrollmentId}:${text(input.operationId)}`, op = tx.get('operation', key);
         if (!op) fail('binding_conflict');
         tx.put('operation', key, { ...op, status: 'canceled', result: null }); return { status: 'canceled' };
       });
     },
-    revokeEnrollment(credential: string, input: Row) {
+    async revokeEnrollment(credential: string, input: Row) {
       exact(input, ['version', 'installationId']);
-      return store.transaction(tx => {
+      return store.transaction({ kind: 'revoke', enrollmentId: enrollmentId(credential) }, tx => {
         const enrollment = auth(tx, credential, text(input.installationId)); tx.put('enrollment', enrollment.enrollmentId, { ...enrollment, revoked: true });
         for (const row of tx.list('operation', `${enrollment.enrollmentId}:`, 1000)) tx.put('operation', row.id, { ...row.value, status: 'canceled', result: null });
         return { status: 'revoked' };
@@ -223,7 +242,7 @@ export function createProvider(options: ProviderOptions) {
         if (request.url === options.clientId && request.method === 'GET') return Response.json({ client_id: options.clientId, client_name: options.clientName, jwks_uri: options.jwksUri, redirect_uris: [options.callbackUrl], token_endpoint_auth_method: 'private_key_jwt' }, { headers });
         if (request.url === options.jwksUri && request.method === 'GET') return Response.json({ keys: (options.publishedKeys ? await options.publishedKeys() : [{ ...await options.signer.publicJwk(), kid: options.signer.kid }]).map(publicKey) }, { headers });
         const url = new URL(request.url);
-        if (url.origin === new URL(options.callbackUrl).origin && url.pathname === new URL(options.callbackUrl).pathname && request.method === 'GET') { api.callback(request.url); return Response.json({ status: 'received' }, { headers }); }
+        if (url.origin === new URL(options.callbackUrl).origin && url.pathname === new URL(options.callbackUrl).pathname && request.method === 'GET') { await api.callback(request.url); return Response.json({ status: 'received' }, { headers }); }
         if (request.method !== 'POST' || !request.headers.get('content-type')?.startsWith('application/json')) fail('binding_conflict');
         const reader = request.body?.getReader(); let body = '', bytes = 0;
         if (reader) try { for (;;) { const part = await reader.read(); if (part.done) break; bytes += part.value.length; if (bytes > 16384) fail('binding_conflict'); body += new TextDecoder().decode(part.value, { stream: true }); } } finally { await reader.cancel().catch(() => {}); }

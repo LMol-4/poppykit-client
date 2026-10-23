@@ -23,3 +23,7 @@ and endpoint; never substitute profile names or model-provided URLs for that bin
 The [quickstart](examples/quickstart.mjs) is executed by CI. Integration examples
 describe adapters your application supplies; they are not built-in browser drivers
 or general API executors.
+
+The optional Postgres entry point ships its adapters, `createPostgresPool`,
+`postgresMigration`, `migratePostgres` and schema-version export; see [storage](STORAGE.md).
+TypeScript Postgres consumers also install `@types/pg@8.23.1` as a development dependency.

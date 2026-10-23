@@ -61,3 +61,10 @@ coverage/
 /tests/sync-protocol.test.mjs
 
 /tests/license.test.mjs
+
+/test-support/postgres.mjs
+/test-support/postgres.mjs.map
+/tests/adapter-contract.test.mjs
+/tests/adapter-contract.test.mjs.map
+/tests/postgres.test.mjs
+/tests/postgres.test.mjs.map

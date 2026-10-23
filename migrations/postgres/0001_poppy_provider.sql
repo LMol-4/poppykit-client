@@ -1,0 +1,14 @@
+CREATE SCHEMA poppy_provider;
+CREATE TABLE poppy_provider.schema_version (version integer PRIMARY KEY CHECK(version > 0));
+INSERT INTO poppy_provider.schema_version VALUES (1);
+CREATE TABLE poppy_provider.records (ns text NOT NULL, kind text NOT NULL, id text NOT NULL, body text NOT NULL CHECK (body::jsonb IS NOT NULL), ordinal bigint GENERATED ALWAYS AS IDENTITY, PRIMARY KEY(ns,kind,id));
+CREATE INDEX operations_enrollment ON poppy_provider.records(ns,(split_part(id,':',1)),id) WHERE kind='operation';
+CREATE INDEX by_conversation ON poppy_provider.records (ns,kind,(body::jsonb->>'conversationId'));
+CREATE INDEX by_binding ON poppy_provider.records (ns,kind,(body::jsonb->>'bindingId'));
+CREATE INDEX by_client ON poppy_provider.records (ns,kind,(body::jsonb->>'clientId'));
+CREATE INDEX by_account ON poppy_provider.records (ns,kind,(body::jsonb->>'accountId'));
+CREATE INDEX by_grant ON poppy_provider.records (ns,kind,(body::jsonb->>'grantId'));
+CREATE INDEX by_phase ON poppy_provider.records (ns,kind,(body::jsonb->>'phase'));
+CREATE INDEX by_expiry ON poppy_provider.records (ns,kind,((body::jsonb->>'expiresAt')::double precision));
+CREATE INDEX by_connection ON poppy_provider.records (ns,kind,(body::jsonb->>'connectionId'));
+CREATE INDEX by_callback ON poppy_provider.records (ns,kind,(body::jsonb#>>'{direct,stateHash}'));
