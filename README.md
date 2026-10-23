@@ -6,13 +6,13 @@ application supplies the agent and trusted infrastructure. [MIT](LICENSE).
 
 ## Install
 
-Version 0.2.0 is a release candidate until its publishing workflow completes.
+Version 0.3.0 is a release candidate until its publishing workflow completes.
 
 Requires Node **24.12.0+**, ESM and HTTPS. CI tests Node 24.12.0 on Linux, macOS and
 Windows; later majors are not separately certified.
 
 ```sh
-npm install @poppykit/client@0.2.0
+npm install @poppykit/client@0.3.0
 ```
 
 ## Discover a company

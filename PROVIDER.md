@@ -1,5 +1,15 @@
 # Optional identity provider
 
+`createBrowserEnrollmentClient` from this subpath is an optional hosting-service
+client. It is independent of company consent and leaves all secret custody with
+the caller. Configure an HTTPS enrollment URL on the provider origin; call
+`start(SHA256(verifier))`, show only its public `browserUrl`, then call
+`status(requestId, verifier)` from trusted code. A ready response contains the
+credential for immediate secure staging, never for model output. `cancel` revokes
+failed/uncertain delivery; hosts must consume results once, retain replay
+tombstones and revoke on failed/lost retrieval. The CLI implements that workflow.
+This optional service uses version1 JSON requests and is not a Poppy extension.
+
 Import `createProvider`, `createProviderClient`, and `createResultCipher` from
 `@poppykit/client/provider`; durable `SqliteProviderStore` is separately exported
 from `@poppykit/client/provider/sqlite`. Neither is loaded by the core import.

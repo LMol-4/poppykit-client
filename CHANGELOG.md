@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 (release candidate)
+
+Add the optional challenge-bound browser enrollment client under `/provider`.
+Existing provider APIs, storage adapters and all protocol authentication methods
+retain their contracts. Enrollment secrets remain caller-controlled.
+
 ## 0.2.0 (release candidate)
 
 Add bundled Postgres auth/conversation/provider stores and explicit migrations. Provider APIs and targeted storage transactions are asynchronous; await callback/result/revocation operations. SQLite and explicit legacy local-store migration remain supported.

@@ -281,3 +281,36 @@ export function createProviderClient(options: { url: string; installationId: str
     cancel: (operationId: string) => call('cancel', { operationId }), revokeEnrollment: () => call('revokeEnrollment', {}) };
 }
 
+/** Browser enrollment is an optional host service, separate from company consent. Keep verifier/results in trusted custody. */
+export function createBrowserEnrollmentClient(options: { url: string; provider: string; company: string; installationId: string; transport: HttpTransport }) {
+  const base = https(options.url), provider = https(options.provider);
+  if (base.search || base.hash || provider.origin !== base.origin) throw new TypeError('enrollment and provider must share origin');
+  async function call(action: string, input: Row): Promise<Row> {
+    const response = await options.transport.fetch(new Request(`${base.href.replace(/\/$/, '')}/${action}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ version: 1, installationId: options.installationId, provider: options.provider, company: options.company, ...input }),
+    }));
+    const body = object(await response.json());
+    if (!response.ok) throw new ProviderError(['unauthorized','binding_conflict','expired','consumed','canceled','rate_limited'].includes(body.error) ? body.error : 'unavailable');
+    return body;
+  }
+  return {
+    async start(challenge: string) {
+      if (!/^[\w-]{43}$/.test(challenge)) throw new TypeError('enrollment challenge');
+      const body = await call('start', { challenge });
+      const browser = https(text(body.browserUrl));
+      if (browser.origin !== base.origin || typeof body.expiresAt !== 'number' || !/^[\w-]{43}$/.test(body.requestId)) fail('binding_conflict');
+      return { requestId: body.requestId as string, browserUrl: browser.href, expiresAt: body.expiresAt as number };
+    },
+    async status(requestId: string, verifier: string) {
+      const body = await call('status', { requestId, verifier });
+      if (!['pending','denied','ready'].includes(body.status)) fail('binding_conflict');
+      if (body.status !== 'ready') return { status: body.status as 'pending' | 'denied' };
+      const clientId = https(text(body.clientId)).href, callbackUrl = https(text(body.callbackUrl)).href;
+      if (new URL(clientId).origin !== provider.origin || new URL(callbackUrl).origin !== provider.origin) fail('binding_conflict');
+      return { status: 'ready' as const, credential: text(body.credential), clientId, callbackUrl };
+    },
+    cancel: (requestId: string, verifier: string) => call('cancel', { requestId, verifier }),
+  };
+}
+

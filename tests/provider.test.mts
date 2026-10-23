@@ -11,12 +11,22 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import type { ProviderRaceAction } from '../test-support/provider-worker.mjs';
 import { decodeJwt, decodeProtectedHeader, importJWK, jwtVerify } from 'jose';
-import { createProvider, createProviderClient, createResultCipher } from '../dist/provider.js';
+import { createProvider, createProviderClient, createResultCipher, createBrowserEnrollmentClient } from '../dist/provider.js';
 import { SqliteProviderStore } from '../dist/provider-sqlite.js';
 import { PostgresProviderStore } from '../dist/provider-postgres.js';
 import { testPool } from '../test-support/postgres.mjs';
 
 const issuer='https://company.example/issuer', domain='company.example', clientId='https://identity.example/client.json', callbackUrl='https://identity.example/callback';
+test('browser enrollment keeps verifier in request bodies and rejects foreign response identity',async()=>{
+  const sent:Request[]=[];let foreign=false;
+  const enrollment=createBrowserEnrollmentClient({url:'https://identity.example/enrollment',provider:'https://identity.example/v1',company:domain,installationId:'installation',transport:{async fetch(request){sent.push(request.clone());return Response.json(request.url.endsWith('/start')?{requestId:'r'.repeat(43),browserUrl:'https://identity.example/approve?id=public',expiresAt:Date.now()+300000}:{status:'ready',credential:'PRIVATE_ENROLLMENT',clientId:foreign?'https://foreign.example/client.json':clientId,callbackUrl});}}});
+  const started=await enrollment.start('c'.repeat(43));assert.equal(started.requestId,'r'.repeat(43));
+  const ready=await enrollment.status(started.requestId,'PRIVATE_VERIFIER');assert.equal(ready.status,'ready');
+  assert.ok(sent.every(request=>!request.url.includes('PRIVATE')&&!request.headers.has('authorization')));
+  assert.equal((await sent[1].json()).verifier,'PRIVATE_VERIFIER');
+  foreign=true;await assert.rejects(enrollment.status(started.requestId,'PRIVATE_VERIFIER'),{code:'binding_conflict'});
+  assert.throws(()=>createBrowserEnrollmentClient({url:'https://foreign.example/enroll',provider:'https://identity.example/v1',company:domain,installationId:'installation',transport:{fetch:async()=>new Response()}}));
+});
 async function fixture() {
   const dir=mkdtempSync(join(tmpdir(),'provider-')), path=join(dir,'provider.sqlite');
   const pool=process.env.D1_POSTGRES==='1'?testPool():undefined, namespace=(process.env.D1_NAMESPACE??'d1')+':'+path;

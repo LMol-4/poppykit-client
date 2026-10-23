@@ -11,7 +11,7 @@ for complete option/result types. This map describes the supported integration s
 | `@poppykit/client` | `ApiTarget`, `AgentBrowserController`, `FeedbackReport` types | [integrations](INTEGRATIONS.md) |
 | `@poppykit/client/sqlite` | `SqliteAuthStore`, `SqliteConversationStore` | [storage](STORAGE.md) |
 | `@poppykit/client/memory` | `MemoryConversationStore` (non-durable) | [storage](STORAGE.md) |
-| `@poppykit/client/provider` | `createProvider`, `createProviderClient`, `createResultCipher` | [provider](PROVIDER.md) |
+| `@poppykit/client/provider` | `createProvider`, `createProviderClient`, `createResultCipher`, `createBrowserEnrollmentClient` | [provider](PROVIDER.md) |
 | `@poppykit/client/provider/sqlite` | `SqliteProviderStore` | [provider](PROVIDER.md) |
 
 ClientAuth methods include `start/get/list/target`, `authorization`,

@@ -1,6 +1,6 @@
 {
   "name": "@poppykit/client",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": false,
   "description": "Personal Agent Protocol client SDK",
   "repository": {
