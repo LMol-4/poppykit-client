@@ -59,3 +59,5 @@ coverage/
 /scripts/install-candidate.mjs
 
 /tests/sync-protocol.test.mjs
+
+/tests/license.test.mjs

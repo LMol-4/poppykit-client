@@ -1,7 +1,8 @@
 {
   "unit": [
     "tests/auth/challenge.test.mts",
-    "tests/sync-protocol.test.mts"
+    "tests/sync-protocol.test.mts",
+    "tests/license.test.mts"
   ],
   "contracts": [
     "tests/auth/client-auth.test.mts",
