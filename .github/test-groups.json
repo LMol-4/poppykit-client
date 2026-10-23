@@ -1,0 +1,20 @@
+{
+  "unit": [
+    "tests/auth/challenge.test.mjs"
+  ],
+  "contracts": [
+    "tests/auth/client-auth.test.mjs",
+    "tests/storage.test.mjs",
+    "tests/network/network.test.mjs",
+    "tests/conversation.test.mjs",
+    "tests/provider.test.mjs"
+  ],
+  "integration": [
+    "tests/integrations.test.mjs"
+  ],
+  "validation": [
+    "tests/release.test.mjs",
+    "tests/workflows.test.mjs",
+    "tests/registry.test.mjs"
+  ]
+}

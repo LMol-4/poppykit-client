@@ -1,56 +1,13 @@
 name: CI
-
 on:
   push:
   pull_request:
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  check:
-    name: Build, types and unit tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24.12.0'
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
-      - run: pnpm build
-      - run: pnpm test
-      - run: npm pack --ignore-scripts
-      - uses: actions/upload-artifact@v4
-        with:
-          name: client-candidate
-          path: poppykit-client-0.0.0.tgz
-          if-no-files-found: error
-  packaged:
-    name: Client packaged ${{ matrix.os }}
-    needs: check
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
-    steps:
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24.12.0'
-      - uses: actions/download-artifact@v4
-        with:
-          name: client-candidate
-      - run: node -e "const fs=require('node:fs');fs.mkdirSync('clean install ü',{recursive:true});fs.writeFileSync('clean install ü/package.json',JSON.stringify({private:true,type:'module'}))"
-      - run: npm install --prefix "clean install ü" --ignore-scripts --no-package-lock --no-audit --no-fund ./poppykit-client-0.0.0.tgz
-      - working-directory: clean install ü
-        run: node --input-type=module -e "await import('@poppykit/client');await import('@poppykit/client/provider');const {SqliteProviderStore}=await import('@poppykit/client/provider/sqlite');const s=new SqliteProviderStore(':memory:');s.close();await import('@poppykit/client/sqlite');await import('@poppykit/client/memory');console.log(process.platform,process.version)"
+  verify:
+    uses: ./.github/workflows/verify.yml
