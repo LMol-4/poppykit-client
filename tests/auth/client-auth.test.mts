@@ -9,9 +9,76 @@ import { randomUUID } from 'node:crypto';
 import { calculateJwkThumbprint, CompactSign } from 'jose';
 import { createClientAuth, initialClientAuthState, AuthFailure, createMetadataResolver } from '../../dist/index.js';
 import { createFakeCompany, fakeTransport } from './fake-issuer.mjs';
+import { SqliteAuthStore } from '../../dist/sqlite.js';
+import { PostgresAuthStore } from '../../dist/postgres.js';
+import { testPool } from '../../test-support/postgres.mjs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const CLIENT_ID = 'https://agent.test/agent.json';
 const REDIRECT = 'https://agent.test/oauth/callback';
+for (const engine of ['SQLite', ...(process.env.D1_POSTGRES === '1' ? ['Postgres'] : [])]) test(`global auth history pruning uses bounded durable selectors (${engine})`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'auth-history-')), path = join(dir, 'auth.sqlite');
+  const pool = engine === 'Postgres' ? testPool() : undefined;
+  const namespace = `${process.env.D1_NAMESPACE ?? 'local'}:${path}`;
+  const open = () => pool ? new PostgresAuthStore(pool, namespace) : new SqliteAuthStore(path);
+  const store = open(); let second: ReturnType<typeof open> | undefined;
+  try {
+    const env = await setup(), auth = createClientAuth({ ...env.options, store });
+    const initial = await auth.start(env.company.domain);
+    const direct = await beginAndApprove(auth, env.company, initial.connection.id);
+    const restore = loseTokenResponses(env.transport, env.company);
+    const uncertain = await auth.completeSignIn({ callbackUrl: direct.callbackUrl, browserBinding: BROWSER });
+    restore(); assert.equal(uncertain.status, 'uncertain');
+    const pending = (await auth.beginSignIn(initial.connection.id, { scopes: ['poppy:read'], redirectUri: REDIRECT, browserBinding: BROWSER, force: true })).outcome;
+    const starts: string[] = [], completions: string[] = []; let oldestCallback = '';
+    for (let i = 0; i < 104; i++) {
+      env.clock.t += 2000;
+      const started = await auth.start(env.company.domain); starts.push(started.operationId);
+      const approved = await beginAndApprove(auth, env.company, started.connection.id);
+      if (!oldestCallback) oldestCallback = approved.callbackUrl;
+      const completed = await auth.completeSignIn({ callbackUrl: approved.callbackUrl, browserBinding: BROWSER }); completions.push(completed.operationId);
+    }
+    assert.equal(await auth.operation(starts[0]), null);
+    assert.equal(await auth.operation(completions[0]), null);
+    assert.equal((await auth.operation(uncertain.operationId))?.status, 'uncertain');
+    assert.equal((await auth.operation(pending.operationId))?.status, 'pending');
+    second = open(); const restarted = createClientAuth({ ...env.options, store: second });
+    assert.equal((await restarted.operation(completions.at(-1)!))?.status, 'completed');
+    assert.equal((await restarted.operation(uncertain.operationId))?.status, 'uncertain');
+    env.clock.t += 2000;
+    await Promise.all([auth.start(env.company.domain), restarted.start(env.company.domain)]);
+    const history = await store.read({ issuer: env.company.issuer, history: true });
+    assert.equal(Object.values(history.operations).filter(op => op.phase === 'terminal' && op.status !== 'uncertain').length, 101);
+    await assert.rejects(restarted.completeSignIn({ callbackUrl: oldestCallback, browserBinding: BROWSER }), { code: 'invalid_callback' });
+    assert.equal((await restarted.completeSignIn({ callbackUrl: direct.callbackUrl, browserBinding: BROWSER })).status, 'uncertain');
+    assert.equal((await restarted.operation(uncertain.operationId))?.status, 'uncertain');
+  } finally { await second?.close(); await store.close(); await pool?.end(); await rm(dir, { recursive: true, force: true }); }
+});
+test('independently constructed OAuth callbacks accept optional/unknown fields and preserve registered query bindings', async () => {
+  const env = await setup(), redirectUri = REDIRECT + '?route=fixed&route=second';
+  const auth = createClientAuth({ ...env.options, redirectUris: [redirectUri] });
+  const connection = (await auth.start(env.company.domain)).connection;
+  for (const error of ['access_denied', 'server_error']) {
+    const begun = await auth.beginSignIn(connection.id, { scopes: ['poppy:read'], redirectUri, browserBinding: 'independent-browser-binding-012345', force: true });
+    const state = new URL(expectValue(begun.authorizationUrl)).searchParams.get('state')!;
+    const callback = new URL(redirectUri);
+    for (const [name, value] of Object.entries({ state, iss: env.company.issuer, error, error_description: 'PRIVATE_DETAIL', error_uri: 'https://shop.test/error', unknown: 'ignored' })) callback.searchParams.set(name, value);
+    for (const bad of [callback.href.replace('route=fixed', 'route=forged'), callback.href + '&route=forged', callback.href + '&code=extra', callback.href + '&error=duplicate', callback.href + '&iss=duplicate', callback.href.replace(state, 'forged-state')]) {
+      await assert.rejects(auth.completeSignIn({ callbackUrl: bad, browserBinding: 'independent-browser-binding-012345' }), { code: 'invalid_callback' });
+    }
+    await assert.rejects(auth.completeSignIn({ callbackUrl: callback.href, browserBinding: 'wrong-browser' }), { code: 'invalid_callback' });
+    const result = await auth.completeSignIn({ callbackUrl: callback.href, browserBinding: 'independent-browser-binding-012345' });
+    assert.equal(result.status, error === 'access_denied' ? 'denied' : 'failed');
+    assert.ok(!JSON.stringify(result).includes('PRIVATE_DETAIL'));
+    assert.deepEqual(await auth.completeSignIn({ callbackUrl: callback.href, browserBinding: 'independent-browser-binding-012345' }), result);
+  }
+  // A success response built by the independent fake issuer may also carry unknown fields.
+  const success = await setup(), started = await success.auth.start(success.company.domain);
+  const direct = await beginAndApprove(success.auth, success.company, started.connection.id);
+  assert.equal((await success.auth.completeSignIn({ callbackUrl: direct.callbackUrl + '&future_extension=value', browserBinding: BROWSER })).status, 'completed');
+});
 const EC = { name: 'ECDSA', namedCurve: 'P-256' };
 const ES256 = { name: 'ECDSA', hash: 'SHA-256' };
 
@@ -546,7 +613,6 @@ test('wrong callbacks leave the operation untouched; duplicates return the recor
     [tweak(url => url.searchParams.delete('iss')), BROWSER],
     [tweak(url => url.searchParams.set('state', 'forged-state-value')), BROWSER],
     [tweak(url => url.searchParams.append('code', 'second')), BROWSER],
-    [tweak(url => url.searchParams.set('extra', '1')), BROWSER],
     [tweak(url => { url.pathname = '/oauth/other'; }), BROWSER],
     [tweak(url => { url.host = 'evil.test'; }), BROWSER],
     [tweak(url => { url.hash = 'x'; }), BROWSER],

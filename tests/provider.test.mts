@@ -17,6 +17,47 @@ import { PostgresProviderStore } from '../dist/provider-postgres.js';
 import { testPool } from '../test-support/postgres.mjs';
 
 const issuer='https://company.example/issuer', domain='company.example', clientId='https://identity.example/client.json', callbackUrl='https://identity.example/callback';
+test('HTTP decoding preserves split Unicode and rejects malformed, truncated and oversized bytes before enrollment', async () => {
+  const f = await fixture();
+  try {
+    let calls = 0;
+    const api = createProvider({ ...f.options, authenticateEnrollment: async request => { calls++; return f.options.authenticateEnrollment(request); } });
+    const post = (action: string, bytes: Uint8Array, credential = '') => api.handle(new Request(`https://identity.example/v1/${action}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-human': 'authenticated', authorization: `Bearer ${credential}` },
+      body: new ReadableStream({ start(controller) { for (const byte of bytes) controller.enqueue(Uint8Array.of(byte)); controller.close(); } }), duplex: 'half',
+    } as RequestInit));
+    const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
+    for (const bytes of [Uint8Array.of(0xc3, 0x28), Uint8Array.of(0xe2, 0x98), new Uint8Array(16385).fill(32)]) {
+      const response = await post('enroll', bytes); assert.equal(response.status, 409); assert.deepEqual(await response.json(), { error: 'binding_conflict' });
+    }
+    assert.equal(calls, 0);
+    const installationId = 'device-☘😀', operationId = 'op-☘😀';
+    const response = await post('enroll', encode({ version: 1, installationId, idempotencyKey: 'split-utf8' }));
+    assert.equal(response.status, 200); const enrollment = await response.json();
+    assert.equal(calls, 1);
+    const begun = await post('begin', encode({ version: 1, installationId, operationId, domain, issuer, purpose: 'session' }), enrollment.credential);
+    assert.equal(begun.status, 200);
+    assert.ok((await f.api.assert(enrollment.credential, { version: 1, installationId, operationId, purpose: 'session' })).assertion);
+  } finally { await f.close(); }
+});
+test('independent HTTP success and denial callbacks ignore unknown fields while preserving recognized bindings', async () => {
+  const f = await fixture();
+  try {
+    const enrollment = await f.enroll();
+    for (const denied of [false, true]) {
+      const state = randomBytes(32).toString('base64url'), operationId = `oauth-${denied}`;
+      await f.api.begin(enrollment.credential, { version: 1, installationId: 'install-a', operationId, domain, issuer, purpose: 'direct', sessionId: 'owned', state });
+      const callback = new URL(callbackUrl);
+      callback.search = new URLSearchParams({ state, iss: issuer, ...(denied ? { error: 'access_denied', error_description: 'PRIVATE_DETAIL', error_uri: 'https://company.example/error' } : { code: 'PRIVATE_CODE' }), extra: 'ignored' }).toString();
+      for (const bad of [callback.href + '&code=duplicate', callback.href + '&error=duplicate', callback.href + '&state=duplicate', callback.href.replace(encodeURIComponent(issuer), 'https%3A%2F%2Fforeign.example')]) {
+        assert.equal((await f.api.handle(new Request(bad))).status, 409);
+      }
+      assert.equal((await f.api.handle(new Request(callback))).status, 200);
+      const result = await f.api.takeResult(enrollment.credential, { version: 1, installationId: 'install-a', operationId, issuer, sessionId: 'owned' });
+      assert.equal(result.callbackUrl, callback.href);
+    }
+  } finally { await f.close(); }
+});
 test('provider client classifies malformed JSON without exposing its contents',async()=>{
   const client=createProviderClient({url:'https://identity.example/v1',domain,installationId:'test',credential:async()=> 'PRIVATE_CREDENTIAL',transport:{fetch:async()=>new Response('PRIVATE_NOT_JSON',{status:200})}});
   await assert.rejects(client.identity(issuer),error=>{assert.equal((error as {code:string}).code,'invalid_response');assert.ok(!String(error).includes('PRIVATE'));return true;});
@@ -90,7 +131,7 @@ test('callback results encrypted, correlated, atomic, one time; restart, replay,
     await assert.rejects(f.api.takeResult(b.credential,{...take,installationId:'install-b'}),{code:'binding_conflict'});
     await assert.rejects(f.api.takeResult(a.credential,{...take,installationId:'install-b'}),{code:'unauthorized'});
     assert.equal((await f.persisted()).includes(Buffer.from('PRIVATE_CODE')),false);
-    const second=f.second();try{const resumed=createProvider({...f.options,store:second});assert.equal((await resumed.takeResult(a.credential,take)).callbackUrl,callback);await assert.rejects(f.api.takeResult(a.credential,take),{code:'consumed'});await assert.rejects(f.api.callback(callback),{code:'consumed'});}finally{await second.close();}
+    const second=f.second();try{const resumed=createProvider({...f.options,store:second});assert.equal((await resumed.takeResult(a.credential,take)).callbackUrl,callback);await assert.rejects(f.api.takeResult(a.credential,take),{code:'consumed'});assert.equal((await f.api.callback(callback)).status,'consumed');await assert.rejects(f.api.callback(callback.replace('PRIVATE_CODE','OTHER')),{code:'binding_conflict'});await assert.rejects(resumed.takeResult(a.credential,take),{code:'consumed'});}finally{await second.close();}
     await f.api.begin(a.credential,{...input,operationId:'cancel',state:randomBytes(32).toString('base64url')});await f.api.cancel(a.credential,{version:1,installationId:'install-a',operationId:'cancel'});
     await assert.rejects(f.api.takeResult(a.credential,{...take,operationId:'cancel'}),{code:'canceled'});
     f.setTime(1600001);await assert.rejects(f.api.takeResult(a.credential,take),{code:'expired'});

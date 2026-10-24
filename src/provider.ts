@@ -78,12 +78,12 @@ export function createProvider(options: ProviderOptions) {
     if (extra || !row || row.revoked || row.installationId !== installationId || hash(secret ?? '') !== row.verifier) fail('unauthorized');
     return { ...row, enrollmentId };
   }
-  function operation(tx: ProviderTransaction, enrollment: Row, operationId: string): Row {
+  function operation(tx: ProviderTransaction, enrollment: Row, operationId: string, allowConsumed = false): Row {
     const row = tx.get('operation', `${enrollment.enrollmentId}:${operationId}`);
     if (!row) fail('binding_conflict');
     if (row.expiresAt <= now()) fail('expired');
     if (row.status === 'canceled') fail('canceled');
-    if (row.status === 'consumed') fail('consumed');
+    if (row.status === 'consumed' && !allowConsumed) fail('consumed');
     return row;
   }
   async function verified(domain: string, issuer: string): Promise<CompanyMetadata> {
@@ -195,16 +195,16 @@ export function createProvider(options: ProviderOptions) {
     },
     async callback(callbackUrl: string) {
       const url = new URL(callbackUrl), base = new URL(options.callbackUrl);
-      if (url.origin !== base.origin || url.pathname !== base.pathname || url.username || url.password || url.hash || [...url.searchParams.keys()].some(key => !['state', 'iss', 'code', 'error'].includes(key)) || ['state', 'iss', 'code', 'error'].some(key => url.searchParams.getAll(key).length > 1)) fail('binding_conflict');
+      if (url.origin !== base.origin || url.pathname !== base.pathname || url.username || url.password || url.hash || ['state', 'iss', 'code', 'error', 'error_description', 'error_uri'].some(key => url.searchParams.getAll(key).length > 1)) fail('binding_conflict');
       const state = text(url.searchParams.get('state')), issuer = text(url.searchParams.get('iss'));
-      if (!!url.searchParams.get('code') === !!url.searchParams.get('error') || callbackUrl.length > 8192) fail('binding_conflict');
+      if (url.searchParams.has('code') === url.searchParams.has('error') || !(url.searchParams.get('code') || url.searchParams.get('error')) || callbackUrl.length > 8192) fail('binding_conflict');
       return store.transaction({ kind: 'callback', stateHash: hash(state) }, tx => {
         const lookup = tx.get('state', hash(state)); if (!lookup) fail('binding_conflict');
         const enrollment = tx.get('enrollment', lookup.enrollmentId); if (!enrollment || enrollment.revoked) fail('unauthorized');
-        const op = operation(tx, { enrollmentId: lookup.enrollmentId }, lookup.operationId);
+        const op = operation(tx, { enrollmentId: lookup.enrollmentId }, lookup.operationId, true);
         if (op.binding.issuer !== issuer || op.binding.purpose !== 'direct') fail('binding_conflict');
         const fingerprint = hash(callbackUrl);
-        if (op.status === 'ready') { if (op.resultHash !== fingerprint) fail('binding_conflict'); return { status: 'ready' }; }
+        if (op.status === 'ready' || op.status === 'consumed') { if (op.resultHash !== fingerprint) fail('binding_conflict'); return { status: op.status }; }
         tx.put('operation', `${lookup.enrollmentId}:${lookup.operationId}`, { ...op, status: 'ready', result: cipher.seal(callbackUrl), resultHash: fingerprint });
         return { status: 'ready' };
       });
@@ -245,7 +245,11 @@ export function createProvider(options: ProviderOptions) {
         if (url.origin === new URL(options.callbackUrl).origin && url.pathname === new URL(options.callbackUrl).pathname && request.method === 'GET') { await api.callback(request.url); return Response.json({ status: 'received' }, { headers }); }
         if (request.method !== 'POST' || !request.headers.get('content-type')?.startsWith('application/json')) fail('binding_conflict');
         const reader = request.body?.getReader(); let body = '', bytes = 0;
-        if (reader) try { for (;;) { const part = await reader.read(); if (part.done) break; bytes += part.value.length; if (bytes > 16384) fail('binding_conflict'); body += new TextDecoder().decode(part.value, { stream: true }); } } finally { await reader.cancel().catch(() => {}); }
+        const decoder = new TextDecoder('utf-8', { fatal: true });
+        if (reader) try {
+          for (;;) { const part = await reader.read(); if (part.done) break; bytes += part.value.length; if (bytes > 16384) fail('binding_conflict'); body += decoder.decode(part.value, { stream: true }); }
+          body += decoder.decode();
+        } catch { fail('binding_conflict'); } finally { await reader.cancel().catch(() => {}); }
         const input = object(JSON.parse(body)); if (input.version !== 1) fail('binding_conflict');
         const action = url.pathname.slice(url.pathname.lastIndexOf('/') + 1), credential = request.headers.get('authorization')?.match(/^Bearer (\S+)$/)?.[1] ?? '';
         const allowed = ['enroll', 'identity', 'begin', 'assert', 'takeResult', 'cancel', 'revokeEnrollment'] as const;

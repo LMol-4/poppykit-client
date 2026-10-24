@@ -1,9 +1,8 @@
 # Persistence and recovery
 
-Use targeted storage contracts. Node 24.12.0
-or later is required. The optional `@poppykit/client/sqlite` entry point exports
+Use targeted storage contracts. Node 24.x, at least 24.22.1, is required. The optional `@poppykit/client/sqlite` entry point exports
 `SqliteAuthStore` and `SqliteConversationStore`; importing the client core does not
-load SQLite. `node:sqlite` is experimental in the tested Node 24.12.0 runtime.
+load SQLite. `node:sqlite` is experimental in the tested Node 24.22.1 runtime.
 Consumers can implement `AuthStore` and `ConversationStore` using their own database.
 
 ```ts
@@ -29,6 +28,17 @@ Recovery pages nonterminal operation IDs in batches of 100, then rechecks each
 operation and its owner inside its transaction. `cleanup(before, limit)` removes
 only terminal, non-uncertain auth history; the limit is at most 1000. It does not
 erase grants, pending exchanges, uncertain results, or secrets.
+
+Starting a connection or sign-in also selects bounded terminal history with
+`history: true`: at most the newest 201 eligible operation records across this
+auth namespace, without loading their connections. Before creating new work it
+keeps 100 terminal start/sign-in results (creation time, then ID order); the just
+completed result can bring that to 101. Repeated starts drain older excess in
+bounded batches. Pending, dispatched, staged and uncertain operations remain;
+grant references, retirement cleanup and conversation receipts are unaffected.
+Custom AuthStore adapters must honor this history selection. Old pruned callback
+state becomes unknown; uncertain callbacks retain their recorded result and are
+never exchanged again. No vault or connection reset is involved.
 
 Transactions must serialize conflicting domain updates across processes, roll back
 on exceptions, reject asynchronous mutation callbacks and non-JSON persisted values,
@@ -100,7 +110,7 @@ never deletes company history, revokes access or cancels accepted business work.
 The optional `@poppykit/client/postgres` exports `PostgresAuthStore` and
 `PostgresConversationStore`; `/provider/postgres` exports `PostgresProviderStore`.
 Install the optional peer `pg@8.23.1` only when choosing these subpaths.
-Protocol-only imports load neither pg nor SQLite. PostgreSQL 17 and Node 24.12+
+Protocol-only imports load neither pg nor SQLite. PostgreSQL 17 and Node 24.x (at least 24.22.1)
 are supported; plain PostgreSQL and Supabase transaction pooling use the same adapter.
 There is no Supabase Auth or application dependency.
 

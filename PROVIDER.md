@@ -14,13 +14,27 @@ Import `createProvider`, `createProviderClient`, and `createResultCipher` from
 `@poppykit/client/provider`; durable `SqliteProviderStore` is separately exported
 from `@poppykit/client/provider/sqlite`. Neither is loaded by the core import.
 The wire protocol remains PoppyKit provider **v1**; the 0.2 TypeScript API uses async storage, not a Personal Agent Protocol extension.
-Node 24.12+ is required for the SQLite reference adapter.
+Node 24.x (at least 24.22.1) is required for the SQLite reference adapter.
 
 An operator supplies HTTPS hosting, a provider client metadata URL, JWKS URL,
 HTTPS callback URL on that same domain, an ES256 signer/KMS, a verified company
 metadata resolver, authenticated enrollment and encrypted callback-result storage.
 The provider has no company account-token vault, token-exchange proxy, login UI,
 deployment dependency or cloud dependency.
+
+HTTP JSON is limited to 16 KiB of UTF-8 bytes. Chunk boundaries preserve Unicode;
+invalid/truncated UTF-8 fails before enrollment, signing or operation creation.
+Callbacks accept optional OAuth error details and unknown response fields while
+checking state/issuer, destination and duplicate recognized fields. An identical
+callback after consumption acknowledges `consumed` without recreating ciphertext;
+a changed callback conflicts. `takeResult` remains one-time, including after restart.
+
+`ProviderError` codes `unauthorized`, `expired` and `canceled` are definite
+rejections. `consumed` means retrieval already happened and does not prove the
+caller staged its result. Network failure, `unavailable` and `invalid_response`
+are ambiguous; preserve uncertainty rather than repeating one-time retrieval.
+`rate_limited` carries a retry deadline. Never expose raw errors, credentials,
+assertions or callback URLs through model tools.
 
 ```js
 import { createProvider, createResultCipher } from '@poppykit/client/provider';

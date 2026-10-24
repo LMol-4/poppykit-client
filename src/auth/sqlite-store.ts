@@ -49,7 +49,10 @@ export class SqliteAuthStore implements AuthStore {
     const rows = (table: typeof tables[number], clause: string, ...params: string[]) => {
       for (const row of this.db.prepare(`SELECT id,body FROM auth_${table} ${clause}`).all(...params)) (state[table] as Record<string, unknown>)[row.id as string] = JSON.parse(row.body as string);
     };
-    if ('issuer' in selection) { get('identities', selection.issuer); return state; }
+    const history = () => {
+      if (selection.history) rows('operations', "WHERE json_extract(body,'$.phase')='terminal' AND json_extract(body,'$.status')!='uncertain' AND json_extract(body,'$.kind')!='renew' ORDER BY json_extract(body,'$.createdAt') DESC,id DESC LIMIT 201");
+    };
+    if ('issuer' in selection) { get('identities', selection.issuer); history(); return state; }
     if ('connectionId' in selection) get('connections', selection.connectionId);
     else if ('operationId' in selection) get('operations', selection.operationId);
     else if ('callbackHash' in selection) rows('operations', "WHERE json_extract(body,'$.direct.stateHash')=?", selection.callbackHash);
@@ -63,7 +66,7 @@ export class SqliteAuthStore implements AuthStore {
       }
     }
     for (const operation of Object.values(state.operations)) if (operation.grantId) get('grants', operation.grantId);
-    return state;
+    history(); return state;
   }
   async read(selection: AuthSelection): Promise<ClientAuthState> {
     this.db.exec('BEGIN');

@@ -203,8 +203,11 @@ function allowedHost(value: string, hosts: readonly string[]): boolean {
   const hostname = new URL(value).hostname.toLowerCase();
   return hosts.some(host => hostname === host.toLowerCase() || hostname.endsWith(`.${host.toLowerCase()}`));
 }
-// Redirect identity without the response parameters; origin alone would hide userinfo.
-const redirectShape = (url: URL) => JSON.stringify([url.origin, url.username, url.password, url.pathname, [...url.searchParams]]);
+// Ignore unknown OAuth response fields, but preserve every registered redirect component.
+function redirectMatches(url: URL, registered: URL): boolean {
+  return url.origin === registered.origin && url.username === registered.username && url.password === registered.password && url.pathname === registered.pathname
+    && [...registered.searchParams.keys()].every(key => JSON.stringify(url.searchParams.getAll(key)) === JSON.stringify(registered.searchParams.getAll(key)));
+}
 
 function parseCallback(callbackUrl: unknown): { params: Record<string, string>; base: URL } {
   if (typeof callbackUrl !== 'string' || !URL.canParse(callbackUrl)) throw new AuthFailure('invalid_callback');
@@ -465,8 +468,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   }
   // Terminal start/sign-in results only answer late duplicate callbacks, so keep the newest few; uncertain ones decide the cleanup status.
   function pruneHistory(state: ClientAuthState): void {
-    // Newest first; reverse() keeps insertion order as the tie-break for equal timestamps.
-    const done = Object.values(state.operations).reverse().filter(op => op.kind !== 'renew' && op.phase === 'terminal' && op.status !== 'uncertain').sort((a, b) => b.createdAt - a.createdAt);
+    const done = Object.values(state.operations).filter(op => op.kind !== 'renew' && op.phase === 'terminal' && op.status !== 'uncertain').sort((a, b) => b.createdAt - a.createdAt || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
     for (const op of done.slice(KEEP_OPERATIONS)) delete state.operations[op.id];
   }
   function renewOperation(state: ClientAuthState, id: string, connection: ConnectionRecord, grant: GrantRecord | null, at: number, resource: string | null, scopes: string[]): OperationRecord {
@@ -1028,7 +1030,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const token = await signedOutToken(metadata, userId, dpopKeyRef, null, null, anonymous);
       const secretRef = await stageSessionToken(token.access_token);
       const id = randomId('con_'), operationId = randomId('op_');
-      return commit({ issuer }, [secretRef], state => {
+      return commit({ issuer, history: true }, [secretRef], state => {
         // A reset or competing identity since we signed means this session belongs to no current identity.
         if (!anonymous && own(state.identities, issuer)?.dpopKeyRef !== dpopKeyRef) throw new AuthFailure('state_changed');
         const connection: ConnectionRecord = {
@@ -1109,7 +1111,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const verifier = b64(crypto.getRandomValues(new Uint8Array(32)));
       const verifierRef = method === 'direct' ? await secrets.stage(verifier) : null;
       const createdAt = now(), operationId = randomId('op_');
-      const outcome = await commit({ connectionId }, [verifierRef], draft => {
+      const outcome = await commit({ connectionId, history: true }, [verifierRef], draft => {
         const current = own(draft.connections, connectionId);
         if (!current || current.generation !== connection.generation || current.status !== connection.status || current.sessionId !== connection.sessionId) throw new AuthFailure('state_changed', connectionId);
         pruneHistory(draft);
@@ -1142,7 +1144,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const found = Object.values(snapshot.operations).find(operation => operation.kind === 'sign_in' && operation.epoch === snapshot.epoch && operation.direct?.stateHash === stateHash);
       const direct = found?.direct;
       // A wrong browser, redirect or issuer (mix-up, spec 4.5) leaves the operation untouched so the genuine callback still completes.
-      if (!found || !direct || direct.browserHash !== browserHash || redirectShape(base) !== redirectShape(new URL(direct.redirectUri)) || params.iss !== direct.issuer) throw new AuthFailure('invalid_callback');
+      if (!found || !direct || direct.browserHash !== browserHash || !redirectMatches(base, new URL(direct.redirectUri)) || params.iss !== direct.issuer) throw new AuthFailure('invalid_callback');
       checkCooldown(await record(found.connectionId));
       const operationId = found.id;
       const verifier = found.phase === 'prepared' && params.code !== undefined ? await secrets.read(direct.verifierRef) : null;

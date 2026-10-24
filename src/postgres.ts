@@ -42,6 +42,7 @@ export class PostgresAuthStore implements AuthStore {
       }
       for (const operation of Object.values(state.operations)) if (operation.grantId) await one('grants', operation.grantId);
     }
+    if (selection.history) await rows('operations', "AND body::jsonb->>'phase'='terminal' AND body::jsonb->>'status'!='uncertain' AND body::jsonb->>'kind'!='renew' ORDER BY (body::jsonb->>'createdAt')::double precision DESC,id COLLATE \"C\" DESC LIMIT 201");
     return state;
   }
   read(selection: AuthSelection): Promise<ClientAuthState> { return this.db.run(() => this.select(selection)); }

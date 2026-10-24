@@ -16,6 +16,11 @@ implements this adapter. Values are cleared after each submission and never
 persisted by the SDK or exposed in public results. Input adapters must not log
 values, keep copies, or return them through model tools.
 
+Direct callbacks accept OAuth error details and ignore unknown response fields.
+The registered origin/path/query, browser binding, state and exact issuer still
+have to match; duplicate recognized fields and a simultaneous code/error fail.
+Error descriptions and error URLs are never included in public auth outcomes.
+
 First-time partial grants complete with `grantedScopes` and `missingScopes`.
 Replacement preserves every old grant scope by default. An explicit
 `requiredExistingScopes` subset permits dropping other old scopes. A rejected
