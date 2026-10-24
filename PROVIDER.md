@@ -36,6 +36,30 @@ are ambiguous; preserve uncertainty rather than repeating one-time retrieval.
 `rate_limited` carries a retry deadline. Never expose raw errors, credentials,
 assertions or callback URLs through model tools.
 
+Postgres hosts can explicitly enlist the store in their existing transaction:
+
+```js
+await companyDatabase.withTransaction(async connection => {
+  await providerStore.withTransaction(connection, async () => {
+    const callback = await issuer.completeAuthorization(id, browserBinding, decision);
+    await provider.callback(callback.href);
+    await saveHostReceipt(connection); // host-owned bounded SQL
+  });
+});
+```
+
+The handle must come from `PostgresCompanyDatabase.withTransaction` (or an
+equivalent host guard that rejects expired/escaped handles), on the same database
+with the required provider schema privileges. Normal operations still use the
+configured provider pool; enlisted operations never fall back to it. The host
+owns commit/rollback and must propagate failures to abort the whole transaction.
+Only bounded SQL and synchronous cryptography belong in the scope; no HTTP,
+model, signing service or other remote work. Persist the authenticated human
+decision first, then issue the code, provider-ready callback and host receipt in
+one atomic transaction. A rolled-back attempt can retry that decision; an
+uncertain one-time code/token redemption must never be retried. Escaped participant
+work fails closed. Code/consent lifetimes are unchanged.
+
 ```js
 import { createProvider, createResultCipher } from '@poppykit/client/provider';
 import { SqliteProviderStore } from '@poppykit/client/provider/sqlite';

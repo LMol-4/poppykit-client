@@ -32,9 +32,9 @@ async function main() {
     });
     process.stdout.write(result.stdout ?? ''); process.stderr.write(result.stderr ?? '');
     if (result.error) throw result.error; assert.equal(result.status, 0, 'Postgres contracts failed');
-    const required = client ? ['global auth history pruning uses bounded durable selectors (Postgres)', 'callback results encrypted, correlated, atomic, one time; restart, replay, cancel and expiry']
+    const required = client ? ['global auth history pruning uses bounded durable selectors (Postgres)', 'callback results encrypted, correlated, atomic, one time; restart, replay, cancel and expiry', 'provider explicitly enlists a separate host transaction and rolls back delivery without pool fallback']
       : ['Direct completion survives lost commit responses, independent handles and restart without minting a new callback', 'adapter contract: reserved output IDs persist atomic reply and prompt receipts across handles'];
-    console.log(JSON.stringify({ postgresVersion: version, tests: checkPostgresTap(result.stdout, client ? 160 : 22, required), skipped: 0 }));
+    console.log(JSON.stringify({ postgresVersion: version, tests: checkPostgresTap(result.stdout, client ? 161 : 22, required), skipped: 0 }));
   } finally { await pool.end(); }
   // The caller owns and destroys the entire isolated cluster, including roles/resources.
 }

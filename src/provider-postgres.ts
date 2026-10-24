@@ -2,7 +2,9 @@ import type { Pool } from 'pg';
 import type { ProviderSelection, ProviderStore, ProviderTransaction } from './provider.js';
 import { providerMemoryTransaction, providerUserKey, scopedProviderTransaction } from './provider-storage.js';
 import { PostgresRuntime, json, synchronous } from './postgres-runtime.js';
+import type { PostgresConnection } from './postgres-runtime.js';
 export { createPostgresPool, migratePostgres, postgresMigration, postgresSchemaVersion } from './postgres-runtime.js';
+export type { PostgresConnection } from './postgres-runtime.js';
 
 /** Targeted provider aggregates. Cryptography and human/session verification run outside its transactions. */
 export class PostgresProviderStore implements ProviderStore {
@@ -10,6 +12,8 @@ export class PostgresProviderStore implements ProviderStore {
   constructor(pool: Pool, readonly namespace: string) { this.db = new PostgresRuntime(pool, 'poppy_provider'); }
   close(): Promise<void> { return this.db.close(); }
   get metrics() { return this.db.metrics; }
+  /** Only bounded SQL/crypto work; connection comes from the host's active transaction. */
+  withTransaction<T>(connection: PostgresConnection, action: () => Promise<T>): Promise<T> { return this.db.withConnection(connection, action); }
   transaction<T>(selection: ProviderSelection, action: (tx: ProviderTransaction) => T): Promise<T> {
     return this.db.run(async () => {
       const rows = new Map<string, Record<string, any>>();

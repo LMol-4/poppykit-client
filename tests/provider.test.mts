@@ -14,6 +14,7 @@ import { decodeJwt, decodeProtectedHeader, importJWK, jwtVerify } from 'jose';
 import { createProvider, createProviderClient, createResultCipher, createBrowserEnrollmentClient } from '../dist/provider.js';
 import { SqliteProviderStore } from '../dist/provider-sqlite.js';
 import { PostgresProviderStore } from '../dist/provider-postgres.js';
+import type { PostgresConnection } from '../dist/provider-postgres.js';
 import { testPool } from '../test-support/postgres.mjs';
 
 const issuer='https://company.example/issuer', domain='company.example', clientId='https://identity.example/client.json', callbackUrl='https://identity.example/callback';
@@ -86,8 +87,61 @@ async function fixture() {
     signer:{kid:'key-1',publicJwk:async()=>publicJwk,sign:async (bytes:Uint8Array) =>new Uint8Array(await crypto.subtle.sign({name:'ECDSA',hash:'SHA-256'},key.privateKey,new Uint8Array(bytes)))}};
   const api=createProvider(options), req=new Request('https://identity.example/v1/enroll',{headers:{'x-human':'authenticated'}});
   async function enroll(installationId='install-a'){return api.enroll(req,{version:1,installationId,idempotencyKey:randomBytes(20).toString('hex')});}
-  return {api,options,store,path,dir,enroll,second:()=>pool?new PostgresProviderStore(pool,namespace):new SqliteProviderStore(path),persisted:async()=>pool?Buffer.from(JSON.stringify((await pool.query('SELECT body FROM poppy_provider.records WHERE ns=$1',[namespace])).rows)):readFileSync(path),setSubject:(v: string) =>subject=v,setTime:(v: number) =>at=v,setSession:(v: boolean) =>allowSession=v,close:async()=>{await store.close();await pool?.end();rmSync(dir,{recursive:true,force:true});}};
+  return {api,options,store,path,dir,pool,namespace,enroll,second:()=>pool?new PostgresProviderStore(pool,namespace):new SqliteProviderStore(path),persisted:async()=>pool?Buffer.from(JSON.stringify((await pool.query('SELECT body FROM poppy_provider.records WHERE ns=$1',[namespace])).rows)):readFileSync(path),setSubject:(v: string) =>subject=v,setTime:(v: number) =>at=v,setSession:(v: boolean) =>allowSession=v,close:async()=>{await store.close();await pool?.end();rmSync(dir,{recursive:true,force:true});}};
 }
+if (process.env.D1_POSTGRES === '1') test('provider explicitly enlists a separate host transaction and rolls back delivery without pool fallback', async () => {
+  const f = await fixture(), ownerPool = testPool();
+  assert.ok(f.pool);
+  const unavailablePool = new Proxy(f.pool, { get(target, property, receiver) {
+    if (property === 'connect') return () => { throw new Error('provider pool is unavailable'); };
+    return Reflect.get(target, property, receiver);
+  } });
+  const participant = new PostgresProviderStore(unavailablePool, f.namespace);
+  const provider = createProvider({ ...f.options, store: participant });
+  let escaped: Promise<unknown> | undefined, release!: () => void, expiredHandle: PostgresConnection | undefined;
+  const host = async <T,>(action: (connection: PostgresConnection) => Promise<T>): Promise<T> => {
+    const client = await ownerPool.connect(); let active = true;
+    const connection: PostgresConnection = { query: async (sql, values) => {
+      if (!active) throw new Error('expired host transaction');
+      return client.query(sql, values);
+    } };
+    try { await client.query('BEGIN'); const result = await action(connection); await client.query('COMMIT'); return result; }
+    catch (error) { await client.query('ROLLBACK'); throw error; }
+    finally { active = false; client.release(); }
+  };
+  const marker = (connection: PostgresConnection, id: string) => connection.query('INSERT INTO poppy_provider.records(ns,kind,id,body) VALUES($1,$2,$3,$4)', [f.namespace, 'host-receipt', id, '{}']);
+  try {
+    const a = await f.enroll(), state = randomBytes(32).toString('base64url');
+    const input = { version: 1, installationId: 'install-a', operationId: 'atomic', domain, issuer, purpose: 'direct', sessionId: 'owned', state };
+    await f.api.begin(a.credential, input);
+    const callback = `${callbackUrl}?state=${state}&iss=${encodeURIComponent(issuer)}&code=PRIVATE_ATOMIC_CODE`;
+    const take = { version: 1, installationId: 'install-a', operationId: 'atomic', issuer, sessionId: 'owned' };
+    await ownerPool.query('INSERT INTO poppy_provider.records(ns,kind,id,body) VALUES($1,$2,$3,$4)', [f.namespace, 'host-decision', 'chosen', '{"approved":true}']);
+    await assert.rejects(provider.callback(callback), /provider pool is unavailable/);
+    await assert.rejects(host(connection => participant.withTransaction(connection, async () => {
+      await marker(connection, 'issuer-code'); await provider.callback(callback); await marker(connection, 'delivery-receipt');
+      throw new Error('host interruption');
+    })), /host interruption/);
+    assert.equal((await ownerPool.query("SELECT count(*) AS n FROM poppy_provider.records WHERE ns=$1 AND kind='host-receipt'", [f.namespace])).rows[0].n, '0');
+    assert.equal((await ownerPool.query("SELECT count(*) AS n FROM poppy_provider.records WHERE ns=$1 AND kind='host-decision'", [f.namespace])).rows[0].n, '1');
+    assert.equal((await f.api.takeResult(a.credential, take)).status, 'pending');
+    await host(connection => participant.withTransaction(connection, async () => {
+      expiredHandle = connection;
+      await marker(connection, 'issuer-code'); assert.equal((await provider.callback(callback)).status, 'ready'); await marker(connection, 'delivery-receipt');
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      escaped = gate.then(() => provider.callback(callback));
+    }));
+    release(); assert.ok(escaped); await assert.rejects(escaped, /expired Postgres transaction/);
+    await assert.rejects(participant.withTransaction(expiredHandle!, async () => {}), /expired host transaction/);
+    assert.equal((await ownerPool.query("SELECT count(*) AS n FROM poppy_provider.records WHERE ns=$1 AND kind='host-receipt'", [f.namespace])).rows[0].n, '2');
+    assert.equal((await f.api.takeResult(a.credential, take)).callbackUrl, callback);
+    await host(connection => participant.withTransaction(connection, async () => { assert.equal((await provider.callback(callback)).status, 'consumed'); }));
+    await assert.rejects(f.api.takeResult(a.credential, take), { code: 'consumed' });
+    const raw = await ownerPool.connect();
+    try { await assert.rejects(participant.withTransaction(raw, async () => {}), /SAVEPOINT can only be used in transaction blocks/); }
+    finally { raw.release(); }
+  } finally { await participant.close(); await ownerPool.end(); await f.close(); }
+});
 test('authenticated enrollment, visitor/issuer identity and installation isolation',async()=>{
   const f=await fixture();try{
     await assert.rejects(f.api.enroll(new Request(clientId),{version:1,installationId:'a',idempotencyKey:'key'}),{code:'unauthorized'});

@@ -164,3 +164,10 @@ Custom backends can run `runClientConversationAdapterContract` and
 handles to a fresh shared namespace. Real process death and engine atomicity still
 need backend-specific checks. Database credentials and encryption keys stay outside
 records, prompts and logs; provider callback URLs remain encrypted by ResultCipher.
+
+For atomic issuer/provider/host delivery, explicitly enlist `PostgresProviderStore`
+using its `withTransaction(connection, action)` method and the host's guarded
+transaction handle. It uses the supplied handle rather than its configured pool;
+the host owns the entire commit/rollback. Savepoints protect individual provider
+operations, while the host must abort the outer transaction on failure. Never
+span model/network I/O. See the [provider example](PROVIDER.md).

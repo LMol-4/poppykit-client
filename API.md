@@ -31,3 +31,8 @@ TypeScript Postgres consumers also install `@types/pg@8.23.1` as a development d
 Custom `AuthStore` implementations must honor `AuthSelection.history` as described
 in [STORAGE.md](STORAGE.md). Provider callbacks now acknowledge identical consumed
 results without making `takeResult` reusable; see [PROVIDER.md](PROVIDER.md).
+
+`PostgresProviderStore.withTransaction(connection, action)` and its structural
+`PostgresConnection` type are exported only by `@poppykit/client/provider/postgres`.
+They explicitly enlist provider SQL in a host-owned guarded transaction; the host
+retains commit/rollback, deadline and privilege responsibility.

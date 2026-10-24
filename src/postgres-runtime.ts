@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { readFile } from 'node:fs/promises';
 import pg from 'pg';
-import type { Pool, PoolClient, PoolConfig, QueryResult, QueryResultRow } from 'pg';
+import type { Pool, PoolConfig, QueryResult, QueryResultRow } from 'pg';
 
 export type PostgresSchema = 'poppy_client' | 'poppy_provider' | 'poppy_server';
 export type PostgresConnection = { query<R extends QueryResultRow = QueryResultRow>(sql: string, values?: unknown[]): Promise<QueryResult<R>> };
@@ -48,7 +48,7 @@ export async function migratePostgres(pool: Pool, schema: PostgresSchema): Promi
   finally { client.release(); }
 }
 
-type Context = { client: PoolClient; active: boolean; locks: Set<string>; state: { serial: number; active: boolean }; childActive: boolean; parent?: Context };
+type Context = { client: PostgresConnection; active: boolean; locks: Set<string>; state: { serial: number; active: boolean }; childActive: boolean; parent?: Context };
 function scopeActive(context: Context): boolean {
   for (let scope: Context | undefined = context; scope; scope = scope.parent) if (!scope.active || !scope.state.active) return false;
   return true;
@@ -59,6 +59,25 @@ export class PostgresRuntime {
   readonly metrics = { rowsRead: 0, rowsWritten: 0 };
   constructor(readonly pool: Pool, readonly schema: PostgresSchema, private readonly ownsPool = false) {}
   async close(): Promise<void> { this.closed = true; if (this.ownsPool) await this.pool.end(); }
+  /** Enlist in a host-owned transaction; the host handle must enforce its own lifetime. */
+  async withConnection<T>(connection: PostgresConnection, action: () => Promise<T>): Promise<T> {
+    if (this.closed) throw new Error('Postgres adapter is closed');
+    if (this.context.getStore()) throw new Error('cannot enlist an adapter with an active Postgres transaction');
+    const context: Context = { client: connection, active: true, locks: new Set(), state: { serial: 0, active: true }, childActive: false };
+    const savepoint = `enlisted_${this.schema}`;
+    // Probe only: rolling back a host scope would invalidate the owner's cached locks.
+    await connection.query(`SAVEPOINT ${savepoint}`);
+    await connection.query(`RELEASE SAVEPOINT ${savepoint}`);
+    try {
+      const result = await this.context.run(context, async () => {
+        const versions = await this.query(`SELECT version FROM ${this.schema}.schema_version`);
+        if (versions.length !== 1 || versions[0].version !== postgresSchemaVersion) throw new Error('unsupported Postgres schema version');
+        return action();
+      });
+      if (context.childActive) throw new Error('unawaited nested Postgres transaction');
+      return result;
+    } finally { context.active = false; context.state.active = false; }
+  }
   async run<T>(action: () => Promise<T>): Promise<T> {
     if (this.closed) throw new Error('Postgres adapter is closed');
     const parent = this.context.getStore();
