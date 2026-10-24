@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0
+
+Require Node 24 >=24.22.1 within 24.x. Accept conforming OAuth callback fields,
+decode chunked UTF-8 strictly and bound durable terminal-operation history.
+Custom auth stores must implement the documented `history` selection. The
+explicit provider Postgres adapter can enlist in a guarded host transaction for
+atomic consent delivery; protocol-only imports still load no database drivers.
+Required release verification now includes isolated PostgreSQL contracts.
+
 ## 0.3.1 (release candidate)
 
 Allow 30 seconds of provider clock skew in the local assertion freshness check,
