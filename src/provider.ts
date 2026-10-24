@@ -38,7 +38,7 @@ export function createResultCipher(key: Uint8Array): ResultCipher {
     open(value) { const bytes = Buffer.from(value, 'base64url'), cipher = createDecipheriv('aes-256-gcm', secret, bytes.subarray(0, 12)); cipher.setAuthTag(bytes.subarray(-16)); return Buffer.concat([cipher.update(bytes.subarray(12, -16)), cipher.final()]).toString('utf8'); },
   };
 }
-export type ProviderErrorCode = 'unauthorized' | 'binding_conflict' | 'expired' | 'consumed' | 'canceled' | 'rate_limited' | 'unavailable';
+export type ProviderErrorCode = 'unauthorized' | 'binding_conflict' | 'expired' | 'consumed' | 'canceled' | 'rate_limited' | 'unavailable' | 'invalid_response';
 export class ProviderError extends Error {
   constructor(readonly code: ProviderErrorCode, readonly retryAt?: number) { super(`Provider ${code}`); }
 }
@@ -266,7 +266,8 @@ export function createProviderClient(options: { url: string; installationId: str
   const base = https(options.url); if (base.search || base.hash) throw new Error('provider URL must not contain query/fragment');
   async function call(action: string, input: Row): Promise<Row> {
     const response = await options.transport.fetch(new Request(`${options.url.replace(/\/$/, '')}/${action}`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${await options.credential()}` }, body: JSON.stringify({ version: 1, installationId: options.installationId, ...input }) }));
-    const body = object(await response.json());
+    let body: Row;
+    try { body = object(await response.json()); } catch { throw new ProviderError('invalid_response'); }
     if (!response.ok) throw new ProviderError(['unauthorized','binding_conflict','expired','consumed','canceled','rate_limited'].includes(body.error) ? body.error : 'unavailable', body.retryAt);
     return body;
   }

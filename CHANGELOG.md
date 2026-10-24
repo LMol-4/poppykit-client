@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 (release candidate)
+
+Allow 30 seconds of provider clock skew in the local assertion freshness check,
+including browser joins. Already-expired assertions remain rejected; the issuer
+still verifies signatures, signed lifetime and replay. Safe errors now distinguish
+clock/expiry, malformed responses, provider authorization, rate limits and network
+failure. No wire protocol, storage format or dependency change.
+
 ## 0.3.0 (release candidate)
 
 Add the optional challenge-bound browser enrollment client under `/provider`.

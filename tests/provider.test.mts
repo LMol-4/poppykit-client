@@ -17,6 +17,10 @@ import { PostgresProviderStore } from '../dist/provider-postgres.js';
 import { testPool } from '../test-support/postgres.mjs';
 
 const issuer='https://company.example/issuer', domain='company.example', clientId='https://identity.example/client.json', callbackUrl='https://identity.example/callback';
+test('provider client classifies malformed JSON without exposing its contents',async()=>{
+  const client=createProviderClient({url:'https://identity.example/v1',domain,installationId:'test',credential:async()=> 'PRIVATE_CREDENTIAL',transport:{fetch:async()=>new Response('PRIVATE_NOT_JSON',{status:200})}});
+  await assert.rejects(client.identity(issuer),error=>{assert.equal((error as {code:string}).code,'invalid_response');assert.ok(!String(error).includes('PRIVATE'));return true;});
+});
 test('browser enrollment keeps verifier in request bodies and rejects foreign response identity',async()=>{
   const sent:Request[]=[];let foreign=false;
   const enrollment=createBrowserEnrollmentClient({url:'https://identity.example/enrollment',provider:'https://identity.example/v1',company:domain,installationId:'installation',transport:{async fetch(request){sent.push(request.clone());return Response.json(request.url.endsWith('/start')?{requestId:'r'.repeat(43),browserUrl:'https://identity.example/approve?id=public',expiresAt:Date.now()+300000}:{status:'ready',credential:'PRIVATE_ENROLLMENT',clientId:foreign?'https://foreign.example/client.json':clientId,callbackUrl});}}});

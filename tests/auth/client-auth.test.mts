@@ -1478,6 +1478,38 @@ test('provider assertions use derived identity; mixed anonymous never calls stab
   await assert.rejects(createClientAuth({ ...options, identity: undefined }).start(env.company.domain, { anonymous: true }), code('anonymous_unavailable'));
 });
 
+test('provider freshness tolerates bounded clock skew and classifies failures in session and browser paths', async t => {
+  const cases = [
+    { name: 'server one second ahead', remaining: 61, expected: undefined },
+    { name: 'exact freshness horizon', remaining: 90, expected: undefined },
+    { name: 'beyond horizon', remaining: 90.001, expected: 'provider_clock_skew' },
+    { name: 'expired at current time', remaining: 0, expected: 'provider_assertion_expired' },
+    { name: 'already expired', remaining: -1, expected: 'provider_assertion_expired' },
+    { name: 'nonfinite expiry', remaining: NaN, expected: 'provider_invalid_response' },
+    { name: 'missing assertion', remaining: 60, empty: true, expected: 'provider_invalid_response' },
+  ];
+  for (const path of ['session', 'browser']) for (const row of cases) await t.test(path + ': ' + row.name, async () => {
+    const env = await setup(), resolve = env.options.metadata.resolveCompany;
+    env.options.metadata.resolveCompany = async domain => { const metadata = await resolve(domain); metadata.document.web = { browser_session_endpoint: 'https://' + env.company.domain + '/join' }; return metadata; };
+    const first = path === 'browser' ? await env.auth.start(env.company.domain) : undefined;
+    const assertions = { async assert(request: AssertionRequest) {
+      const iat = Math.floor(env.clock.t / 1000), exp = iat + row.remaining;
+      const assertion = await new CompactSign(new TextEncoder().encode(JSON.stringify({ iss: CLIENT_ID, sub: request.purpose === 'client-authentication' ? CLIENT_ID : 'provider-user', aud: request.issuer, iat: exp - 60, exp, jti: randomUUID() }))).setProtectedHeader({ typ: request.purpose === 'session' ? 'JWT' : 'client-authentication+jwt', alg: 'ES256', kid: env.signer.kid }).sign(expectValue(env.signer.privateKey));
+      return { assertion: row.empty ? '' : assertion, expiresAt: exp };
+    } };
+    const auth = createClientAuth({ ...env.options, assertions, providerIdentity: { identity: async () => ({ clientId: CLIENT_ID, userId: 'provider-user' }) } });
+    let posted = false;
+    const action = () => path === 'session' ? auth.start(env.company.domain) : auth.joinBrowser(expectValue(first).connection.id, 'https://' + env.company.domain + '/home', { kind: 'agent-controlled', async postForm() { posted = true; } });
+    if (row.expected) await assert.rejects(action, { code: row.expected }); else await action();
+    if (path === 'browser') assert.equal(posted, !row.expected);
+  });
+  for (const [failure, expected] of [['unauthorized','provider_unauthorized'],['rate_limited','provider_rate_limited'],['timeout','provider_network_error'],['invalid_response','provider_invalid_response'],['unavailable','provider_unavailable']]) await t.test('safe failure: ' + failure, async () => {
+    const env = await setup();
+    const auth = createClientAuth({ ...env.options, providerIdentity: { identity: async () => { throw Object.assign(new Error('PRIVATE_CREDENTIAL'), { code: failure }); } }, assertions: { assert: async () => { throw new Error('not reached'); } } });
+    await assert.rejects(auth.start(env.company.domain), error => { assert.equal((error as AuthFailure).code, expected); assert.ok(!String(error).includes('PRIVATE')); return true; });
+  });
+});
+
 test('a narrow Session Token renews from a sufficient grant without another sign-in', async () => {
   const { auth, company, id, target } = await signedIn();
   await auth.renew(id, { scopes: ['poppy:read'] });

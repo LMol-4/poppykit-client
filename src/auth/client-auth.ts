@@ -174,6 +174,12 @@ const SKEW_MS = 30_000;
 const AMBIGUOUS = new Set(['transport_error', 'invalid_response', 'token_error']);
 const CLIENT_ASSERTION = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
 const ASSERTION_SECONDS = 60;
+function providerFailure(error: unknown, connectionId?: string): AuthFailure {
+  const code = (error as { code?: unknown } | null)?.code;
+  return new AuthFailure(code === 'unauthorized' ? 'provider_unauthorized' : code === 'rate_limited' ? 'provider_rate_limited'
+    : ['timeout', 'network_error', 'blocked_address', 'overloaded', 'closed'].includes(String(code)) ? 'provider_network_error'
+    : ['invalid_response', 'binding_conflict', 'expired', 'consumed', 'canceled'].includes(String(code)) ? 'provider_invalid_response' : 'provider_unavailable', connectionId);
+}
 // OAuth codes the token endpoint may return (spec 4.2, RFC 6749/8707); anything else is reported as token_error.
 const SAFE_ERRORS = new Set(['invalid_request', 'invalid_client', 'invalid_grant', 'unauthorized_client', 'unsupported_grant_type', 'invalid_scope', 'invalid_target', 'invalid_session', 'account_mismatch', 'invalid_dpop_proof', 'use_dpop_nonce', 'extension_required', 'rate_limited']);
 
@@ -331,11 +337,18 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   }
   async function assertion(purpose: 'session' | 'client-authentication', issuer: string, key: DpopKey, sub = clientId, operationId = randomId('op_')): Promise<string> {
     if (!options.assertions) return signIdentity({ typ: purpose === 'session' ? 'JWT' : 'client-authentication+jwt' }, assertionClaims(sub, issuer), key.thumbprint);
-    try {
-      const result = await options.assertions.assert({ operationId, issuer, purpose });
-      if (typeof result.assertion !== 'string' || !result.assertion || !Number.isFinite(result.expiresAt) || result.expiresAt * 1000 <= now() || result.expiresAt * 1000 > now() + ASSERTION_SECONDS * 1000) throw 0;
-      return result.assertion;
-    } catch { throw new AuthFailure('provider_unavailable'); }
+    let result;
+    try { result = await options.assertions.assert({ operationId, issuer, purpose }); }
+    catch (error) { throw providerFailure(error); }
+    return providerAssertion(result);
+  }
+  function providerAssertion(result: { assertion: string; expiresAt: number }, connectionId?: string): string {
+    if (!result || typeof result.assertion !== 'string' || !result.assertion || !Number.isFinite(result.expiresAt)) throw new AuthFailure('provider_invalid_response', connectionId);
+    const at = now(), expires = result.expiresAt * 1000;
+    if (expires <= at) throw new AuthFailure('provider_assertion_expired', connectionId);
+    // Local freshness tolerance; the issuer still verifies signed claims, lifetime and replay.
+    if (expires > at + ASSERTION_SECONDS * 1000 + SKEW_MS) throw new AuthFailure('provider_clock_skew', connectionId);
+    return result.assertion;
   }
   function responseFailure(response: Response, code: string): AuthFailure {
     const value = response.headers.get('retry-after');
@@ -408,8 +421,11 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     const dpopKeyRef = await secrets.stage(JSON.stringify({ kty, crv, x, y, d }));
     let userId = randomId('usr_');
     if (options.providerIdentity && !anonymous) {
-      try { const bound = await options.providerIdentity.identity(issuer); if (bound.clientId !== clientId || typeof bound.userId !== 'string' || !bound.userId) throw 0; userId = bound.userId; }
-      catch { await secrets.remove(dpopKeyRef); throw new AuthFailure('provider_unavailable'); }
+      let bound;
+      try { bound = await options.providerIdentity.identity(issuer); }
+      catch (error) { await secrets.remove(dpopKeyRef); throw providerFailure(error); }
+      if (!bound || bound.clientId !== clientId || typeof bound.userId !== 'string' || !bound.userId) { await secrets.remove(dpopKeyRef); throw new AuthFailure('provider_invalid_response'); }
+      userId = bound.userId;
     }
     if (anonymous) return { userId, dpopKeyRef };
     const winner = await transaction({ issuer }, state => own(state.identities, issuer) ?? (state.identities[issuer] = { userId, dpopKeyRef }));
@@ -1270,11 +1286,10 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const key = await loadDpopKey(connection.dpopKeyRef);
       let value: string;
       if (options.assertions && !connection.anonymous) {
-        try {
-          const result = await options.assertions.assert({ purpose: 'browser', operationId: randomId('op_'), issuer: connection.issuer, sessionId: connection.sessionId, returnTo });
-          if (!result.assertion || result.expiresAt * 1000 <= now() || result.expiresAt * 1000 > now() + 60000) throw 0;
-          value = result.assertion;
-        } catch { throw new AuthFailure('provider_unavailable', connectionId); }
+        let result;
+        try { result = await options.assertions.assert({ purpose: 'browser', operationId: randomId('op_'), issuer: connection.issuer, sessionId: connection.sessionId, returnTo }); }
+        catch (error) { throw providerFailure(error, connectionId); }
+        value = providerAssertion(result, connectionId);
       } else value = await signIdentity({ typ: 'poppy-browser+jwt' }, { ...assertionClaims(connection.userId, endpoint), session_id: connection.sessionId, return_to: returnTo }, key.thumbprint);
       try {
         await controller.postForm({ url: endpoint, fields: { assertion: value }, validateRedirect(status, location) {

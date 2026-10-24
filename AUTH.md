@@ -43,6 +43,17 @@ separate local `IdentitySigner` is required and its key must also be published i
 the client's JWKS. A provider-only configuration reports `anonymous_unavailable`;
 it never substitutes the provider's stable identity for an anonymous one.
 
+Provider `expiresAt` values are Unix seconds. Session/client assertions and browser
+joins accept a local freshness horizon of 60 seconds plus 30 seconds of clock skew;
+an assertion at or before the local current time is rejected. This freshness check
+does not verify the signed assertion's lifetime: the issuer verifies the signature,
+claims, replay and protocol maximum of five minutes between `iat` and `exp`.
+`provider_clock_skew` and `provider_assertion_expired` suggest checking automatic
+date/time and retrying. `provider_invalid_response`, `provider_unauthorized`,
+`provider_rate_limited` and `provider_network_error` distinguish malformed data,
+enrollment rejection, throttling and connectivity. Unknown failures remain
+`provider_unavailable`. Errors never include assertion or provider response text.
+
 Account Tokens, device codes, PKCE and DPoP keys belong in the configured
 SecretStore; Session Tokens stay in memory. SQLite and secret storage are separate
 commit boundaries. A host must sweep orphan staged secrets only after checking
