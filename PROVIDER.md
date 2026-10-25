@@ -14,7 +14,7 @@ Import `createProvider`, `createProviderClient`, and `createResultCipher` from
 `@poppykit/client/provider`; durable `SqliteProviderStore` is separately exported
 from `@poppykit/client/provider/sqlite`. Neither is loaded by the core import.
 The wire protocol remains PoppyKit provider **v1**; the 0.2 TypeScript API uses async storage, not a Personal Agent Protocol extension.
-Node 24.x (at least 24.22.1) is required for the SQLite reference adapter.
+Node 24.x (at least 24.21.0) is required for the SQLite reference adapter.
 
 An operator supplies HTTPS hosting, a provider client metadata URL, JWKS URL,
 HTTPS callback URL on that same domain, an ES256 signer/KMS, a verified company

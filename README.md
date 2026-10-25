@@ -1,5 +1,7 @@
 # PoppyKit client
 
+The Node 24.21.0 minimum is an owner-accepted compatibility baseline. Use a current patched Node 24 runtime where available; this minimum does not establish that older runtimes contain later security fixes. Build and release CI read `.node-version`.
+
 TypeScript SDK for [Personal Agent Protocol draft 0.2](https://personalagentprotocol.org/docs/0.2/spec):
 discovery, authentication, conversations and API/browser/feedback hooks. Your
 application supplies the agent and trusted infrastructure. [MIT](LICENSE).
@@ -8,7 +10,7 @@ application supplies the agent and trusted infrastructure. [MIT](LICENSE).
 
 This source contains unreleased repairs; final version selection and publication are pending.
 
-Requires Node **24.x, at least 24.22.1**, ESM and HTTPS. CI tests Node 24.22.1 on Linux, macOS and
+Requires Node **24.x, at least 24.21.0**, ESM and HTTPS. CI tests Node 24.21.0 on Linux, macOS and
 Windows; other Node majors are unsupported.
 
 ```sh

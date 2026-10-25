@@ -1,8 +1,8 @@
 # Persistence and recovery
 
-Use targeted storage contracts. Node 24.x, at least 24.22.1, is required. The optional `@poppykit/client/sqlite` entry point exports
+Use targeted storage contracts. Node 24.x, at least 24.21.0, is required. The optional `@poppykit/client/sqlite` entry point exports
 `SqliteAuthStore` and `SqliteConversationStore`; importing the client core does not
-load SQLite. `node:sqlite` is experimental in the tested Node 24.22.1 runtime.
+load SQLite. `node:sqlite` is experimental in the tested Node 24.21.0 runtime.
 Consumers can implement `AuthStore` and `ConversationStore` using their own database.
 
 ```ts
@@ -110,7 +110,7 @@ never deletes company history, revokes access or cancels accepted business work.
 The optional `@poppykit/client/postgres` exports `PostgresAuthStore` and
 `PostgresConversationStore`; `/provider/postgres` exports `PostgresProviderStore`.
 Install the optional peer `pg@8.23.1` only when choosing these subpaths.
-Protocol-only imports load neither pg nor SQLite. PostgreSQL 17 and Node 24.x (at least 24.22.1)
+Protocol-only imports load neither pg nor SQLite. PostgreSQL 17 and Node 24.x (at least 24.21.0)
 are supported; plain PostgreSQL and Supabase transaction pooling use the same adapter.
 There is no Supabase Auth or application dependency.
 
