@@ -75,7 +75,6 @@ const provider = createProvider({
     const human = await operatorLogin.authenticateEnrollment(request);
     return human ? { subject: human.stableSubject, allowedCompanies: human.companyDomains } : null;
   },
-  verifySession: binding => operatorSessionVerifier.owns(binding),
 });
 // Route Fetch Requests under /v1/{operation}, plus the exact public URLs above:
 // await provider.handle(request)
@@ -99,11 +98,11 @@ but cannot recover another installation's result. Enrollment never accepts calle
 subjects, arbitrary audiences, lifetimes, key IDs, raw bytes or signing claims.
 
 `identity` takes domain and exact issuer; `begin` registers immutable operation,
-issuer/domain, purpose (`session`, `client-authentication`, `browser`, `direct`),
-optional session and browser return destination. Company metadata is independently
+issuer/domain, purpose (`session`, `client-authentication`, `direct`) and Direct Session Key binding. Company metadata is independently
 resolved and enrollment company policy checked. `assert` takes operation/purpose
-only and constructs a 60-second assertion with fresh 256-bit jti. Browser assertions
-are audience-bound to the verified browser endpoint. `createProviderClient` binds
+only and constructs a 60-second assertion with fresh 256-bit jti. Browser-purpose
+operations/assertions and verifySession are removed; browser joining uses the
+locally held Session Key and browser-bound form code. `createProviderClient` binds
 enrollment credentials and automatically registers SDK assertion operations.
 
 Direct sign-in uses SDK-generated 256-bit state. Trusted CLI code privately

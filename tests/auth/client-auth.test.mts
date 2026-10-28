@@ -1646,16 +1646,18 @@ test('provider freshness tolerates bounded clock skew and classifies failures in
     const env = await setup(), resolve = env.options.metadata.resolveCompany;
     env.options.metadata.resolveCompany = async domain => { const metadata = await resolve(domain); metadata.document.web = { browser_session_endpoint: 'https://' + env.company.domain + '/join' }; return metadata; };
     const first = path === 'browser' ? await env.auth.start(env.company.domain) : undefined;
+    let assertionCalls = 0;
     const assertions = { async assert(request: AssertionRequest) {
+      assertionCalls++;
       const iat = Math.floor(env.clock.t / 1000), exp = iat + row.remaining;
       const assertion = await new CompactSign(new TextEncoder().encode(JSON.stringify({ iss: CLIENT_ID, sub: request.purpose === 'client-authentication' ? CLIENT_ID : 'provider-user', aud: request.issuer, iat: exp - 60, exp, jti: randomUUID() }))).setProtectedHeader({ typ: request.purpose === 'session' ? 'JWT' : 'client-authentication+jwt', alg: 'ES256', kid: env.signer.kid }).sign(expectValue(env.signer.privateKey));
       return { assertion: row.empty ? '' : assertion, expiresAt: exp };
     } };
     const auth = createClientAuth({ ...env.options, assertions, providerIdentity: { identity: async () => ({ clientId: CLIENT_ID, userId: 'provider-user' }) } });
     let posted = false;
-    const action = () => path === 'session' ? auth.start(env.company.domain) : auth.joinBrowser(expectValue(first).connection.id, 'https://' + env.company.domain + '/home', { kind: 'agent-controlled', async postForm() { posted = true; } });
-    if (row.expected) await assert.rejects(action, { code: row.expected }); else await action();
-    if (path === 'browser') assert.equal(posted, !row.expected);
+    const action = () => path === 'session' ? auth.start(env.company.domain) : auth.joinBrowser(expectValue(first).connection.id, 'https://' + env.company.domain + '/home', { kind: 'agent-controlled', async loadJoinForm() { return { code: 'trusted-code' }; }, async postForm() { posted = true; }, async navigate() {} });
+    if (row.expected && path === 'session') await assert.rejects(action, { code: row.expected }); else await action();
+    if (path === 'browser') { assert.equal(posted, true); assert.equal(assertionCalls, 0, 'browser joins never ask the provider to sign'); }
   });
   for (const [failure, expected] of [['unauthorized','provider_unauthorized'],['rate_limited','provider_rate_limited'],['timeout','provider_network_error'],['invalid_response','provider_invalid_response'],['unavailable','provider_unavailable']]) await t.test('safe failure: ' + failure, async () => {
     const env = await setup();

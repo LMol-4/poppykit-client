@@ -99,7 +99,6 @@ async function fixture() {
   const metadata={...createMetadataResolver({async fetch(){throw new Error('unexpected metadata fetch');}}),resolveCompany:async(d:string)=>{assert.equal(d,domain);return {url:'https://company.example/.well-known/poppy.json',document:{protocol_version:'0.3' as const,organization:{domain,name:'Generic'},web:{browser_session_endpoint:'https://company.example/join'}},authorization:{issuer,token_endpoint:issuer+'/token',revocation_endpoint:issuer+'/revoke',protected_resources:[`https://${domain}`],grant_types_supported:['urn:ietf:params:oauth:grant-type:jwt-bearer','refresh_token']}};}};
   const options:ProviderOptions={clientId,callbackUrl,jwksUri:'https://identity.example/jwks',clientName:'Generic provider',store,cipher:createResultCipher(randomBytes(32)),metadata,now:()=>at,
     authenticateEnrollment:async request =>request.headers.get('x-human')==='authenticated'?{subject,allowedCompanies:[domain]}:null,
-    verifySession:async (b: { sessionId: string; }) =>allowSession&&b.sessionId==='owned',
     signer:{kid:'key-1',publicJwk:async()=>publicJwk,sign:async (bytes:Uint8Array) =>new Uint8Array(await crypto.subtle.sign({name:'ECDSA',hash:'SHA-256'},key.privateKey,new Uint8Array(bytes)))}};
   const api=createProvider(options), req=new Request('https://identity.example/v1/enroll',{headers:{'x-human':'authenticated'}});
   async function enroll(installationId='install-a'){return api.enroll(req,{version:1,installationId,idempotencyKey:randomBytes(20).toString('hex')});}
@@ -178,11 +177,8 @@ test('constrained signing rejects claims, purposes, companies and unverified bro
     const payload=decodeJwt(result.assertion);assert.equal(payload.aud,issuer);assert.equal(payload.iss,clientId);assert.equal(expectValue(payload.exp)-expectValue(payload.iat),60);assert.ok(expectValue(payload.jti).length>=22);assert.equal(decodeProtectedHeader(result.assertion).typ,'JWT');
     await jwtVerify(result.assertion,await importJWK(await f.options.signer.publicJwk(),'ES256'),{issuer:clientId,audience:issuer,currentDate:new Date(1000000)});
     await assert.rejects(f.api.assert(a.credential,{version:1,installationId:'install-a',operationId:'sign',purpose:'client-authentication'}),{code:'binding_conflict'});
-    await assert.rejects(f.api.begin(a.credential,{...binding,purpose:'browser',operationId:'browser',sessionId:'other',returnTo:'https://company.example/'}),{code:'unauthorized'});
-    await assert.rejects(f.api.begin(a.credential,{...binding,purpose:'browser',operationId:'browser',sessionId:'owned',returnTo:'https://evil.example/'}),{code:'binding_conflict'});
-    await f.api.begin(a.credential,{...binding,purpose:'browser',operationId:'browser',sessionId:'owned',returnTo:'https://company.example/'});
-    const browser=await f.api.assert(a.credential,{version:1,installationId:'install-a',operationId:'browser',purpose:'browser'});assert.equal(decodeProtectedHeader(browser.assertion).typ,'poppy-browser+jwt');
-    f.setSession(false);await assert.rejects(f.api.assert(a.credential,{version:1,installationId:'install-a',operationId:'browser',purpose:'browser'}),{code:'unauthorized'});
+    for (const sessionId of ['other','owned']) await assert.rejects(f.api.begin(a.credential,{...binding,purpose:'browser',operationId:'browser',sessionId,returnTo:'https://company.example/'}),{code:'binding_conflict'});
+    await assert.rejects(f.api.assert(a.credential,{version:1,installationId:'install-a',operationId:'sign',purpose:'browser'}),{code:'binding_conflict'});
     await assert.rejects(f.api.takeResult(a.credential,{version:1,installationId:'install-a',operationId:'sign',issuer,sessionKey:'k'.repeat(43),sessionId:null}),{code:'binding_conflict'});
   }finally{await f.close();}
 });
@@ -258,7 +254,7 @@ test('bound HTTP client uses authenticated versioned handlers without raw-byte s
 test('authentication and policy precede metadata; malformed sessions never reach session hook',async()=>{
   const f=await fixture();try{
     let resolves=0,hooks=0;const original=f.options.metadata.resolveCompany;
-    const api=createProvider({...f.options,metadata:{...f.options.metadata,resolveCompany:async d=>{resolves++;return original(d);}},verifySession:async()=>{hooks++;return true;}});
+    const api=createProvider({...f.options,metadata:{...f.options.metadata,resolveCompany:async d=>{resolves++;return original(d);}}});
     const a=await f.enroll(),base={version:1,installationId:'install-a',operationId:'browser',issuer,domain,purpose:'browser',sessionId:'owned',returnTo:'https://company.example/'};
     for(const input of [{...base,installationId:'wrong'},{...base,domain:'evil.example'}])await assert.rejects(api.begin(a.credential,input));
     await assert.rejects(api.identity('invalid',{version:1,installationId:'install-a',issuer,domain}));

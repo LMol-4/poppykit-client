@@ -32,8 +32,11 @@ endpoint; extra paths or queries are refused. Query-bearing discovery endpoints 
 not supported. Protected-resource metadata must name that exact resource and the
 verified company issuer. ES256 DPoP metadata selects DPoP; absence selects Bearer.
 A Bearer-only MCP resource cannot also authorize a conversation. Resource-specific
-credential slots use the shared renewal, rotation, nonce, cooldown and revocation
-lifecycle. The wire `token_type` must match verified metadata; there is no fallback
+credential slots use the shared nonce, cooldown and revocation
+lifecycle. Bearer-only MCP credentials come only from Token Exchange of a current
+DPoP Session Token, preserving its Session and limiting scopes to that subject. The
+issuer must advertise the exchange grant; exchange does not rotate the Account Token.
+DPoP-capable MCP keeps the normal token grants. The wire `token_type` must match verified metadata; there is no fallback
 from DPoP to Bearer. Redirects never forward tokens or proofs. Auth 401 rejection may
 cause one fresh-token retry; unknown results are not automatically retried.
 
@@ -42,6 +45,12 @@ cause one fresh-token retry; unknown results are not automatically retried.
 ```ts
 await auth.joinBrowser(connectionId, 'https://company.example/account', {
   kind: 'agent-controlled',
+  async loadJoinForm(url) {
+    // Top-level GET in this isolated browser; verify the final URL and form action
+    // are exactly url. Read the hidden code only here, outside model context.
+    return controlledBrowser.loadJoinForm(url);
+  },
+  navigate: url => controlledBrowser.navigateWithoutPostBody(url),
   async postForm({ url, fields, validateRedirect }) {
     // Bind your existing browser controller here. It must enforce this contract:
     // isolated per-session storage; verified TLS/actual peer addresses; no logging;
@@ -56,13 +65,15 @@ await auth.joinBrowser(connectionId, 'https://company.example/account', {
 `controlledBrowser` is the host's existing controller, not an SDK driver. This hook
 is trusted code. Its network layer must reject loopback/private/link-local actual
 connected addresses unless narrowly configured, validate TLS and enforce redirect
-interception. Never replay the assertion on 307/308 or send it in a URL. The supplied
-validator permits only 303 to the exact validated `returnTo`. HttpTransport cannot
+interception. Never replay the code or proof on 307/308 or send it in a URL. The supplied
+validator permits only 303 to an HTTPS company page. After that redirect, the SDK
+asks the controller to navigate to the validated `returnTo`. HttpTransport cannot
 enforce network policy inside an unrelated browser engine. Keep this capability
 separate from the human consent-browser opener. Never join the user's browser.
 Use separate cookies/local storage for each session/user, join just before browsing,
 rejoin on lost recognition and close the context when the session ends. Custom
-controllers own those guarantees; the SDK validates the assertion destination and
+controllers own those guarantees; the SDK signs a Session Key proof with the form
+code as nonce (no access token or identity assertion), and validates the destination and
 navigation contract but cannot inspect their internal browser implementation.
 
 ## Feedback
@@ -77,7 +88,11 @@ await auth.feedback(connectionId, {
 Signed-out sessions are allowed and no account scope is required. Task and
 description are nonempty strings of at most 200 and 2000 Unicode codepoints. Only
 `missing` is supported client-side. Omit identifiers, personal data and secrets;
-report task limitations rather than individual errors. Success is an empty 202.
+report task limitations rather than individual errors. Success is an empty 202
+(returning undefined) or HTTP 200 with an `Alternative`. The SDK validates the latter
+and returns instructions/references as company data, never as user consent. Unlisted
+OpenAPI/MCP references and unknown reference types are ignored; known malformed
+references fail. Web links must be HTTPS. No alternative is executed automatically.
 There are no automatic POST retries (including nonce/auth rejection). A lost
 response can mean accepted; callers decide whether to repeat because the protocol
 defines no deduplication key. Prefer one report per unfulfilled task.
@@ -85,3 +100,18 @@ defines no deduplication key. Prefer one report per unfulfilled task.
 The executable generic caller/controller fixtures are `tests/integrations.test.mts`.
 They exercise the same hooks used by the CLI; installed CLI integration is
 verified separately against immutable candidate tarballs.
+
+## Task metadata
+
+Call `auth.excludedTasks(connectionId)` before choosing how to perform a task.
+It uses `MetadataResolver.resolveExcludedTasks(document)` (optional for custom
+resolvers), fetches the advertised document without credentials and shares the
+resolver's bounded HTTP cache/revalidation. Alternatives use the feedback validator;
+cached references are checked against current discovery on every read.
+
+Discovery exposes `auth.scope_hints`: both fields are required, unknown changes
+become irreversible, and unknown fields are ignored. Missing hints remain unknown.
+Hints and excluded task phrases are company claims, never user approval. The host
+agent decides whether a phrase matches its task. The SDK/CLI intentionally omit the
+SHOULD-level automatic pre-task check: they have no task planner; callers choose
+when to read the metadata. No task-policy engine or alternative executor is supplied.

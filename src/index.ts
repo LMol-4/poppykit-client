@@ -22,3 +22,6 @@ export type { ApiTarget, AgentBrowserController, FeedbackReport } from './integr
 export { protectedResourceMetadataUrl } from './integrations.js';
 
 export type { Author, AuthorType, Message, RecordedMessage, ConversationRequest, ConversationState, ConversationEvent, KnownEvent, EventPage } from './protocol/wire.js';
+
+export type { Alternative, AlternativeReference, ExcludedTask } from './network/tasks.js';
+export type { ScopeHint } from './network/discovery.js';

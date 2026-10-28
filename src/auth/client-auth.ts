@@ -1,3 +1,5 @@
+import { parseAlternative } from '../network/tasks.js';
+import type { Alternative, ExcludedTask } from '../network/tasks.js';
 import { registeredRedirect } from '../network/redirect.js';
 import type { AuthSelection, AuthStore } from './store.js';
 import { acquireOwner, releaseOwner, localOwnerAlive } from './ownership.js';
@@ -28,7 +30,6 @@ export interface IdentitySigner {
 }
 export type AssertionRequest = { operationId: string; issuer: string } & (
   | { purpose: 'client-authentication' } | { purpose: 'session' }
-  | { purpose: 'browser'; sessionId: string; returnTo: string }
 );
 export interface AssertionProvider {
   assert(request: AssertionRequest): Promise<{ assertion: string; expiresAt: number }>;
@@ -105,7 +106,8 @@ export interface ClientAuth {
   apiTarget(connectionId: string, apiUrl: string, destination?: string): Promise<ApiTarget>;
   apiFetch(connectionId: string, request: Request, target: ApiTarget, requiredScopes?: readonly string[]): Promise<Response>;
   joinBrowser(connectionId: string, returnTo: string, controller: AgentBrowserController): Promise<void>;
-  feedback(connectionId: string, report: FeedbackReport): Promise<void>;
+  feedback(connectionId: string, report: FeedbackReport): Promise<Alternative | void>;
+  excludedTasks(connectionId: string): Promise<ExcludedTask[]>;
 }
 
 export interface CredentialRecord {
@@ -339,11 +341,11 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       return signature;
     });
   }
-  async function proof(key: DpopKey, method: string, url: string, token?: string): Promise<string> {
+  async function proof(key: DpopKey, method: string, url: string, token?: string, browserCode?: string): Promise<string> {
     const htu = new URL(url); htu.search = ''; htu.hash = '';
     const payload: JsonObject = { jti: randomId(), htm: method, htu: htu.href, iat: Math.floor(now() / 1000) };
     if (token !== undefined) payload.ath = b64(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))));
-    const nonce = nonces.get(htu.origin);
+    const nonce = browserCode ?? nonces.get(htu.origin);
     if (nonce !== undefined) payload.nonce = nonce;
     return compact({ typ: 'dpop+jwt', alg: 'ES256', jwk: key.jwk }, payload, async input => new Uint8Array(await crypto.subtle.sign(ES256, key.privateKey, input)));
   }
@@ -399,7 +401,10 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       let json: unknown;
       try { json = parseJson(text); } catch { /* reported below */ }
       if (response.status === 200) {
-        try { return { token: parseTokenResponse(json), scheme }; } catch { throw new AuthFailure('invalid_response'); }
+        try {
+          if (fields.grant_type === 'urn:ietf:params:oauth:grant-type:token-exchange' && (typeof json !== 'object' || json === null || !('issued_token_type' in json) || json.issued_token_type !== 'urn:ietf:params:oauth:token-type:access_token')) throw 0;
+          return { token: parseTokenResponse(json), scheme };
+        } catch { throw new AuthFailure('invalid_response'); }
       }
       let error = response.status === 429 ? 'rate_limited' : 'token_error';
       try { if (response.status !== 429) error = parseProtocolError(json).error; } catch { /* non-OAuth body */ }
@@ -683,6 +688,42 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     const wait = BigInt(connection.notBefore ?? '0') - BigInt(Math.floor(now()));
     if (wait > 0n) throw new AuthFailure('rate_limited', connection.id, Number(wait), connection.notBefore);
   }
+  async function exchangeBearer(connection: ConnectionRecord, resource: string, scopes: string[] | null): Promise<AuthOutcome> {
+    if (!connection.metadata.authorization?.grant_types_supported.includes('urn:ietf:params:oauth:grant-type:token-exchange')) throw new AuthFailure('invalid_target', connection.id);
+    let subject = await credentialFor(connection.id, null, null);
+    connection = await currentConnection(connection.id);
+    const granted = publicConnection(await load({ connectionId: connection.id }), connection).scopes;
+    const requested = scopes ?? granted;
+    if (!requested.every(scope => granted.includes(scope))) throw new AuthFailure('invalid_scope', connection.id);
+    if (!requested.every(scope => subject.scopes.includes(scope))) subject = await renewShared(connection.id, null);
+    for (let attempt = 0; ; attempt++) {
+      let value = await secrets.read(subject.secretRef);
+      if (!value) { subject = await credentialFor(connection.id, null, subject.secretRef); value = await secrets.read(subject.secretRef); }
+      if (!value || subject.tokenType !== 'DPoP') throw new AuthFailure('invalid_response', connection.id);
+      connection = await currentConnection(connection.id);
+      if (!requested.every(scope => subject.scopes.includes(scope))) throw new AuthFailure('invalid_scope', connection.id);
+      const fields: Record<string, string> = { grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange', subject_token: value, subject_token_type: 'urn:ietf:params:oauth:token-type:access_token', resource };
+      if (scopes !== null) fields.scope = scopes.join(' ');
+      const issuedAt = now();
+      let token: TokenResponse;
+      try { ({ token } = await tokenRequest(connection.metadata, connection.dpopKeyRef, fields, null, connection.anonymous)); }
+      catch (error) {
+        if (!(error instanceof AuthFailure && error.code === 'invalid_grant') || attempt !== 0) throw error;
+        // A definite subject rejection uses normal renewal/diagnosis; ambiguous exchanges never replay credentials.
+        subject = await credentialFor(connection.id, null, subject.secretRef); continue;
+      }
+      const allowed = token.scope === undefined ? requested : token.scope.split(' ').filter(Boolean);
+      if (token.token_type !== 'Bearer' || token.refresh_token !== undefined || !allowed.every(scope => requested.includes(scope))) throw new AuthFailure('invalid_response', connection.id);
+      const secretRef = await stageSessionToken(token.access_token);
+      return commit({ connectionId: connection.id }, [secretRef], (state, drop) => {
+        const live = own(state.connections, connection.id);
+        if (!live || live.generation !== connection.generation || live.status !== connection.status || live.sessionId !== connection.sessionId || live.dpopKeyRef !== connection.dpopKeyRef || own(live.slots, slotKey(live.sessionId, null))?.secretRef !== subject.secretRef) throw new AuthFailure('state_changed', connection.id);
+        replaceSlot(live, resource, { secretRef, tokenType: 'Bearer', dpopKeyRef: live.dpopKeyRef, scopes: allowed, expiresAt: issuedAt + token.expires_in * 1000, generation: live.generation }, drop);
+        return finish(state, renewOperation(state, randomId('op_'), live, null, issuedAt, resource, allowed), 'completed');
+      });
+    }
+  }
+
   // Every token-request path (internal refresh and public renew) goes through here, so all honour Retry-After.
   async function renewal(connection: ConnectionRecord, resource: string | null, scopes: string[] | null): Promise<AuthOutcome> {
     // Local failures first: a wait is only meaningful for a connection that can still send a token request.
@@ -691,7 +732,8 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     checkCooldown(await record(connection.id));
     let outcome: AuthOutcome;
     try {
-      outcome = connection.status === 'signed_out' ? await signedOutRenewal(connection, resource) : await refresh(connection, resource, scopes);
+      if (resource !== null && await resourceScheme(connection.metadata, resource) === 'Bearer') outcome = await exchangeBearer(connection, resource, scopes);
+      else outcome = connection.status === 'signed_out' ? await signedOutRenewal(connection, resource) : await refresh(connection, resource, scopes);
     } catch (error) {
       if (error instanceof AuthFailure && error.retryAfterMs !== undefined) await holdOff(connection.id, error);
       throw error;
@@ -1331,21 +1373,21 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     },
     async joinBrowser(connectionId, returnTo, controller) {
       const connection = await currentConnection(connectionId), endpoint = connection.metadata.document.web?.browser_session_endpoint;
-      if (!endpoint || !connection.sessionId || connection.status === 'disconnected' || connection.status === 'uncertain' || controller?.kind !== 'agent-controlled' || typeof controller.postForm !== 'function') throw new AuthFailure('invalid_browser', connectionId);
+      if (!endpoint || !connection.sessionId || connection.status === 'disconnected' || connection.status === 'uncertain' || controller?.kind !== 'agent-controlled' || typeof controller.loadJoinForm !== 'function' || typeof controller.postForm !== 'function' || typeof controller.navigate !== 'function') throw new AuthFailure('invalid_browser', connectionId);
       try { browserDestination(returnTo, connection.metadata.document.organization.domain); } catch { throw new AuthFailure('invalid_target', connectionId); }
       const key = await loadDpopKey(connection.dpopKeyRef);
-      let value: string;
-      if (options.assertions && !connection.anonymous) {
-        let result;
-        try { result = await options.assertions.assert({ purpose: 'browser', operationId: randomId('op_'), issuer: connection.issuer, sessionId: connection.sessionId, returnTo }); }
-        catch (error) { throw providerFailure(error, connectionId); }
-        value = providerAssertion(result, connectionId);
-      } else value = await signIdentity({ typ: 'poppy-browser+jwt' }, { ...assertionClaims(connection.userId, endpoint), session_id: connection.sessionId, return_to: returnTo }, key.thumbprint);
       try {
-        await controller.postForm({ url: endpoint, fields: { assertion: value }, validateRedirect(status, location) {
-          if (status !== 303 || location !== returnTo) throw new AuthFailure('invalid_browser_redirect', connectionId);
-          return returnTo;
+        const { code } = await controller.loadJoinForm(endpoint);
+        if (typeof code !== 'string' || !code || code.length > 256) throw new Error('code');
+        const live = await currentConnection(connectionId);
+        if (live.generation !== connection.generation || live.dpopKeyRef !== connection.dpopKeyRef || live.status !== connection.status) throw new Error('state changed');
+        await controller.postForm({ url: endpoint, fields: { code, proof: await proof(key, 'POST', endpoint, undefined, code) }, validateRedirect(status, location) {
+          if (status !== 303) throw new AuthFailure('invalid_browser_redirect', connectionId);
+          const destination = new URL(location, endpoint).href;
+          browserDestination(destination, connection.metadata.document.organization.domain);
+          return destination;
         } });
+        await controller.navigate(returnTo);
       } catch { throw new AuthFailure('browser_failed', connectionId); }
     },
     async feedback(connectionId, report) {
@@ -1353,7 +1395,18 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const connection = await currentConnection(connectionId), endpoint = connection.metadata.document.feedback?.endpoint;
       if (!endpoint) throw new AuthFailure('feedback_unavailable', connectionId);
       const response = await sendAuthorized(connectionId, new Request(endpoint, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(report) }), { issuer: connection.issuer, endpoint }, [], 'DPoP', false);
-      if (response.status !== 202 || (await response.text()) !== '') throw new AuthFailure('feedback_failed', connectionId);
+      try {
+        const text = await response.text();
+        if (response.status === 202 && text === '') return;
+        if (response.status === 200) return parseAlternative(parseJson(text), connection.metadata.document);
+      } catch { /* Do not expose company response/parser details. */ }
+      throw new AuthFailure('feedback_failed', connectionId);
+    },
+    async excludedTasks(connectionId) {
+      const connection = await currentConnection(connectionId);
+      if (!connection.metadata.document.excluded_tasks) return [];
+      if (!options.metadata.resolveExcludedTasks) throw new AuthFailure('excluded_tasks_unavailable', connectionId);
+      return options.metadata.resolveExcludedTasks(connection.metadata.document);
     },
     async authorizedFetch(connectionId, request, target, requiredScopes = []) {
       const connection = await currentConnection(connectionId), expected = targetOf(connection);

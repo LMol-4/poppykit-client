@@ -50,8 +50,6 @@ export interface ProviderOptions {
   publishedKeys?: () => Promise<Record<string, any>[]>;
   /** Validate operator login and CSRF; caller IDs and public setup URLs are never authentication. */
   authenticateEnrollment(request: Request): Promise<{ subject: string; allowedCompanies: string[] } | null>;
-  /** Required for browser assertions: independently prove session belongs to this client AND derived user. */
-  verifySession?(binding: { clientId: string; userId: string; issuer: string; sessionId: string }): Promise<boolean>;
   now?: () => number; maxEnrollments?: number;
 }
 const id = () => randomBytes(32).toString('base64url');
@@ -62,7 +60,6 @@ const text = (value: unknown): string => typeof value === 'string' && value.leng
 function exact(value: Row, keys: string[]): void { if (value.version !== 1 || Object.keys(value).some(key => !keys.includes(key))) fail('binding_conflict'); }
 function object(value: unknown): Row { if (!value || typeof value !== 'object' || Array.isArray(value)) fail('binding_conflict'); return value as Row; }
 function https(value: string): URL { try { return secureUrl(value); } catch { return fail('binding_conflict'); } }
-function onDomain(value: string, domain: string): boolean { const host = https(value).hostname; return host === domain || host.endsWith(`.${domain}`); }
 function publicKey(value: Row): Row {
   if(value.kty!=='EC'||value.crv!=='P-256'||typeof value.x!=='string'||typeof value.y!=='string'||'d'in value||'k'in value)fail('unavailable');
   return {kty:value.kty,crv:value.crv,x:value.x,y:value.y,kid:text(value.kid),alg:'ES256',use:'sig'};
@@ -138,27 +135,22 @@ export function createProvider(options: ProviderOptions) {
       });
     },
     async begin(credential: string, input: Row) {
-      exact(input, ['version', 'installationId', 'operationId', 'domain', 'issuer', 'purpose', 'sessionId', 'sessionKey', 'returnTo', 'state']);
-      if (!['client-authentication', 'session', 'browser', 'direct'].includes(input.purpose)) fail('binding_conflict');
+      exact(input, ['version', 'installationId', 'operationId', 'domain', 'issuer', 'purpose', 'sessionId', 'sessionKey', 'state']);
+      if (!['client-authentication', 'session', 'direct'].includes(input.purpose)) fail('binding_conflict');
       text(input.operationId);
       if (input.sessionId !== undefined) text(input.sessionId);
       await authorizeCompany(credential, input);
-      if (input.purpose === 'client-authentication' && (input.sessionId !== undefined || input.returnTo !== undefined)) fail('binding_conflict');
-      if (input.purpose !== 'browser' && input.returnTo !== undefined) fail('binding_conflict');
+      if (input.purpose === 'client-authentication' && input.sessionId !== undefined) fail('binding_conflict');
       if (input.purpose !== 'direct' && input.state !== undefined) fail('binding_conflict');
       if (input.purpose === 'direct' && (typeof input.state !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(input.state) || typeof input.sessionKey !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(input.sessionKey))) fail('binding_conflict');
       if (input.purpose !== 'direct' && input.sessionKey !== undefined) fail('binding_conflict');
-      if (input.purpose === 'browser' && !input.sessionId) fail('binding_conflict');
-      if (input.purpose === 'browser') text(input.returnTo);
       const metadata = await verified(text(input.domain), text(input.issuer));
-      if (input.purpose === 'browser' && (!onDomain(input.returnTo, metadata.document.organization.domain) || !metadata.document.web?.browser_session_endpoint)) fail('binding_conflict');
       const identity = await store.transaction({ kind: 'identity', enrollmentId: enrollmentId(credential), issuer: input.issuer }, tx => {
         const enrollment = auth(tx, credential, text(input.installationId));
         if (!enrollment.allowedCompanies.includes(metadata.document.organization.domain)) fail('unauthorized');
         return { enrollment, userId: user(tx, enrollment.visitor, input.issuer) };
       });
-      if (input.purpose === 'browser' && !await options.verifySession?.({ clientId: options.clientId, userId: identity.userId, issuer: input.issuer, sessionId: input.sessionId })) fail('unauthorized');
-      const binding = { issuer: input.issuer, domain: metadata.document.organization.domain, purpose: input.purpose, sessionKey: input.sessionKey ?? null, sessionId: input.sessionId ?? null, returnTo: input.returnTo ?? null, stateHash: input.state ? hash(input.state) : null, userId: identity.userId, browserEndpoint: metadata.document.web?.browser_session_endpoint ?? null };
+      const binding = { issuer: input.issuer, domain: metadata.document.organization.domain, purpose: input.purpose, sessionKey: input.sessionKey ?? null, sessionId: input.sessionId ?? null, stateHash: input.state ? hash(input.state) : null, userId: identity.userId };
       return store.transaction({ kind: 'begin', enrollmentId: enrollmentId(credential), operationId: input.operationId, issuer: input.issuer, ...(binding.stateHash ? { stateHash: binding.stateHash } : {}), at: now() }, tx => {
         const enrollment = auth(tx, credential, text(input.installationId)), key = `${enrollment.enrollmentId}:${text(input.operationId)}`, existing = tx.get('operation', key);
         if (existing) { if (!same(existing.binding, binding)) fail('binding_conflict'); operation(tx, enrollment, input.operationId); return { expiresAt: existing.expiresAt }; }
@@ -179,15 +171,13 @@ export function createProvider(options: ProviderOptions) {
       exact(input, ['version', 'installationId', 'operationId', 'purpose']);
       const snapshot = await store.transaction(selectedOperation(credential, input), tx => {
         const enrollment = auth(tx, credential, text(input.installationId)), op = operation(tx, enrollment, text(input.operationId));
-        if (op.binding.purpose !== input.purpose || !['client-authentication', 'session', 'browser'].includes(input.purpose)) fail('binding_conflict');
+        if (op.binding.purpose !== input.purpose || !['client-authentication', 'session'].includes(input.purpose)) fail('binding_conflict');
         throttle(tx, enrollment); return { enrollment, op };
       });
-      const b = snapshot.op.binding, metadata = await verified(b.domain, b.issuer);
-      if (b.browserEndpoint !== (metadata.document.web?.browser_session_endpoint ?? null)) fail('binding_conflict');
-      if (b.purpose === 'browser' && !await options.verifySession?.({ clientId: options.clientId, userId: b.userId, issuer: b.issuer, sessionId: b.sessionId })) fail('unauthorized');
+      const b = snapshot.op.binding; await verified(b.domain, b.issuer);
       const iat = Math.floor(now() / 1000), exp = iat + 60;
-      const claims = { iss: options.clientId, sub: b.purpose === 'client-authentication' ? options.clientId : b.userId, aud: b.purpose === 'browser' ? b.browserEndpoint : b.issuer, iat, exp, jti: id(), ...(b.purpose === 'browser' ? { session_id: b.sessionId, return_to: b.returnTo } : {}) };
-      const header = { alg: 'ES256', kid: options.signer.kid, typ: b.purpose === 'client-authentication' ? 'client-authentication+jwt' : b.purpose === 'browser' ? 'poppy-browser+jwt' : 'JWT' };
+      const claims = { iss: options.clientId, sub: b.purpose === 'client-authentication' ? options.clientId : b.userId, aud: b.issuer, iat, exp, jti: id() };
+      const header = { alg: 'ES256', kid: options.signer.kid, typ: b.purpose === 'client-authentication' ? 'client-authentication+jwt' : 'JWT' };
       const unsigned = `${Buffer.from(JSON.stringify(header)).toString('base64url')}.${Buffer.from(JSON.stringify(claims)).toString('base64url')}`;
       const signature = await options.signer.sign(new TextEncoder().encode(unsigned));
       if (signature.length !== 64) fail('unavailable');

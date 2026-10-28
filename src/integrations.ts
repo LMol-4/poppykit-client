@@ -9,7 +9,10 @@ export interface AgentBrowserController {
   // Trusted adapter: isolated per-session cookies; verified TLS and actual connected-address checks (no private/
   // loopback/link-local peers without narrow explicit configuration). Never log fields. Intercept redirects before
   // following; call validateRedirect, discard the POST body, then navigate. Never replay it on 307/308.
-  postForm(input: { url: string; fields: { assertion: string }; validateRedirect(status: number, location: string): string }): Promise<void>;
+  // Load url as a top-level GET, then read its form code in trusted software, outside model context.
+  loadJoinForm(url: string): Promise<{ code: string }>;
+  postForm(input: { url: string; fields: { code: string; proof: string }; validateRedirect(status: number, location: string): string }): Promise<void>;
+  navigate(url: string): Promise<void>;
 }
 export interface FeedbackReport { kind: 'missing'; task: string; description: string }
 export function validateFeedback(value: FeedbackReport): void {

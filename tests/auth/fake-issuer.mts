@@ -209,6 +209,16 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     if (company.behavior.tokenError) return json(company.behavior.tokenError.status, company.behavior.tokenError.body);
     const form = new URLSearchParams(await request.text());
     if (form.get('client_assertion_type') !== CLIENT_ASSERTION || form.get('client_id') !== clientId) throw new Reject(400, 'invalid_request');
+    if (form.get('grant_type') === 'urn:ietf:params:oauth:grant-type:token-exchange') {
+      await company.verifyAssertion(form.get('client_assertion'), 'client'); const jkt = await verifyProof(request);
+      const subject = company.tokens.get(form.get('subject_token'));
+      if (!subject || subject.expires <= now() || subject.jkt !== jkt) throw new Reject(400, 'invalid_grant');
+      if (form.get('subject_token_type') !== 'urn:ietf:params:oauth:token-type:access_token') throw new Reject(400, 'invalid_request');
+      const scopes = form.has('scope') ? (form.get('scope') ?? '').split(' ').filter(Boolean) : subject.scopes ?? [];
+      if (!scopes.every(scope => (subject.scopes ?? []).includes(scope))) throw new Reject(400, 'invalid_scope');
+      const access = 'exchange_' + randomUUID(); company.tokens.set(access, { ...subject, jkt: '', resource: form.get('resource') });
+      return json(200, { access_token: access, issued_token_type: 'urn:ietf:params:oauth:token-type:access_token', token_type: 'Bearer', expires_in: 3600, scope: scopes.join(' '), ...company.behavior.tokenOverride });
+    }
     if (form.get('grant_type') === 'authorization_code') return exchangeCode(request, form);
     if (form.get('grant_type') === 'urn:ietf:params:oauth:grant-type:device_code') {
       await company.verifyAssertion(form.get('client_assertion'), 'client'); const jkt = await verifyProof(request);
