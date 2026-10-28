@@ -8,6 +8,7 @@ for complete option/result types. This map describes the supported integration s
 | `@poppykit/client` | `createMetadataResolver`, `signInMethods`, `createNodeTransport` | [README](README.md), [delivery](DELIVERY.md) |
 | `@poppykit/client` | `createClientAuth`, `AuthFailure`, authentication/identity/input types | [authentication](AUTH.md) |
 | `@poppykit/client` | `createConversationClient`, `ConversationError`, `parseEventStream` | [delivery](DELIVERY.md) |
+| `@poppykit/client` | `Author`, `AuthorType`, `Message`, `RecordedMessage`, conversation/event types | [delivery](DELIVERY.md) |
 | `@poppykit/client` | `ApiTarget`, `AgentBrowserController`, `FeedbackReport` types | [integrations](INTEGRATIONS.md) |
 | `@poppykit/client/sqlite` | `SqliteAuthStore`, `SqliteConversationStore` | [storage](STORAGE.md) |
 | `@poppykit/client/memory` | `MemoryConversationStore` (non-durable) | [storage](STORAGE.md) |

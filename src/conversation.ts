@@ -115,8 +115,14 @@ export function createConversationClient(options: ConversationClientOptions) {
     const record = await store.getOutbound(key, id);
     if (!record) throw new ConversationError('unknown_operation');
     if (record.endpoint !== endpoint) throw new ConversationError('invalid_target');
-    if (record.phase === 'accepted') return record.response!;
+    if (record.phase === 'accepted') {
+      try { return record.response && 'events' in record.response ? parseEventPage(record.response, record.read?.cursor) : parseConversationState(record.response); }
+      catch { throw new ConversationError('stored_operation_reset_required'); }
+    }
     if (record.phase === 'rejected') throw new ConversationError(record.error!.code, record.error!.status, undefined, undefined, record.error!.conversationId);
+    // A legacy pending body may already be accepted remotely. Never rewrite or replay it as a new contract.
+    if ('sender' in record.request.message) throw new ConversationError('legacy_message_uncertain');
+    parseConversationRequest(record.request);
     const url = new URL(record.target === null ? endpoint : conversationUrl(record.target, 'messages'));
     if (record.read?.cursor !== undefined) url.searchParams.set('cursor', record.read.cursor);
     if (record.read?.wait !== undefined) url.searchParams.set('wait', String(record.read.wait));

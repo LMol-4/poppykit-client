@@ -12,7 +12,7 @@ export function runClientConversationAdapterContract(fixture: ClientConversation
     const f=await fixture();
     try {
       const key={connectionId:'contract',issuer:'https://issuer.example/one',endpoint:'https://company.example/conversations'};
-      const row:OutboundRecord={...key,id:'message',fingerprint:'original',phase:'pending',target:null,request:{message:{id:'message',sender:'agent',text:'hello'}}};
+      const row:OutboundRecord={...key,id:'message',fingerprint:'original',phase:'pending',target:null,request:{message:{id:'message',author: { type: 'agent' },text:'hello'}}};
       const saved=await Promise.all([f.store.prepareOutbound(key,row),f.second.prepareOutbound(key,{...row,fingerprint:'changed'})]);
       assert.equal(saved[0].fingerprint,saved[1].fingerprint);
       saved[0].request.message.text='mutated';assert.equal((await f.second.getOutbound(key,row.id))?.request.message.text,'hello');

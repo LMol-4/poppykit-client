@@ -14,7 +14,17 @@ import { MemoryConversationStore } from '../dist/memory.js';
 import { createConversationClient } from '../dist/index.js';
 
 const key = { connectionId: 'c', issuer: 'https://issuer.test/one', endpoint: 'https://company.test/conversations' };
-const row:OutboundRecord = { ...key, id: 'message', target: null, request: { message: { id: 'message', sender: 'agent', text: 'hello' } }, fingerprint: 'same', phase: 'pending' };
+const row:OutboundRecord = { ...key, id: 'message', target: null, request: { message: { id: 'message', author: { type: 'agent' }, text: 'hello' } }, fingerprint: 'same', phase: 'pending' };
+test('old pending outbox survives reopen but cannot dispatch or be rewritten under its ID', async t => {
+  const path=await fixture(t), first=new SqliteConversationStore(path);
+  const legacy={...row,request:{message:{id:row.id,sender:'agent',text:'hello'}},fingerprint:'accepted-or-uncertain-original'};
+  await first.prepareOutbound(key,legacy as unknown as OutboundRecord);first.close();
+  const store=new SqliteConversationStore(path);t.after(()=>store.close());let calls=0;
+  const client=createConversationClient({...key,store,clock:{now:Date.now},authorizedRequest:async()=>{calls++;throw new Error('must not send');}});
+  await assert.rejects(client.retry(row.id),{code:'legacy_message_uncertain'});
+  await assert.rejects(client.start(row.request.message),{code:'message_id_conflict'});
+  assert.equal(calls,0);assert.deepEqual(await store.getOutbound(key,row.id),legacy);
+});
 test('explicit SQLite retry removal preserves other destinations',async t=>{
   const store=new SqliteConversationStore(await fixture(t));t.after(()=>store.close());
   await store.prepareOutbound(key,row);

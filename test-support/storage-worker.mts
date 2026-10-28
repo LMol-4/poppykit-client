@@ -11,7 +11,7 @@ const pool=process.env.D1_POSTGRES==='1'?testPool():undefined;
 
 const [mode, path] = process.argv.slice(2);
 const key = { connectionId: 'c', issuer: 'https://issuer.test/one', endpoint: 'https://company.test/conversations' };
-const row:OutboundRecord = { ...key, id: 'message', target: null, request: { message: { id: 'message', sender: 'agent', text: 'hello' } }, fingerprint: 'same', phase: 'pending' };
+const row:OutboundRecord = { ...key, id: 'message', target: null, request: { message: { id: 'message', author: { type: 'agent' }, text: 'hello' } }, fingerprint: 'same', phase: 'pending' };
 const pause = () => new Promise(() => { setInterval(() => {}, 1000); });
 if (mode === 'prepare') {
   const store = pool?new PostgresConversationStore(pool,path):new SqliteConversationStore(path);

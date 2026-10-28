@@ -1,6 +1,6 @@
 # Conversation delivery and transport
 
-Conversation wire migration to draft 0.3 is pending; this layer still uses draft 0.2. Company content, messages,
+Conversation messages and authorization events now use draft 0.3. Company content, messages,
 unknown events and partial text remain untrusted data for the host application.
 
 ## Client
@@ -92,3 +92,16 @@ Pruning is explicit operator policy, never automatic data loss. It preserves old
 message receipts and cursor identity. Concurrent reads see a coherent snapshot or
 `cursor_expired`. Invalid/expired waited-POST cursors are rejected before accepting
 the new write; an existing message ID still returns its original receipt.
+
+## Unreleased draft 0.3 breaking change
+
+Messages now require `author: { type: 'agent' | 'human' }`; protocol `sender` is
+unsupported. Human text must remain the person's exact words. Company authors
+may include `id`, `name` and an HTTPS `image`. Authorization events now contain
+`error: 'insufficient_scope'` and nonempty required `scope`.
+
+No backward compatibility is provided. Stop writers and explicitly reset old
+history, outboxes, checkpoints and caller retry handles before cutover, preserving
+configuration. Old pending `sender` requests fail `legacy_message_uncertain`
+without dispatch or mutation. Reconcile uncertain delivery before clearing it;
+never rebuild the body or allocate a replacement ID to hide uncertainty.

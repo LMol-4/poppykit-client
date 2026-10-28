@@ -20,3 +20,5 @@ export { authChallenge } from './auth/challenge.js';
 export type { AuthChallenge } from './auth/challenge.js';
 export type { ApiTarget, AgentBrowserController, FeedbackReport } from './integrations.js';
 export { protectedResourceMetadataUrl } from './integrations.js';
+
+export type { Author, AuthorType, Message, RecordedMessage, ConversationRequest, ConversationState, ConversationEvent, KnownEvent, EventPage } from './protocol/wire.js';

@@ -21,7 +21,7 @@ const conversationStore=(path:string)=>new PostgresConversationStore(pool!,path)
 import { createConversationClient } from '../dist/index.js';
 
 const key = { connectionId: 'c', issuer: 'https://issuer.test/one', endpoint: 'https://company.test/conversations' };
-const row:OutboundRecord = { ...key, id: 'message', target: null, request: { message: { id: 'message', sender: 'agent', text: 'hello' } }, fingerprint: 'same', phase: 'pending' };
+const row:OutboundRecord = { ...key, id: 'message', target: null, request: { message: { id: 'message', author: { type: 'agent' }, text: 'hello' } }, fingerprint: 'same', phase: 'pending' };
 test('explicit Postgres retry removal preserves other destinations',async t=>{
   const store=conversationStore(await fixture(t));t.after(async()=>{await store.close();});
   await store.prepareOutbound(key,row);

@@ -90,7 +90,7 @@ function setup(overrides:Partial<ConversationClientOptions>&{keepCompleted?:numb
   });
   return { server, sleeps, store, client };
 }
-const msg:Omit<Message,'id'> = { sender: 'agent', text: 'hello' };
+const msg:Omit<Message,'id'> = { author: { type: 'agent' }, text: 'hello' };
 
 test('lost first POST response then retry reuses the ID and the company dedupes', async () => {
   const { server, client } = setup({ maxAttempts: 1 });
@@ -129,18 +129,18 @@ test('outbound content is persisted before the first dispatch', async () => {
 
 test('same ID with different content or target is a local conflict; key order is ignored', async () => {
   const { client, server } = setup();
-  await client.start({ id: 'msg_d', sender: 'agent', data: { a: 1, b: [1, 2] }, text: 't' });
-  await client.start({ id: 'msg_d', sender: 'agent', text: 't', data: { b: [1, 2], a: 1 } });
-  await assert.rejects(client.start({ id: 'msg_d', sender: 'agent', text: 't', data: { a: 1, b: [2, 1] } }), e => e instanceof ConversationError && e.code === 'message_id_conflict');
-  await assert.rejects(client.start({ id: 'msg_d', sender: 'agent', text: 't ', data: { a: 1, b: [1, 2] } }), e => e instanceof ConversationError && e.code === 'message_id_conflict');
-  await assert.rejects(client.send('cnv_1', { id: 'msg_d', sender: 'agent', text: 't', data: { a: 1, b: [1, 2] } }), e => e instanceof ConversationError && e.code === 'message_id_conflict');
+  await client.start({ id: 'msg_d', author: { type: 'agent' }, data: { a: 1, b: [1, 2] }, text: 't' });
+  await client.start({ id: 'msg_d', author: { type: 'agent' }, text: 't', data: { b: [1, 2], a: 1 } });
+  await assert.rejects(client.start({ id: 'msg_d', author: { type: 'agent' }, text: 't', data: { a: 1, b: [2, 1] } }), e => e instanceof ConversationError && e.code === 'message_id_conflict');
+  await assert.rejects(client.start({ id: 'msg_d', author: { type: 'agent' }, text: 't ', data: { a: 1, b: [1, 2] } }), e => e instanceof ConversationError && e.code === 'message_id_conflict');
+  await assert.rejects(client.send('cnv_1', { id: 'msg_d', author: { type: 'agent' }, text: 't', data: { a: 1, b: [1, 2] } }), e => e instanceof ConversationError && e.code === 'message_id_conflict');
   assert.equal(server.conversations.size, 1);
 });
 
 test('unknown extension members are part of the identity', async () => {
   const { client } = setup();
-  await client.start({ id: 'msg_e', sender: 'agent', text: 'x', ext: { v: 1 } });
-  await assert.rejects(client.start({ id: 'msg_e', sender: 'agent', text: 'x', ext: { v: 2 } }), e => e instanceof ConversationError && e.code === 'message_id_conflict');
+  await client.start({ id: 'msg_e', author: { type: 'agent' }, text: 'x', ext: { v: 1 } });
+  await assert.rejects(client.start({ id: 'msg_e', author: { type: 'agent' }, text: 'x', ext: { v: 2 } }), e => e instanceof ConversationError && e.code === 'message_id_conflict');
 });
 
 test('rejections: definite 4xx is recorded and not resent; 5xx stays retryable', async () => {
@@ -183,8 +183,8 @@ test('Retry-After beyond the cap or exhausted attempts surfaces the delay', asyn
 
 test('invalid input fails before anything is persisted', async () => {
   const { client, store } = setup();
-  await assert.rejects(client.start({ id: 'bad id!', sender: 'agent', text: 'x' }));
-  await assert.rejects(client.start({ id: 'msg_k', sender: 'agent' }));
+  await assert.rejects(client.start({ id: 'bad id!', author: { type: 'agent' }, text: 'x' }));
+  await assert.rejects(client.start({ id: 'msg_k', author: { type: 'agent' } }));
   assert.equal((await store.read()).outbound.length, 0);
 });
 
@@ -580,7 +580,7 @@ test('backoff is capped full jitter with injectable randomness', async () => {
 test('default message IDs carry 128 random bits as base64url and are unique', async () => {
   const ids = new Set<string>();
   const { client } = setup({ newId: undefined });
-  for (let i = 0; i < 3; i++) {const id=(await client.start({sender:'agent',text:`t${i}`})).messageId;assert.ok(typeof id==='string');ids.add(id);}
+  for (let i = 0; i < 3; i++) {const id=(await client.start({author: { type: 'agent' },text:`t${i}`})).messageId;assert.ok(typeof id==='string');ids.add(id);}
   assert.equal(ids.size, 3);
   for (const id of ids) assert.match(id, /^msg_[A-Za-z0-9_-]{22}$/);
 });
@@ -600,7 +600,7 @@ test('a renewal that lost its connection (AuthFailure transport_error) is retrie
 test('malformed waited page cannot fall back to a valid state and JSON errors retain header scope',async()=>{
   const {client,server}=setup();
   server.hooks.failures.push(json({conversation_id:'c1',status:'idle',responder:'agent',events:'bad',cursor:null,has_more:false},201));
-  await assert.rejects(client.start({id:'broken_wait',sender:'agent',text:'x'},{wait:1}),{code:'invalid_response'});
+  await assert.rejects(client.start({id:'broken_wait',author: { type: 'agent' },text:'x'},{wait:1}),{code:'invalid_response'});
   server.hooks.failures.push(json({error:'insufficient_scope'},403,{'www-authenticate':'DPoP error="insufficient_scope", scope="custom:read"'}));
   await assert.rejects(client.read('c1'),{code:'insufficient_scope',scope:'custom:read'});
 });
