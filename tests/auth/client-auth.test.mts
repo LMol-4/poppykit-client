@@ -1829,3 +1829,9 @@ for(const method of ['device','mediated'] as const)test(`conversation errors use
   let error:unknown;try{await client.read('c1');}catch(value){error=value;}assert.ok(error instanceof ConversationError);const requirement=await client.authorization(error);assert.deepEqual(requirement.methods,[{method,scopes:['orders:read','orders:write']}]);assert.deepEqual(requirement.requiredScopes,['orders:read']);
   const begun=await auth.beginSignIn(connection.id,{method,scopes:requirement.requiredScopes});if(method==='device'){env.clock.t+=5000;await auth.continueSignIn(begun.outcome.operationId);}assert.equal((await client.read('c1')).conversation_id,'c1');
 });
+
+test('authority revalidation preserves the discovered HTTPS port before sending credentials',async()=>{
+  const env=await setup(),resolve=env.options.metadata.resolveCompany,hosts:string[]=[];
+  env.options.metadata.resolveCompany=async domain=>{hosts.push(domain);assert.equal(domain,env.company.domain+':8443');const metadata=structuredClone(await resolve(env.company.domain));metadata.url='https://'+env.company.domain+':8443/.well-known/poppy.json';return metadata;};
+  const outcome=await env.auth.start(env.company.domain+':8443');assert.equal(outcome.status,'completed');await env.auth.target(outcome.connection.id);assert.ok(hosts.length>=3);
+});

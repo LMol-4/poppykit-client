@@ -298,7 +298,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   }
   async function verified(metadata: CompanyMetadata): Promise<CompanyMetadata> {
     let fresh: CompanyMetadata;
-    try { fresh = await options.metadata.resolveCompany(new URL(metadata.url).hostname); } catch { throw new AuthFailure('discovery_failed'); }
+    try { fresh = await options.metadata.resolveCompany(new URL(metadata.url).host); } catch { throw new AuthFailure('discovery_failed'); }
     if (destinations(fresh) !== destinations(metadata)) throw new AuthFailure('metadata_changed');
     return fresh;
   }
