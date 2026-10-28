@@ -1,3 +1,4 @@
+import { registeredRedirect } from '../network/redirect.js';
 import type { AuthSelection, AuthStore } from './store.js';
 import { acquireOwner, releaseOwner, localOwnerAlive } from './ownership.js';
 import type { OperationOwner } from './ownership.js';
@@ -140,7 +141,7 @@ export interface OperationRecord {
   // Sign-in activates in one transaction with its result; only refresh records staged refs first.
   direct: DirectRecord | null; staged: StagedRefresh | null;
   result: AuthOutcome | null;
-  method?: SignInMethod; requiredExistingScopes?: string[]; signInSessionId?: string;
+  method?: SignInMethod; requiredExistingScopes?: string[]; signInSessionId?: string; signInSessionKey?: string;
   device?: { codeRef: string; intervalMs: number; nextPollAt: number };
   mediated?: { challengeId: string; sentTo: string };
   cancelRequested?: boolean;
@@ -864,6 +865,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
 
   async function claimSignIn(operationId: string, executionOwner: OperationOwner, preSend = false): Promise<{ operation: OperationRecord; connection: ConnectionRecord } | AuthOutcome> {
     const snapshot = await load({ operationId }), operation = own(snapshot.operations, operationId)!;
+    if (operation.phase === 'prepared' && !operation.signInSessionKey) return terminate(operationId, 'failed', 'restart_required');
     await currentConnection(operation.connectionId);
     return await transaction({ operationId }, state => {
       const current = own(state.operations, operationId)!;
@@ -1131,7 +1133,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (requirement.sufficient && !input.force) return { outcome: { operationId: '', status: 'completed', connection: publicConnection(await load({ connectionId }), found), grantedScopes: requirement.grantedScopes, missingScopes: [] } };
       checkCooldown(found);
       if (method === 'mediated' && !options.trustedInput) throw new AuthFailure('trusted_input_required', connectionId);
-      if (method === 'direct' && (typeof redirectUri !== 'string' || !options.redirectUris.includes(redirectUri) || !URL.canParse(redirectUri) || !safeHttps(redirectUri) || new URL(redirectUri).hostname !== new URL(clientId).hostname || CALLBACK_PARAMS.some(name => new URL(redirectUri).searchParams.has(name)))) throw new AuthFailure('invalid_redirect', connectionId);
+      if (method === 'direct' && (typeof redirectUri !== 'string' || !registeredRedirect(redirectUri, options.redirectUris, clientId) || CALLBACK_PARAMS.some(name => new URL(redirectUri).searchParams.has(name)))) throw new AuthFailure('invalid_redirect', connectionId);
       // The host derives this from its authenticated browser session; a short value would be guessable.
       if (method === 'direct' && (typeof browserBinding !== 'string' || browserBinding.length < 22)) throw new AuthFailure('invalid_binding', connectionId);
       // Ask for the conversation resource up front so the signed-in token is usable there (spec 4.3 "Narrower tokens").
@@ -1152,6 +1154,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (connection.status === 'disconnected' || connection.sessionId === null) throw new AuthFailure('sign_in_unavailable', connectionId);
       const state = b64(crypto.getRandomValues(new Uint8Array(32)));
       const verifier = b64(crypto.getRandomValues(new Uint8Array(32)));
+      const sessionKey = (await loadDpopKey(connection.dpopKeyRef)).thumbprint;
       const verifierRef = method === 'direct' ? await secrets.stage(verifier) : null;
       const createdAt = now(), operationId = randomId('op_');
       const outcome = await commit({ connectionId, history: true }, [verifierRef], draft => {
@@ -1161,7 +1164,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         const operation: OperationRecord = draft.operations[operationId] = {
           epoch: draft.epoch, id: operationId, kind: 'sign_in', connectionId, connectionGeneration: current.generation, grantId: current.grantId, grantGeneration: null,
           phase: 'prepared', status: 'pending', createdAt, expiresAt: createdAt + SIGN_IN_MS, resource, scopes: [...scopes],
-          method, signInSessionId: connection.sessionId!, requiredExistingScopes: requiredExistingScopes ?? requirement.grantedScopes,
+          method, signInSessionId: connection.sessionId!, signInSessionKey: sessionKey, requiredExistingScopes: requiredExistingScopes ?? requirement.grantedScopes,
           direct: method === 'direct' ? { stateHash: sha256(state), verifierRef: verifierRef!, browserHash: sha256(browserBinding!), redirectUri: redirectUri!, issuer: current.issuer, clientId, sessionId: connection.sessionId! } : null,
           staged: null, result: null,
         };
@@ -1170,7 +1173,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (method === 'device') return beginDevice(outcome.operationId);
       if (method === 'mediated') return { outcome: await continueMediated(outcome.operationId) };
       const url = new URL(authorizationEndpoint!);
-      const query = { response_type: 'code', client_id: clientId, redirect_uri: redirectUri!, scope: scopes.join(' '), state, code_challenge: sha256(verifier), code_challenge_method: 'S256' };
+      const query = { response_type: 'code', client_id: clientId, redirect_uri: redirectUri!, scope: scopes.join(' '), state, code_challenge: sha256(verifier), code_challenge_method: 'S256', dpop_jkt: sessionKey };
       for (const [name, value] of Object.entries(query)) url.searchParams.set(name, value);
       if (resource !== null) url.searchParams.set('resource', resource);
       return { outcome, authorizationUrl: url.href };
@@ -1189,6 +1192,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       // A wrong browser, redirect or issuer (mix-up, spec 4.5) leaves the operation untouched so the genuine callback still completes.
       if (!found || !direct || direct.browserHash !== browserHash || !redirectMatches(base, new URL(direct.redirectUri)) || params.iss !== direct.issuer) throw new AuthFailure('invalid_callback');
       checkCooldown(await record(found.connectionId));
+      if (found.phase === 'prepared' && !found.signInSessionKey) return terminate(found.id, 'failed', 'restart_required');
       const operationId = found.id;
       const verifier = found.phase === 'prepared' && params.code !== undefined ? await secrets.read(direct.verifierRef) : null;
       const at = now();
@@ -1198,7 +1202,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         if (!operation || operation.epoch !== state.epoch) throw new AuthFailure('invalid_callback');
         if (operation.phase !== 'prepared') return outcomeOf(state, operation);
         const connection = own(state.connections, operation.connectionId)!;
-        if (connection.generation !== operation.connectionGeneration) return finish(state, operation, 'failed', { error: 'state_changed' });
+        if (connection.generation !== operation.connectionGeneration || connection.sessionId !== operation.signInSessionId) return finish(state, operation, 'failed', { error: 'state_changed' });
         if (at >= operation.expiresAt) return finish(state, operation, 'expired');
         if (params.error !== undefined) return params.error === 'access_denied' ? finish(state, operation, 'denied', { error: 'access_denied' }) : finish(state, operation, 'failed', { error: AUTHORIZE_ERRORS.has(params.error) ? params.error : 'authorization_error' });
         if (verifier === null) return finish(state, operation, 'failed', { error: 'missing_key' });
@@ -1272,6 +1276,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
           // The code may have reached the issuer before the crash; only a fresh sign-in is safe.
           else if (operation.phase === 'staged') result = activateSignIn(state, operation, drop);
           else if (operation.phase !== 'prepared') result = finish(state, operation, 'uncertain', { error: 'lost_response' });
+          else if (operation.kind === 'sign_in' && !operation.signInSessionKey) result = finish(state, operation, 'failed', { error: 'restart_required' });
           else if (at >= operation.expiresAt) result = finish(state, operation, 'expired');
           else return;
           // Terminal operations never read their verifier again.

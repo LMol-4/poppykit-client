@@ -28,7 +28,11 @@ for appropriate device-flow situations. No sign-in method is user consent.
 
 Ask `authorization(connectionId, scopes)` for the current grant, missing scopes
 and advertised methods, with `scopeDescriptions` from `auth.scopes`. Choose a method explicitly in `beginSignIn`. Direct
-requires an HTTPS registered callback and an authenticated browser binding.
+requires a registered HTTPS callback on the client domain, or an RFC 8252 HTTP
+loopback IP callback (`127.0.0.1` or `[::1]`), and an authenticated browser binding.
+Only a loopback registration's port may vary; callback completion and code exchange
+use the exact port selected at initiation. Metadata/network endpoint address
+protections do not change. The URL's `dpop_jkt` binds the code to this Session Key.
 Display its URL in the user's browser. Device returns a checked link/code and
 company identity; call `continueSignIn(operationId)` when its deadline is due.
 Do not automate user approval. Mediated calls the configured `TrustedInput`

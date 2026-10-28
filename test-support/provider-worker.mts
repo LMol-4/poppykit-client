@@ -6,7 +6,7 @@ import { PostgresProviderStore } from '../dist/provider-postgres.js';
 import { testPool } from './postgres.mjs';
 
 export type ProviderRaceAction =
-  | { action:'take'; credential:string; body:{version:number;installationId:string;operationId:string;issuer:string;sessionId:string} }
+  | { action:'take'; credential:string; body:{version:number;installationId:string;operationId:string;issuer:string;sessionKey:string;sessionId?:string} }
   | { action:'revoke'; credential:string; body:{version:number;installationId:string} }
   | { action:'callback'; callback:string };
 

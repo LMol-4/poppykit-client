@@ -18,6 +18,22 @@ import type { PostgresConnection } from '../dist/provider-postgres.js';
 import { testPool } from '../test-support/postgres.mjs';
 
 const issuer='https://company.example/issuer', domain='company.example', clientId='https://identity.example/client.json', callbackUrl='https://identity.example/callback';
+test('Direct custody rejects absent/malformed keys and incompatible saved callbacks', async () => {
+  const f = await fixture();
+  try {
+    const a = await f.enroll(), state = randomBytes(32).toString('base64url');
+    const input = { version: 1, installationId: 'install-a', operationId: 'legacy', domain, issuer, purpose: 'direct', state, sessionId: 'local-id' };
+    for (const sessionKey of [undefined, '', 'short', ['k'.repeat(43)]]) await assert.rejects(f.api.begin(a.credential, { ...input, sessionKey }), { code: 'binding_conflict' });
+    await f.api.begin(a.credential, { ...input, sessionKey: 'k'.repeat(43) });
+    await f.store.transaction({ kind: 'operation', enrollmentId: a.enrollmentId, operationId: input.operationId }, tx => {
+      const key = `${a.enrollmentId}:${input.operationId}`, op = tx.get('operation', key)!;
+      delete op.binding.sessionKey; tx.put('operation', key, op);
+    });
+    const callback = `${callbackUrl}?state=${state}&iss=${encodeURIComponent(issuer)}&code=PRIVATE`;
+    await assert.rejects(f.api.callback(callback), { code: 'binding_conflict' });
+    await assert.rejects(f.api.takeResult(a.credential, { version: 1, installationId: 'install-a', operationId: input.operationId, issuer, sessionKey: 'k'.repeat(43) }), { code: 'binding_conflict' });
+  } finally { await f.close(); }
+});
 test('HTTP decoding preserves split Unicode and rejects malformed, truncated and oversized bytes before enrollment', async () => {
   const f = await fixture();
   try {
@@ -47,14 +63,14 @@ test('independent HTTP success and denial callbacks ignore unknown fields while 
     const enrollment = await f.enroll();
     for (const denied of [false, true]) {
       const state = randomBytes(32).toString('base64url'), operationId = `oauth-${denied}`;
-      await f.api.begin(enrollment.credential, { version: 1, installationId: 'install-a', operationId, domain, issuer, purpose: 'direct', sessionId: 'owned', state });
+      await f.api.begin(enrollment.credential, { version: 1, installationId: 'install-a', operationId, domain, issuer, purpose: 'direct', sessionKey: 'k'.repeat(43), sessionId: 'owned', state });
       const callback = new URL(callbackUrl);
       callback.search = new URLSearchParams({ state, iss: issuer, ...(denied ? { error: 'access_denied', error_description: 'PRIVATE_DETAIL', error_uri: 'https://company.example/error' } : { code: 'PRIVATE_CODE' }), extra: 'ignored' }).toString();
       for (const bad of [callback.href + '&code=duplicate', callback.href + '&error=duplicate', callback.href + '&state=duplicate', callback.href.replace(encodeURIComponent(issuer), 'https%3A%2F%2Fforeign.example')]) {
         assert.equal((await f.api.handle(new Request(bad))).status, 409);
       }
       assert.equal((await f.api.handle(new Request(callback))).status, 200);
-      const result = await f.api.takeResult(enrollment.credential, { version: 1, installationId: 'install-a', operationId, issuer, sessionId: 'owned' });
+      const result = await f.api.takeResult(enrollment.credential, { version: 1, installationId: 'install-a', operationId, issuer, sessionKey: 'k'.repeat(43), sessionId: 'owned' });
       assert.equal(result.callbackUrl, callback.href);
     }
   } finally { await f.close(); }
@@ -112,10 +128,10 @@ if (process.env.D1_POSTGRES === '1') test('provider explicitly enlists a separat
   const marker = (connection: PostgresConnection, id: string) => connection.query('INSERT INTO poppy_provider.records(ns,kind,id,body) VALUES($1,$2,$3,$4)', [f.namespace, 'host-receipt', id, '{}']);
   try {
     const a = await f.enroll(), state = randomBytes(32).toString('base64url');
-    const input = { version: 1, installationId: 'install-a', operationId: 'atomic', domain, issuer, purpose: 'direct', sessionId: 'owned', state };
+    const input = { version: 1, installationId: 'install-a', operationId: 'atomic', domain, issuer, purpose: 'direct', sessionKey: 'k'.repeat(43), sessionId: 'owned', state };
     await f.api.begin(a.credential, input);
     const callback = `${callbackUrl}?state=${state}&iss=${encodeURIComponent(issuer)}&code=PRIVATE_ATOMIC_CODE`;
-    const take = { version: 1, installationId: 'install-a', operationId: 'atomic', issuer, sessionId: 'owned' };
+    const take = { version: 1, installationId: 'install-a', operationId: 'atomic', issuer, sessionKey: 'k'.repeat(43), sessionId: 'owned' };
     await ownerPool.query('INSERT INTO poppy_provider.records(ns,kind,id,body) VALUES($1,$2,$3,$4)', [f.namespace, 'host-decision', 'chosen', '{"approved":true}']);
     await assert.rejects(provider.callback(callback), /provider pool is unavailable/);
     await assert.rejects(host(connection => participant.withTransaction(connection, async () => {
@@ -167,21 +183,21 @@ test('constrained signing rejects claims, purposes, companies and unverified bro
     await f.api.begin(a.credential,{...binding,purpose:'browser',operationId:'browser',sessionId:'owned',returnTo:'https://company.example/'});
     const browser=await f.api.assert(a.credential,{version:1,installationId:'install-a',operationId:'browser',purpose:'browser'});assert.equal(decodeProtectedHeader(browser.assertion).typ,'poppy-browser+jwt');
     f.setSession(false);await assert.rejects(f.api.assert(a.credential,{version:1,installationId:'install-a',operationId:'browser',purpose:'browser'}),{code:'unauthorized'});
-    await assert.rejects(f.api.takeResult(a.credential,{version:1,installationId:'install-a',operationId:'sign',issuer,sessionId:null}),{code:'binding_conflict'});
+    await assert.rejects(f.api.takeResult(a.credential,{version:1,installationId:'install-a',operationId:'sign',issuer,sessionKey:'k'.repeat(43),sessionId:null}),{code:'binding_conflict'});
   }finally{await f.close();}
 });
 test('callback results encrypted, correlated, atomic, one time; restart, replay, cancel and expiry',async()=>{
   const f=await fixture();try{
     const a=await f.enroll(),b=await f.enroll('install-b'),state=randomBytes(32).toString('base64url');
-    const input={version:1,installationId:'install-a',operationId:'direct',issuer,domain,purpose:'direct',sessionId:'session-a',state};
+    const input={version:1,installationId:'install-a',operationId:'direct',issuer,domain,purpose:'direct',sessionKey:'k'.repeat(43),sessionId:'session-a',state};
     await f.api.begin(a.credential,input);
     await assert.rejects(f.api.begin(b.credential,{...input,installationId:'install-b'}),{code:'binding_conflict'});
     const callback=`${callbackUrl}?state=${state}&iss=${encodeURIComponent(issuer)}&code=PRIVATE_CODE`;
     await assert.rejects(f.api.callback(callback.replace(encodeURIComponent(issuer),'https%3A%2F%2Fevil.example')),{code:'binding_conflict'});
     await f.api.callback(callback);await f.api.callback(callback);
     await assert.rejects(f.api.callback(callback.replace('PRIVATE_CODE','OTHER')),{code:'binding_conflict'});
-    const take={version:1,installationId:'install-a',operationId:'direct',issuer,sessionId:'session-a'};
-    await assert.rejects(f.api.takeResult(a.credential,{...take,sessionId:'other'}),{code:'binding_conflict'});
+    const take={version:1,installationId:'install-a',operationId:'direct',issuer,sessionKey:'k'.repeat(43),sessionId:'session-a'};
+    await assert.rejects(f.api.takeResult(a.credential,{...take,sessionKey:'x'.repeat(43)}),{code:'binding_conflict'});
     await assert.rejects(f.api.takeResult(b.credential,{...take,installationId:'install-b'}),{code:'binding_conflict'});
     await assert.rejects(f.api.takeResult(a.credential,{...take,installationId:'install-b'}),{code:'unauthorized'});
     assert.equal((await f.persisted()).includes(Buffer.from('PRIVATE_CODE')),false);
@@ -194,7 +210,7 @@ test('callback results encrypted, correlated, atomic, one time; restart, replay,
 
 test('operation retries retain original binding and expiry without extending authorization',async()=>{
   const f=await fixture();try{
-    const a=await f.enroll(),state=randomBytes(32).toString('base64url'),input={version:1,installationId:'install-a',operationId:'idempotent',issuer,domain,purpose:'direct',sessionId:'owned',state};
+    const a=await f.enroll(),state=randomBytes(32).toString('base64url'),input={version:1,installationId:'install-a',operationId:'idempotent',issuer,domain,purpose:'direct',sessionKey:'k'.repeat(43),sessionId:'owned',state};
     const started=await f.api.begin(a.credential,input);f.setTime(1100000);
     assert.deepEqual(await f.api.begin(a.credential,input),started);
     for(const change of [{sessionId:'another'},{state:randomBytes(32).toString('base64url')}])await assert.rejects(f.api.begin(a.credential,{...input,...change}),{code:'binding_conflict'});
@@ -204,7 +220,7 @@ test('operation retries retain original binding and expiry without extending aut
 
 test('expired callback tombstones retain state through grace and cleanup cannot remove live operations',async()=>{
   const f=await fixture();try{
-    const a=await f.enroll(),state=randomBytes(32).toString('base64url'),input={version:1,installationId:'install-a',operationId:'old',issuer,domain,purpose:'direct',sessionId:'owned',state};
+    const a=await f.enroll(),state=randomBytes(32).toString('base64url'),input={version:1,installationId:'install-a',operationId:'old',issuer,domain,purpose:'direct',sessionKey:'k'.repeat(43),sessionId:'owned',state};
     const old=await f.api.begin(a.credential,input);
     f.setTime(old.expiresAt+29999);
     await assert.rejects(f.api.begin(a.credential,{...input,operationId:'too-soon'}),{code:'binding_conflict'});
@@ -214,7 +230,7 @@ test('expired callback tombstones retain state through grace and cleanup cannot 
     const oldCallback=`${callbackUrl}?state=${state}&iss=${encodeURIComponent(issuer)}&code=PRIVATE`;
     await assert.rejects(f.api.callback(oldCallback),{code:'binding_conflict'});
     const replacementCallback=`${callbackUrl}?state=${replacementState}&iss=${encodeURIComponent(issuer)}&code=NEW`;assert.equal((await f.api.callback(replacementCallback)).status,'ready');
-    const take={version:1,installationId:'install-a',operationId:'replacement',issuer,sessionId:'owned'};
+    const take={version:1,installationId:'install-a',operationId:'replacement',issuer,sessionKey:'k'.repeat(43),sessionId:'owned'};
     assert.equal((await f.api.takeResult(a.credential,take)).callbackUrl,replacementCallback);
     await assert.rejects(f.api.takeResult(a.credential,{...take,operationId:'old'}),{code:'binding_conflict'});
     assert.equal((await f.api.callback(`${callbackUrl}?state=${liveState}&iss=${encodeURIComponent(issuer)}&code=LIVE`)).status,'ready');
@@ -257,7 +273,7 @@ test('tombstone flooding cannot hide quota records or ciphertext from revocation
     const a=await f.enroll(),base={version:1,installationId:'install-a',domain,issuer,purpose:'session'};
     // Install retained tombstones through the same store contract to reach the hard cap quickly.
     await f.store.transaction({kind:'begin',enrollmentId:a.enrollmentId,operationId:'seed',issuer,at:1000000},tx=>{for(let i=0;i<999;i++)tx.put('operation',`${a.enrollmentId}:a${i.toString().padStart(4,'0')}`,{binding:{stateHash:null},expiresAt:1600000,status:'canceled',result:null});});
-    const state=randomBytes(32).toString('base64url');await f.api.begin(a.credential,{...base,operationId:'\uffffx',purpose:'direct',sessionId:'owned',state});
+    const state=randomBytes(32).toString('base64url');await f.api.begin(a.credential,{...base,operationId:'\uffffx',purpose:'direct',sessionKey:'k'.repeat(43),sessionId:'owned',state});
     await f.api.callback(`${callbackUrl}?state=${state}&iss=${encodeURIComponent(issuer)}&code=PRIVATE`);
     await assert.rejects(f.api.begin(a.credential,{...base,operationId:'zz-overflow'}),{code:'rate_limited'});
     await f.api.revokeEnrollment(a.credential,{version:1,installationId:'install-a'});
@@ -266,7 +282,7 @@ test('tombstone flooding cannot hide quota records or ciphertext from revocation
 });
 test('real processes atomically race result consumption and revoke against callback',async()=>{
   const f=await fixture();try{
-    const a=await f.enroll(),state=randomBytes(32).toString('base64url'),base={version:1,installationId:'install-a',operationId:'race',issuer,domain,purpose:'direct',sessionId:'owned',state};await f.api.begin(a.credential,base);
+    const a=await f.enroll(),state=randomBytes(32).toString('base64url'),base={version:1,installationId:'install-a',operationId:'race',issuer,domain,purpose:'direct',sessionKey:'k'.repeat(43),sessionId:'owned',state};await f.api.begin(a.credential,base);
     const callback=`${callbackUrl}?state=${state}&iss=${encodeURIComponent(issuer)}&code=PRIVATE_RACE`;await f.api.callback(callback);
     const worker=(action:ProviderRaceAction)=>new Promise<{status?:string;error?:string}>((resolve,reject)=>{
       const child=spawn(process.execPath,[fileURLToPath(new URL('../test-support/provider-worker.mjs',import.meta.url))],{env:{...process.env,DB_PATH:f.path,TASK:JSON.stringify(action)},windowsHide:true});let out='',err='';child.stdout.on('data',d=>out+=d);child.stderr.on('data',d=>err+=d);child.on('error',reject);child.on('close',code=>{try{
@@ -275,7 +291,7 @@ test('real processes atomically race result consumption and revoke against callb
         else{assert.ok('error' in result&&typeof result.error==='string');resolve({error:result.error});}
       }catch(e){reject(e);}});
     });
-    const take:ProviderRaceAction={action:'take',credential:a.credential,body:{version:1,installationId:'install-a',operationId:'race',issuer,sessionId:'owned'}};
+    const take:ProviderRaceAction={action:'take',credential:a.credential,body:{version:1,installationId:'install-a',operationId:'race',issuer,sessionKey:'k'.repeat(43),sessionId:'owned'}};
     const results=await Promise.all([worker(take),worker(take)]);assert.equal(results.filter(r=>r.status==='completed').length,1);assert.equal(results.filter(r=>r.error==='consumed').length,1);
     const secondState=randomBytes(32).toString('base64url');await f.api.begin(a.credential,{...base,operationId:'race2',state:secondState});
     await Promise.all([worker({action:'callback',callback:`${callbackUrl}?state=${secondState}&iss=${encodeURIComponent(issuer)}&code=PRIVATE`}),worker({action:'revoke',credential:a.credential,body:{version:1,installationId:'install-a'}})]);
@@ -287,7 +303,7 @@ test('Unicode operation IDs retain bindings, count towards quotas and clear ciph
   const f=await fixture();try{
     const a=await f.enroll(),states=[randomBytes(32).toString('base64url'),randomBytes(32).toString('base64url')];
     for(const [i,operationId] of ['\uffffx','😀'].entries()){
-      const input={version:1,installationId:'install-a',operationId,domain,issuer,purpose:'direct',sessionId:'owned',state:states[i]};
+      const input={version:1,installationId:'install-a',operationId,domain,issuer,purpose:'direct',sessionKey:'k'.repeat(43),sessionId:'owned',state:states[i]};
       const started=await f.api.begin(a.credential,input);assert.deepEqual(await f.api.begin(a.credential,input),started);
       await f.api.callback(`${callbackUrl}?state=${states[i]}&iss=${encodeURIComponent(issuer)}&code=PRIVATE_UNICODE`);
     }

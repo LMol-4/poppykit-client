@@ -81,6 +81,7 @@ export function createProvider(options: ProviderOptions) {
   function operation(tx: ProviderTransaction, enrollment: Row, operationId: string, allowConsumed = false): Row {
     const row = tx.get('operation', `${enrollment.enrollmentId}:${operationId}`);
     if (!row) fail('binding_conflict');
+    if (row.binding.purpose === 'direct' && (typeof row.binding.sessionKey !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(row.binding.sessionKey))) fail('binding_conflict');
     if (row.expiresAt <= now()) fail('expired');
     if (row.status === 'canceled') fail('canceled');
     if (row.status === 'consumed' && !allowConsumed) fail('consumed');
@@ -137,7 +138,7 @@ export function createProvider(options: ProviderOptions) {
       });
     },
     async begin(credential: string, input: Row) {
-      exact(input, ['version', 'installationId', 'operationId', 'domain', 'issuer', 'purpose', 'sessionId', 'returnTo', 'state']);
+      exact(input, ['version', 'installationId', 'operationId', 'domain', 'issuer', 'purpose', 'sessionId', 'sessionKey', 'returnTo', 'state']);
       if (!['client-authentication', 'session', 'browser', 'direct'].includes(input.purpose)) fail('binding_conflict');
       text(input.operationId);
       if (input.sessionId !== undefined) text(input.sessionId);
@@ -145,7 +146,8 @@ export function createProvider(options: ProviderOptions) {
       if (input.purpose === 'client-authentication' && (input.sessionId !== undefined || input.returnTo !== undefined)) fail('binding_conflict');
       if (input.purpose !== 'browser' && input.returnTo !== undefined) fail('binding_conflict');
       if (input.purpose !== 'direct' && input.state !== undefined) fail('binding_conflict');
-      if (input.purpose === 'direct' && (typeof input.state !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(input.state) || !input.sessionId)) fail('binding_conflict');
+      if (input.purpose === 'direct' && (typeof input.state !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(input.state) || typeof input.sessionKey !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(input.sessionKey))) fail('binding_conflict');
+      if (input.purpose !== 'direct' && input.sessionKey !== undefined) fail('binding_conflict');
       if (input.purpose === 'browser' && !input.sessionId) fail('binding_conflict');
       if (input.purpose === 'browser') text(input.returnTo);
       const metadata = await verified(text(input.domain), text(input.issuer));
@@ -156,7 +158,7 @@ export function createProvider(options: ProviderOptions) {
         return { enrollment, userId: user(tx, enrollment.visitor, input.issuer) };
       });
       if (input.purpose === 'browser' && !await options.verifySession?.({ clientId: options.clientId, userId: identity.userId, issuer: input.issuer, sessionId: input.sessionId })) fail('unauthorized');
-      const binding = { issuer: input.issuer, domain: metadata.document.organization.domain, purpose: input.purpose, sessionId: input.sessionId ?? null, returnTo: input.returnTo ?? null, stateHash: input.state ? hash(input.state) : null, userId: identity.userId, browserEndpoint: metadata.document.web?.browser_session_endpoint ?? null };
+      const binding = { issuer: input.issuer, domain: metadata.document.organization.domain, purpose: input.purpose, sessionKey: input.sessionKey ?? null, sessionId: input.sessionId ?? null, returnTo: input.returnTo ?? null, stateHash: input.state ? hash(input.state) : null, userId: identity.userId, browserEndpoint: metadata.document.web?.browser_session_endpoint ?? null };
       return store.transaction({ kind: 'begin', enrollmentId: enrollmentId(credential), operationId: input.operationId, issuer: input.issuer, ...(binding.stateHash ? { stateHash: binding.stateHash } : {}), at: now() }, tx => {
         const enrollment = auth(tx, credential, text(input.installationId)), key = `${enrollment.enrollmentId}:${text(input.operationId)}`, existing = tx.get('operation', key);
         if (existing) { if (!same(existing.binding, binding)) fail('binding_conflict'); operation(tx, enrollment, input.operationId); return { expiresAt: existing.expiresAt }; }
@@ -210,10 +212,10 @@ export function createProvider(options: ProviderOptions) {
       });
     },
     async takeResult(credential: string, input: Row) {
-      exact(input, ['version', 'installationId', 'operationId', 'issuer', 'sessionId']);
+      exact(input, ['version', 'installationId', 'operationId', 'issuer', 'sessionId', 'sessionKey']);
       return store.transaction(selectedOperation(credential, input), tx => {
         const enrollment = auth(tx, credential, text(input.installationId)), op = operation(tx, enrollment, text(input.operationId));
-        if (op.binding.issuer !== input.issuer || op.binding.sessionId !== input.sessionId || op.binding.purpose !== 'direct') fail('binding_conflict');
+        if (op.binding.issuer !== input.issuer || op.binding.sessionKey !== input.sessionKey || op.binding.purpose !== 'direct') fail('binding_conflict');
         if (op.status !== 'ready') return { status: 'pending' };
         const callbackUrl = cipher.open(op.result);
         tx.put('operation', `${enrollment.enrollmentId}:${input.operationId}`, { ...op, status: 'consumed', result: null });
@@ -281,8 +283,8 @@ export function createProviderClient(options: { url: string; installationId: str
     const value = await call('assert', { operationId: request.operationId, purpose: request.purpose });
     return { assertion: text(value.assertion), expiresAt: value.expiresAt };
   };
-  return { identity, assert, beginDirect: (input: { operationId: string; issuer: string; sessionId: string; state: string }) => call('begin', { ...input, domain: options.domain, purpose: 'direct' }),
-    takeResult: (input: { operationId: string; issuer: string; sessionId: string }) => call('takeResult', input),
+  return { identity, assert, beginDirect: (input: { operationId: string; issuer: string; sessionKey: string; state: string }) => call('begin', { ...input, domain: options.domain, purpose: 'direct' }),
+    takeResult: (input: { operationId: string; issuer: string; sessionKey: string }) => call('takeResult', input),
     cancel: (operationId: string) => call('cancel', { operationId }), revokeEnrollment: () => call('revokeEnrollment', {}) };
 }
 

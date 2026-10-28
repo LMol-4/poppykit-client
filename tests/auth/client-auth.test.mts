@@ -21,6 +21,27 @@ const CLIENT_ID = 'https://agent.test/agent.json';
 const REDIRECT = 'https://agent.test/oauth/callback';
 const remoteSession = (company: FakeCompany) => expectValue(company.sessionKeys.get(expectValue(company.proofs.at(-1)).thumbprint));
 
+test('Direct URL binds the current Session Key; loopback callback keeps the actual port and pending old work restarts', async () => {
+  const redirectUri = 'http://[::1]:49152/cb?route=fixed';
+  const env = await setup(), auth = createClientAuth({ ...env.options, redirectUris: ['http://[::1]:8000/cb?route=fixed'] });
+  const connection = (await auth.start(env.company.domain)).connection;
+  const started = await auth.beginSignIn(connection.id, { scopes: ['orders:read'], redirectUri, browserBinding: BROWSER });
+  const url = new URL(started.authorizationUrl!);
+  assert.equal(url.searchParams.get('redirect_uri'), redirectUri);
+  assert.equal(url.searchParams.get('dpop_jkt'), env.company.proofs.at(-1)!.thumbprint);
+  const callback = new URL(redirectUri); callback.searchParams.set('state', url.searchParams.get('state')!); callback.searchParams.set('iss', env.company.issuer); callback.searchParams.set('error', 'access_denied');
+  await assert.rejects(auth.completeSignIn({ callbackUrl: callback.href.replace(':49152', ':8000'), browserBinding: BROWSER }), { code: 'invalid_callback' });
+  assert.equal((await auth.completeSignIn({ callbackUrl: callback.href, browserBinding: BROWSER })).status, 'denied');
+  const old = await auth.beginSignIn(connection.id, { scopes: ['orders:read'], redirectUri, browserBinding: BROWSER });
+  await env.store.transaction(state => { delete state.operations[old.outcome.operationId].signInSessionKey; });
+  const before = exchanges(env.company), recovered = await createClientAuth({ ...env.options, redirectUris: [redirectUri] }).recover();
+  assert.equal(recovered[0].error, 'restart_required'); assert.equal(exchanges(env.company), before);
+  const dispatched = await auth.beginSignIn(connection.id, { scopes: ['orders:read'], redirectUri, browserBinding: BROWSER });
+  await env.store.transaction(state => { const op = state.operations[dispatched.outcome.operationId]; delete op.signInSessionKey; op.phase = 'dispatched'; });
+  const lost = await auth.recover(); assert.equal(lost[0].status, 'uncertain'); assert.equal(lost[0].error, 'lost_response');
+  assert.equal(exchanges(env.company), before, 'old dispatched codes are never resent');
+});
+
 for (const engine of ['SQLite', ...(process.env.D1_POSTGRES === '1' ? ['Postgres'] : [])]) test(`auth upgrade keeps User/grant ownership, replaces shared keys, and retires unbound pending sign-in (${engine})`, async t => {
   const env = await signedIn(), legacy = structuredClone(env.store.raw);
   const pending = await env.auth.beginSignIn(env.id, { scopes: ['orders:read'], redirectUri: REDIRECT, browserBinding: BROWSER, force: true });

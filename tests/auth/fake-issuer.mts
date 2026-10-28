@@ -23,7 +23,7 @@ function proofClaims(value: unknown): asserts value is ProofClaims {
 interface Session { sub: string; account: string | null | undefined; expires: number; family?: string | null }
 interface Grant { family: string; sub: string; account: string | undefined; scopes: string[]; revoked: boolean; rotated: boolean }
 interface Bound { jkt: string; sessionId: string; sub: string; resource: string | null; expires: number; account?: string; scopes?: string[]; family?: string }
-interface Code { redirectUri: string; challenge: string; scopes: string[]; account: string | undefined; resource: string | null; used: boolean }
+interface Code { sessionKey: string; redirectUri: string; challenge: string; scopes: string[]; account: string | undefined; resource: string | null; used: boolean }
 interface FakeOptions { name?: string; jwks: { keys: JWK[] }; clientId: string; now(): number; issuerPath?: string; redirectUris?: string[]; directScopes?: string[]; conversationResource?: string; method?: string }
 export interface FakeCompany {
  domain: string; issuer: string; tokenEndpoint: string; endpoint: string; authorizationEndpoint: string;
@@ -34,7 +34,7 @@ export interface FakeCompany {
  assertions: {kind:string;header:ProtectedHeaderParameters;payload:AssertionClaims}[];
  proofs: {header:ProtectedHeaderParameters & {jwk:JWK};payload:ProofClaims;thumbprint:string}[];
  seenAssertionJti: Set<string>; seenProofJti: Set<string>; nonce: string | null;
- devices: Map<string|null,{scopes:string[];used:boolean}>; challenges: Map<string,{sessionId:string;scopes:string[]}>;
+ devices: Map<string|null,{scopes:string[];used:boolean;sessionKey?:string}>; challenges: Map<string,{sessionId:string;scopes:string[]}>;
  signInBehavior: {status:string;scopes:string[];account:string;code:string;codeRequired:boolean;attempts:number};
  verifyAssertion(jwt:string|null,kind:string):Promise<AssertionClaims>;
  authorize(url:string,input:{account?:string;approve?:string[]|null;deny?:boolean}):string;
@@ -123,7 +123,7 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
   // The User's browser at the authorization endpoint (spec 4.5 steps 2-3): approve some scopes for an account, or decline.
   company.authorize = (authorizationUrl, { account, approve = null, deny = false }) => {
     const url = new URL(authorizationUrl); const q = (name:string) => url.searchParams.get(name);
-    if (url.origin + url.pathname !== authorizationEndpoint || q('response_type') !== 'code' || q('client_id') !== clientId || q('code_challenge_method') !== 'S256' || !q('code_challenge') || !q('state')) throw new Error('bad authorization request');
+    if (url.origin + url.pathname !== authorizationEndpoint || q('response_type') !== 'code' || q('client_id') !== clientId || q('code_challenge_method') !== 'S256' || !q('code_challenge') || !q('state') || !/^[A-Za-z0-9_-]{43}$/.test(q('dpop_jkt') ?? '')) throw new Error('bad authorization request');
     if (!redirectUris.includes(expectValue(q('redirect_uri')))) throw new Error('unregistered redirect_uri');
     const requested = expectValue(q('scope')).split(' ');
     if (!requested.every(scope => directScopes.includes(scope))) throw new Error('invalid_scope');
@@ -132,7 +132,7 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     else {
       const code = `code_${randomUUID()}`;
       const scopes = (approve ?? requested).filter(scope => requested.includes(scope));
-      company.codes.set(code, { redirectUri: expectValue(q('redirect_uri')), challenge: expectValue(q('code_challenge')), scopes, account, resource: q('resource'), used: false });
+      company.codes.set(code, { sessionKey: expectValue(q('dpop_jkt')), redirectUri: expectValue(q('redirect_uri')), challenge: expectValue(q('code_challenge')), scopes, account, resource: q('resource'), used: false });
       callback.searchParams.set('code', code);
     }
     callback.searchParams.set('state',expectValue(q('state'))); callback.searchParams.set('iss', issuer);
@@ -143,7 +143,7 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     await company.verifyAssertion(form.get('client_assertion'), 'client');
     const jkt = await verifyProof(request);
     const grant = company.codes.get(form.get('code'));
-    if (!grant || grant.used) throw new Reject(400, 'invalid_grant');
+    if (!grant || grant.used || grant.sessionKey !== jkt) throw new Reject(400, 'invalid_grant');
     grant.used = true;
     if (form.get('redirect_uri') !== grant.redirectUri || sha256(form.get('code_verifier') ?? '') !== grant.challenge || form.get('resource') !== grant.resource) throw new Reject(400, 'invalid_grant');
     return issueSignedIn(company.sessionKeys.get(jkt) ?? null, jkt, grant.account, grant.scopes, grant.resource);
@@ -214,6 +214,8 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
       await company.verifyAssertion(form.get('client_assertion'), 'client'); const jkt = await verifyProof(request);
       const device = company.devices.get(form.get('device_code'));
       if (!device || device.used) throw new Reject(400, 'invalid_grant');
+      if (device.sessionKey !== undefined && device.sessionKey !== jkt) throw new Reject(400, 'invalid_grant');
+      device.sessionKey ??= jkt;
       const behavior = company.signInBehavior;
       if (behavior.status !== 'approved') throw new Reject(400, behavior.status);
       device.used = true;

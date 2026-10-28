@@ -112,7 +112,10 @@ authorization URL. Only its hash is indexed. The callback accepts state, exact
 issuer, and exactly one code/error; result ciphertext is sealed atomically with
 the immutable binding. Identical pending callbacks are harmless; conflicting,
 canceled, expired and consumed callbacks fail. `takeResult` requires enrollment,
-installation, operation, issuer and exact session; it consumes within the same
+installation, operation, issuer and exact `sessionKey` thumbprint from the SDK's
+authorization URL `dpop_jkt`; the local `Connection.sessionId` cannot identify a
+company Session. Old Direct operations without the key binding must restart.
+Retrieval consumes within the same
 storage transaction before returning private callback data. Lost retrieval delivery
 is uncertain, never a reason to exchange or retrieve again. SDK code owns PKCE and
 the exchange. Never log request URLs or responses on this route.
