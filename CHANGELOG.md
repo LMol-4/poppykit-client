@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0 (unreleased)
+
+Target pinned Personal Agent Protocol draft 0.3. Break discovery, Session Key/token, author, browser-controller and feedback contracts; retain explicit storage subpaths. Upgrade normalized auth state 1→2; stop old writers and reset incompatible conversation/outbox state before cutover.
+
+Local migration candidate only. Publication and deployment require separate approval.
+
 ## 0.4.1
 
 Support Node 24.21.0 and later within Node 24 under the owner-accepted runtime policy.
