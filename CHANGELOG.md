@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 (unreleased)
+## 0.5.0 — 2026-10-28
 
 Target pinned Personal Agent Protocol draft 0.3. Break discovery, Session Key/token, author, browser-controller and feedback contracts; retain explicit storage subpaths. Upgrade normalized auth state 1→2; stop old writers and reset incompatible conversation/outbox state before cutover.
 
