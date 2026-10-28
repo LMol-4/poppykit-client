@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { initializeSqlite } from '../sqlite-init.js';
-import { initialClientAuthState } from './client-auth.js';
+import { initialClientAuthState, upgradeClientAuthState } from './client-auth.js';
 import type { ClientAuthState } from './client-auth.js';
 import type { AuthSelection, AuthStore } from './store.js';
 
@@ -42,6 +42,14 @@ export class SqliteAuthStore implements AuthStore {
   }
   private select(selection: AuthSelection): ClientAuthState {
     const state: ClientAuthState = { ...JSON.parse(this.db.prepare('SELECT body FROM auth_meta WHERE id=1').get()!.body as string), identities: {}, connections: {}, grants: {}, operations: {}, cleanup: {} };
+    if (state.version === 1) {
+      for (const table of tables) for (const row of this.db.prepare(`SELECT id,body FROM auth_${table}`).all()) (state[table] as Record<string, unknown>)[row.id as string] = JSON.parse(row.body as string);
+      upgradeClientAuthState(state);
+      for (const table of tables) for (const [id, value] of Object.entries(state[table])) this.db.prepare(`UPDATE auth_${table} SET body=? WHERE id=?`).run(json(value), id);
+      this.db.prepare('UPDATE auth_meta SET body=? WHERE id=1').run(json({ version: state.version, epoch: state.epoch, owner: state.owner }));
+      for (const table of tables) state[table] = {};
+    }
+    if (state.version !== 2) throw new Error('unsupported auth state version');
     const get = (table: typeof tables[number], id: string) => {
       const row = this.db.prepare(`SELECT body FROM auth_${table} WHERE id=?`).get(id);
       if (row) (state[table] as Record<string, unknown>)[id] = JSON.parse(row.body as string);
@@ -69,7 +77,7 @@ export class SqliteAuthStore implements AuthStore {
     history(); return state;
   }
   async read(selection: AuthSelection): Promise<ClientAuthState> {
-    this.db.exec('BEGIN');
+    this.db.exec('BEGIN IMMEDIATE');
     try { const state = this.select(selection); this.db.exec('COMMIT'); return state; }
     catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }

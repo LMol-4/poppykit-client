@@ -1,5 +1,5 @@
 import type { Pool } from 'pg';
-import { initialClientAuthState } from './auth/client-auth.js';
+import { initialClientAuthState, upgradeClientAuthState } from './auth/client-auth.js';
 import type { ClientAuthState } from './auth/client-auth.js';
 import type { AuthSelection, AuthStore } from './auth/store.js';
 import type { ConversationKey, ConversationStore } from './conversation-store.js';
@@ -26,6 +26,14 @@ export class PostgresAuthStore implements AuthStore {
     const rows = async (table: typeof tables[number], where: string, values: unknown[] = []) => {
       for (const row of await this.db.query(`SELECT id,body FROM poppy_client.records WHERE ns=$1 AND kind=$2 ${where}`, [this.namespace, table, ...values])) (state[table] as Record<string, unknown>)[row.id] = JSON.parse(row.body);
     };
+    if (state.version === 1) {
+      for (const table of tables) await rows(table, '');
+      upgradeClientAuthState(state);
+      for (const table of tables) for (const [id, value] of Object.entries(state[table])) await this.put(table, id, value);
+      await this.put('auth_meta', 'meta', { version: state.version, epoch: state.epoch, owner: state.owner });
+      for (const table of tables) state[table] = {};
+    }
+    if (state.version !== 2) throw new Error('unsupported auth state version');
     if ('issuer' in selection) await one('identities', selection.issuer);
     else {
       if ('connectionId' in selection) await one('connections', selection.connectionId);

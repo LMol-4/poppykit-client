@@ -15,9 +15,76 @@ import { testPool } from '../../test-support/postgres.mjs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 const CLIENT_ID = 'https://agent.test/agent.json';
 const REDIRECT = 'https://agent.test/oauth/callback';
+const remoteSession = (company: FakeCompany) => expectValue(company.sessionKeys.get(expectValue(company.proofs.at(-1)).thumbprint));
+
+for (const engine of ['SQLite', ...(process.env.D1_POSTGRES === '1' ? ['Postgres'] : [])]) test(`auth upgrade keeps User/grant ownership, replaces shared keys, and retires unbound pending sign-in (${engine})`, async t => {
+  const env = await signedIn(), legacy = structuredClone(env.store.raw);
+  const pending = await env.auth.beginSignIn(env.id, { scopes: ['orders:read'], redirectUri: REDIRECT, browserBinding: BROWSER, force: true });
+  legacy.operations[pending.outcome.operationId] = structuredClone(env.store.raw.operations[pending.outcome.operationId]);
+  legacy.version = 1;
+  const connection = legacy.connections[env.id], key = connection.dpopKeyRef, oldGrant = legacy.grants[connection.grantId!];
+  legacy.identities[env.company.issuer].dpopKeyRef = key;
+  const dir = await mkdtemp(join(tmpdir(), 'auth-upgrade-')), path = join(dir, 'state.sqlite');
+  const pool = engine === 'Postgres' ? testPool() : undefined;
+  const open = () => pool ? new PostgresAuthStore(pool, path) : new SqliteAuthStore(path);
+  const stores: ReturnType<typeof open>[] = [];
+  t.after(async () => { for (const store of stores) await store.close(); await pool?.end(); await rm(dir, { recursive: true, force: true }); });
+  const bootstrap = open(); await bootstrap.close();
+  if (pool) {
+    await pool.query('INSERT INTO poppy_client.records VALUES ($1,$2,$3,$4)', [path, 'auth_meta', 'meta', JSON.stringify({ version: 1, epoch: legacy.epoch, owner: legacy.owner })]);
+    for (const table of ['identities', 'connections', 'grants', 'operations', 'cleanup'] as const) for (const [id, row] of Object.entries(legacy[table])) await pool.query('INSERT INTO poppy_client.records VALUES ($1,$2,$3,$4)', [path, table, id, JSON.stringify(row)]);
+  } else {
+  const raw = new DatabaseSync(path);
+  raw.prepare('UPDATE auth_meta SET body=? WHERE id=1').run(JSON.stringify({ version: 1, epoch: legacy.epoch, owner: legacy.owner }));
+  for (const table of ['identities', 'connections', 'grants', 'operations', 'cleanup'] as const) for (const [id, row] of Object.entries(legacy[table])) raw.prepare(`INSERT INTO auth_${table} VALUES (?,?)`).run(id, JSON.stringify(row));
+  raw.close();
+  }
+  const store = open(); stores.push(store);
+  const upgraded = createClientAuth({ ...env.options, store });
+  assert.equal((await upgraded.operation(pending.outcome.operationId))?.status, 'cancelled');
+  const beforeProofs = env.company.proofs.length;
+  const renewed = await upgraded.renew(env.id); assert.equal(renewed.status, 'completed');
+  const state = await store.read({ connectionId: env.id });
+  assert.equal(state.version, 2); assert.deepEqual(state.owner, legacy.owner); assert.equal(state.epoch, legacy.epoch);
+  assert.equal(state.connections[env.id].userId, connection.userId); assert.notEqual(state.connections[env.id].dpopKeyRef, key);
+  assert.notEqual(state.connections[env.id].sessionId, connection.sessionId);
+  assert.deepEqual(state.grants[oldGrant.id].scopes, oldGrant.scopes); assert.equal(state.grants[oldGrant.id].userId, oldGrant.userId);
+  assert.notEqual(state.grants[oldGrant.id].secretRef, oldGrant.secretRef);
+  assert.equal(env.company.proofs.length - beforeProofs, 1, 'the old Session Key was never sent');
+  const restarted = open(); stores.push(restarted);
+  assert.equal((await createClientAuth({ ...env.options, store: restarted }).renew(env.id)).status, 'completed');
+});
+
+test('old dispatched refresh recovery preserves uncertainty without resending the Account Token', async () => {
+  const env = await signedIn(), grant = grantOf(env.store, env.id), snapshot = env.store.raw.connections[env.id];
+  await env.store.transaction(state => {
+    state.version = 1;
+    state.grants[grant.id].operationId = 'old-renew';
+    state.operations['old-renew'] = { epoch: state.epoch, id: 'old-renew', kind: 'renew', connectionId: env.id, connectionGeneration: snapshot.generation, grantId: grant.id, grantGeneration: grant.generation, phase: 'dispatched', status: 'pending', createdAt: env.clock.t, expiresAt: env.clock.t, resource: null, scopes: grant.scopes, direct: null, staged: null, result: null };
+  });
+  const before = exchanges(env.company), restarted = createClientAuth(env.options);
+  assert.equal((await restarted.recover())[0].status, 'uncertain');
+  assert.equal((await restarted.get(env.id))?.status, 'uncertain');
+  await assert.rejects(restarted.renew(env.id), { code: 'grant_uncertain' });
+  assert.equal(exchanges(env.company), before);
+});
+
+test('omitted signed-in scope inherits only the grant request context', async () => {
+  const env = await setup(), started = await env.auth.start(env.company.domain);
+  env.company.behavior.tokenOverride = { scope: undefined };
+  const signed = await signIn(env.auth, env.company, started.connection.id, { scopes: ['orders:read', 'orders:write'] });
+  assert.deepEqual(signed.grantedScopes, ['orders:read', 'orders:write']);
+  const narrow = await env.auth.renew(started.connection.id, { scopes: ['orders:read'] });
+  assert.equal(narrow.status, 'completed');
+  assert.deepEqual(Object.values(env.store.raw.connections[started.connection.id].slots).at(-1)?.scopes, ['orders:read']);
+  env.company.behavior.tokenOverride = { scope: 'orders:read orders:write' };
+  const escalated = await env.auth.renew(started.connection.id, { scopes: ['orders:read'] });
+  assert.deepEqual([escalated.status, escalated.error], ['failed', 'invalid_response']);
+});
 for (const engine of ['SQLite', ...(process.env.D1_POSTGRES === '1' ? ['Postgres'] : [])]) test(`global auth history pruning uses bounded durable selectors (${engine})`, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'auth-history-')), path = join(dir, 'auth.sqlite');
   const pool = engine === 'Postgres' ? testPool() : undefined;
@@ -141,7 +208,7 @@ test('start creates a signed-out session with verified assertions and a separate
   assert.equal(outcome.status, 'completed');
   assert.deepEqual(Object.keys(outcome.connection).sort(), ['domain', 'generation', 'id', 'issuer', 'organization', 'scopes', 'sessionId', 'status']);
   assert.equal(outcome.connection.status, 'signed_out'); assert.equal(outcome.connection.issuer, company.issuer);
-  assert.deepEqual(outcome.connection.scopes, []); assert.ok(company.sessions.has(outcome.connection.sessionId));
+  assert.deepEqual(outcome.connection.scopes, []); assert.ok(company.sessions.has(remoteSession(company)));
   const [client, session] = company.assertions;
   assert.equal(client.kind, 'client'); assert.equal(client.header.typ, 'client-authentication+jwt'); assert.equal(client.header.kid, signer.kid);
   for (const { payload } of [client, session]) {
@@ -166,7 +233,7 @@ test('start creates a signed-out session with verified assertions and a separate
   assert.deepEqual(await auth.target(outcome.connection.id), { issuer: company.issuer, endpoint: company.endpoint });
 });
 
-test('User IDs and DPoP keys are stable per issuer and separate per issuer and local user', async () => {
+test('User IDs are stable per issuer; every Session has a separate key', async () => {
   const signer = await makeSigner();
   const { auth, companies: [shop, books] } = await setup({ signer, names: ['shop', 'books'] });
   const a = await auth.start(shop.domain); const b = await auth.start(shop.domain); const c = await auth.start(books.domain);
@@ -174,7 +241,7 @@ test('User IDs and DPoP keys are stable per issuer and separate per issuer and l
   const sessionSubs = (company:FakeCompany) => company.assertions.filter(item => item.kind === 'session').map(item => item.payload.sub);
   const [shopSub1, shopSub2] = sessionSubs(shop); const [booksSub] = sessionSubs(books);
   assert.equal(shopSub1, shopSub2); assert.notEqual(shopSub1, booksSub);
-  assert.equal(shop.proofs[0].thumbprint, shop.proofs[1].thumbprint); assert.notEqual(shop.proofs[0].thumbprint, books.proofs[0].thumbprint);
+  assert.notEqual(shop.proofs[0].thumbprint, shop.proofs[1].thumbprint); assert.notEqual(shop.proofs[0].thumbprint, books.proofs[0].thumbprint);
   const other = await setup({ localUserId: 'bob', signer });
   await other.auth.start(other.company.domain);
   assert.notEqual(other.company.assertions[1].payload.sub, shopSub1); assert.notEqual(other.company.proofs[0].thumbprint, shop.proofs[0].thumbprint);
@@ -216,14 +283,14 @@ test('signer misconfiguration fails before any token request', async () => {
 test('an identity signer that reuses the DPoP key is refused', async () => {
   const store = memoryStore(); const secrets = memorySecrets();
   const first = await setup({ store, secrets });
-  await first.auth.start(first.company.domain);
+  const initial = await first.auth.start(first.company.domain);
   // Build an identity signer over the stored DPoP private key and reuse the same state.
-  const dpop = JSON.parse(expectValue(secrets.map.get(store.raw.identities[first.company.issuer].dpopKeyRef)));
+  const dpop = JSON.parse(expectValue(secrets.map.get(store.raw.connections[initial.connection.id].dpopKeyRef)));
   const privateKey = await crypto.subtle.importKey('jwk', dpop, EC, false, ['sign']);
   const { kty, crv, x, y } = dpop;
   const signer = { kid: 'reused', jwk: { kty, crv, x, y, kid: 'reused' }, publicJwk: async () => ({ kty, crv, x, y }), sign: async (input:Uint8Array) => new Uint8Array(await crypto.subtle.sign(ES256, privateKey, new Uint8Array(input))) };
   const second = await setup({ store, secrets, signer });
-  await assert.rejects(second.auth.start(second.company.domain), code('key_separation'));
+  await assert.rejects(second.auth.renew(initial.connection.id), code('key_separation'));
   assert.equal(second.company.requests.filter(item => item.url === second.company.tokenEndpoint).length, 0);
 });
 
@@ -244,7 +311,7 @@ test('token endpoint nonce challenge is retried once with fresh assertions and p
 test('token responses other than a signed-out DPoP session are rejected without persisting', async () => {
   for (const [override, expected] of [
     [{ token_type: 'Bearer' }, 'unsupported_token_type'],
-    [{ signed_in: true }, 'invalid_response'],
+    [{ refresh_token: 'unexpected' }, 'invalid_response'],
     [{ scope: 'orders:read' }, 'invalid_response'],
     [{ expires_in: 0 }, 'invalid_response'],
     [{ access_token: 7 }, 'invalid_response'],
@@ -292,7 +359,7 @@ test('authorizedFetch sends DPoP with a fresh proof bound to method, URL and tok
   const response = await auth.authorizedFetch(connection.id, conversations(company, '/cnv_1/messages?x=1'), target);
   assert.equal(response.status, 200);
   const body = await response.json();
-  assert.equal(body.body, JSON.stringify({ hello: 'world' })); assert.equal(body.session_id, connection.sessionId);
+  assert.equal(body.body, JSON.stringify({ hello: 'world' })); assert.equal(body.session_id, remoteSession(company));
   const proof = company.proofs.at(-1);
   assert.equal(expectValue(proof).payload.htu, `${company.endpoint}/cnv_1/messages`); assert.equal(expectValue(proof).payload.htm, 'POST'); assert.ok(expectValue(proof).payload.ath);
   assert.equal(expectValue(proof).thumbprint, company.proofs[0].thumbprint);
@@ -357,7 +424,7 @@ test('invalid_token renews the signed-out session once and retries', { timeout: 
   const target = await auth.target(connection.id);
   company.tokens.clear();
   const response = await auth.authorizedFetch(connection.id, conversations(company), target);
-  assert.equal(response.status, 200); assert.equal((await response.json()).session_id, connection.sessionId);
+  assert.equal(response.status, 200); assert.equal((await response.json()).session_id, remoteSession(company));
   const renewal = company.assertions.at(-1);
   assert.equal(expectValue(renewal).kind, 'session');
   assert.equal(company.tokens.size, 1);
@@ -385,17 +452,17 @@ test('expired credentials renew before dispatch; an idle-expired signed-out Sess
   const response = await auth.authorizedFetch(connection.id, conversations(company), target);
   assert.equal(response.status, 200);
   const body = await response.json();
-  assert.deepEqual(forms.map(form => [form.get('grant_type'), form.get('session_id')]), [['urn:ietf:params:oauth:grant-type:jwt-bearer', connection.sessionId], ['urn:ietf:params:oauth:grant-type:jwt-bearer', null]]);
+  assert.deepEqual(forms.map(form => [form.get('grant_type'), form.get('session_id')]), [['urn:ietf:params:oauth:grant-type:jwt-bearer', null], ['urn:ietf:params:oauth:grant-type:jwt-bearer', null]]);
   const current = store.raw.connections[connection.id];
-  assert.notEqual(current.sessionId, connection.sessionId); assert.equal(body.session_id, current.sessionId); assert.equal(body.account, null);
-  assert.deepEqual([current.status, current.generation, current.grantId], ['signed_out', connection.generation, null]);
+  assert.notEqual(current.sessionId, connection.sessionId); assert.equal(body.session_id, remoteSession(company)); assert.equal(body.account, null);
+  assert.deepEqual([current.status, current.generation, current.grantId], ['signed_out', connection.generation + 1, null]);
   // The ended Session's credentials are gone, for every resource.
   assert.deepEqual(Object.keys(current.slots), [JSON.stringify([current.sessionId, null])]);
   for (const ref of oldRefs) assert.equal(secrets.map.has(ref), false);
   assert.equal(expectValue((await auth.get(connection.id))).sessionId, current.sessionId);
 });
 
-test('a refused replacement Session surfaces its error and keeps the slots', async () => {
+test('a refused replacement retires the rejected key and its old credentials', async () => {
   const { auth, company, clock, store } = await setup();
   const { connection } = await auth.start(company.domain);
   const target = await auth.target(connection.id);
@@ -404,11 +471,12 @@ test('a refused replacement Session surfaces its error and keeps the slots', asy
   company.handle = async (request, init) => request.url === company.tokenEndpoint && ++calls === 2 ? new Response('{"error":"invalid_client"}', { status: 401 }) : original(request, init);
   const before = structuredClone(store.raw.connections[connection.id]);
   await assert.rejects(auth.authorizedFetch(connection.id, conversations(company), target), code('invalid_client'));
-  assert.deepEqual(store.raw.connections[connection.id], before);
+  assert.notEqual(store.raw.connections[connection.id].dpopKeyRef, before.dpopKeyRef);
+  assert.deepEqual(store.raw.connections[connection.id].slots, {});
   // Any other refusal of the renewal is not a reason to start a new Session.
   calls = 0;
-  company.handle = async (request, init) => request.url === company.tokenEndpoint && ++calls ? new Response('{"error":"invalid_grant"}', { status: 400 }) : original(request, init);
-  await assert.rejects(auth.renew(connection.id), code('invalid_grant'));
+  company.handle = async (request, init) => request.url === company.tokenEndpoint && ++calls ? new Response('{"error":"invalid_scope"}', { status: 400 }) : original(request, init);
+  await assert.rejects(auth.renew(connection.id), code('invalid_scope'));
   assert.equal(calls, 1);
 });
 
@@ -450,22 +518,23 @@ test('a reset between token issuance and activation does not attach the session'
   assert.equal([...secrets.map.values()].filter(value => company.tokens.has(value)).length, 0);
 });
 
-test('a renewal answered for a different session is rejected and leaves the slots unchanged', async () => {
+test('unknown legacy token fields do not select or change the local Session', async () => {
   const { auth, company, clock, store } = await setup();
   const { connection } = await auth.start(company.domain);
   const target = await auth.target(connection.id);
   clock.t += 3600_000;
   const slots = structuredClone(store.raw.connections[connection.id].slots);
   company.behavior.tokenOverride = { session_id: 'ses_someone_else' };
-  await assert.rejects(auth.authorizedFetch(connection.id, conversations(company), target), code('invalid_response'));
-  assert.deepEqual(store.raw.connections[connection.id].slots, slots);
+  assert.equal((await auth.authorizedFetch(connection.id, conversations(company), target)).status, 200);
+  assert.equal(store.raw.connections[connection.id].sessionId, connection.sessionId);
+  assert.notDeepEqual(store.raw.connections[connection.id].slots, slots);
 });
 
 test('a corrupted DPoP key fails as missing_key without quoting the secret', async () => {
   const { auth, company, store, secrets } = await setup();
   const { connection } = await auth.start(company.domain);
   const target = await auth.target(connection.id);
-  const ref = store.raw.identities[company.issuer].dpopKeyRef;
+  const ref = store.raw.connections[connection.id].dpopKeyRef;
   for (const corrupt of ['{"d":"SECRET-PREFIX', 'null', JSON.stringify({ ...JSON.parse(expectValue(secrets.map.get(ref))), d: 'SECRET-PREFIX' })]) {
     secrets.map.set(ref, corrupt);
     const error = await auth.authorizedFetch(connection.id, conversations(company), target).catch(failure => failure);
@@ -510,7 +579,7 @@ test('Direct Sign-In isolates two users with two connections each', async () => 
   for (const { user, id, account, sessionId } of accounts) {
     const response = await user.auth.authorizedFetch(id, conversations(user.company), await user.auth.target(id), ['orders:write']);
     const body = await response.json();
-    assert.equal(body.account, account); assert.equal(body.session_id, sessionId);
+    assert.equal(body.account, account); assert.equal(body.session_id, remoteSession(user.company)); assert.equal((await user.auth.get(id))?.sessionId, sessionId);
   }
   assert.equal((await alice.auth.list()).length, 2); assert.equal((await bob.auth.list()).length, 2);
   assert.equal(await alice.auth.get(accounts[2].id), null);
@@ -539,8 +608,8 @@ test('Direct Sign-In after the Session idle-expired binds to a replacement Sessi
   const sessionId = store.raw.connections[connection.id].sessionId;
   assert.notEqual(sessionId, connection.sessionId); assert.equal(outcome.connection.sessionId, sessionId);
   assert.deepEqual(forms.map(form => [form.get('grant_type'), form.get('session_id')]), [
-    ['urn:ietf:params:oauth:grant-type:jwt-bearer', connection.sessionId], ['urn:ietf:params:oauth:grant-type:jwt-bearer', null], ['authorization_code', sessionId]]);
-  assert.equal(expectValue(company.sessions.get(sessionId)).account, 'acct_1');
+    ['urn:ietf:params:oauth:grant-type:jwt-bearer', null], ['urn:ietf:params:oauth:grant-type:jwt-bearer', null], ['authorization_code', null]]);
+  assert.equal(expectValue(company.sessions.get(remoteSession(company))).account, 'acct_1');
 });
 
 test('Direct Sign-In after both the Session and the Account Token ended binds to a new signed-out Session', async () => {
@@ -553,7 +622,7 @@ test('Direct Sign-In after both the Session and the Account Token ended binds to
   const current = store.raw.connections[id].sessionId;
   assert.notEqual(current, sessionId);
   assert.deepEqual(forms.map(form => [form.get('grant_type'), form.get('session_id')]), [
-    ['refresh_token', sessionId], ['urn:ietf:params:oauth:grant-type:jwt-bearer', sessionId], ['urn:ietf:params:oauth:grant-type:jwt-bearer', null], ['authorization_code', current]]);
+    ['refresh_token', null], ['urn:ietf:params:oauth:grant-type:jwt-bearer', null], ['refresh_token', null], ['urn:ietf:params:oauth:grant-type:jwt-bearer', null], ['authorization_code', null]]);
 });
 
 test('the authorization request and code exchange carry PKCE, state, issuer and session', async () => {
@@ -570,7 +639,7 @@ test('the authorization request and code exchange carry PKCE, state, issuer and 
   assert.ok(expectValue(url.searchParams.get('state')).length >= 43);
   assert.equal(JSON.stringify(store.raw).includes(expectValue(url.searchParams.get('state'))), false);
   await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER });
-  assert.equal(expectValue(exchange).get('grant_type'), 'authorization_code'); assert.equal(expectValue(exchange).get('session_id'), connection.sessionId);
+  assert.equal(expectValue(exchange).get('grant_type'), 'authorization_code'); assert.equal(expectValue(exchange).has('session_id'), false);
   assert.equal(expectValue(exchange).get('redirect_uri'), REDIRECT); assert.equal(expectValue(exchange).get('client_id'), CLIENT_ID);
   assert.equal(expectValue(exchange).has('assertion'), false); assert.ok(expectValue(exchange).get('client_assertion'));
   assert.equal(expectValue(company.proofs.at(-1)).thumbprint, company.proofs[0].thumbprint);
@@ -726,8 +795,6 @@ test('failed replacement keeps the old connection; a different account on the sa
 test('token responses that are not a usable signed-in grant fail and park any Account Token', async () => {
   for (const [override, expected, parked] of [
     [{ token_type: 'Bearer' }, 'unsupported_token_type', 1],
-    [{ signed_in: false }, 'invalid_response', 1],
-    [{ session_id: 'ses_other' }, 'invalid_response', 1],
     [{ scope: 'orders:read orders:write' }, 'invalid_response', 1],
     [{ refresh_token: undefined }, 'invalid_response', 0],
   ] satisfies [Record<string,unknown>,string,number][]) {
@@ -845,7 +912,7 @@ test('refresh rotates the Account Token once for parallel requests and keeps oth
   const other = 'https://api.shop.test/other';
   const extra = await auth.renew(id, { resource: other, scopes: ['orders:read'] });
   assert.deepEqual([extra.status, extra.connection.status], ['completed', 'signed_in']);
-  assert.deepEqual([forms[0].get('grant_type'), forms[0].get('resource'), forms[0].get('scope'), forms[0].get('session_id')], ['refresh_token', other, 'orders:read', sessionId]);
+  assert.deepEqual([forms[0].get('grant_type'), forms[0].get('resource'), forms[0].get('scope'), forms[0].get('session_id')], ['refresh_token', other, 'orders:read', null]);
   assert.equal(forms[0].has('assertion'), false); assert.ok(forms[0].get('client_assertion'));
   const before = structuredClone(store.raw);
   const grant = grantOf({ raw: before }, id);
@@ -908,9 +975,9 @@ test('renew validates input and a definite refusal releases the grant', async ()
   }
   await assert.rejects(auth.renew('con_missing'), code('unknown_connection'));
   assert.equal(exchanges(company), 2);
-  company.behavior.tokenError = { status: 400, body: { error: 'invalid_session', error_description: 'secret-diagnostic' } };
+  company.behavior.tokenError = { status: 400, body: { error: 'invalid_scope', error_description: 'secret-diagnostic' } };
   const refused = await auth.renew(id);
-  assert.deepEqual([refused.status, refused.error, refused.connection.status], ['failed', 'invalid_session', 'signed_in']);
+  assert.deepEqual([refused.status, refused.error, refused.connection.status], ['failed', 'invalid_scope', 'signed_in']);
   assert.equal(JSON.stringify(refused).includes('secret-diagnostic'), false);
   assert.deepEqual([grantOf(store, id).operationId, grantOf(store, id).status], [null, 'active']);
   company.behavior.tokenError = null;
@@ -923,7 +990,7 @@ test('renew validates input and a definite refusal releases the grant', async ()
   await assert.rejects(auth.renew(connection.id, { scopes: ['orders:read'] }), code('invalid_scope'));
 });
 
-test('an idle-expired signed-in Session is replaced by refreshing without session_id, never by a new sign-in', async () => {
+test('an idle-expired signed-in Session is diagnosed, then replaced with a fresh key without a new sign-in', async () => {
   const { auth, company, store, secrets, clock, id, sessionId, target } = await signedIn();
   const forms = tokenForms(company);
   const grant = grantOf(store, id), oldToken = secrets.map.get(grant.secretRef);
@@ -933,11 +1000,11 @@ test('an idle-expired signed-in Session is replaced by refreshing without sessio
   const response = await auth.authorizedFetch(id, conversations(company), target, ['orders:write']);
   assert.equal(response.status, 200);
   const body = await response.json();
-  assert.deepEqual(forms.map(form => [form.get('grant_type'), form.get('session_id'), form.get('refresh_token')]), [['refresh_token', sessionId, oldToken], ['refresh_token', null, oldToken]]);
+  assert.deepEqual(forms.map(form => [form.get('grant_type'), form.get('session_id'), form.get('refresh_token')]), [['refresh_token', null, oldToken], ['urn:ietf:params:oauth:grant-type:jwt-bearer', null, null], ['refresh_token', null, oldToken]]);
   const current = store.raw.connections[id];
   assert.notEqual(current.sessionId, sessionId);
-  assert.deepEqual([body.session_id, body.account, current.status], [current.sessionId, 'acct_1', 'signed_in']);
-  assert.equal(expectValue(company.sessions.get(current.sessionId)).account, 'acct_1', 'the new Session is bound to the same account');
+  assert.deepEqual([body.session_id, body.account, current.status], [remoteSession(company), 'acct_1', 'signed_in']);
+  assert.equal(expectValue(company.sessions.get(remoteSession(company))).account, 'acct_1', 'the new Session is bound to the same account');
   assert.deepEqual(Object.keys(current.slots), [JSON.stringify([current.sessionId, null])]);
   for (const ref of oldSlots) assert.equal(secrets.map.has(ref), false);
   const after = grantOf(store, id);
@@ -946,7 +1013,7 @@ test('an idle-expired signed-in Session is replaced by refreshing without sessio
   assert.equal(company.codes.size, codes, 'no sign-in was started');
 });
 
-test('replacement-Session refresh: only a definite invalid_session retries, and a lost answer is never resent', async () => {
+test('replacement-Session refresh: diagnosis and lost rotation answers never replay an Account Token', async () => {
   const { auth, company, clock, id } = await signedIn();
   clock.t += 25 * 3600_000;
   // A 5xx is not a definite refusal: the Account Token may have been used, so nothing is retried.
@@ -956,17 +1023,17 @@ test('replacement-Session refresh: only a definite invalid_session retries, and 
   const other = await signedIn();
   other.clock.t += 25 * 3600_000;
   let calls = 0; const original = other.transport.fetch;
-  other.transport.fetch = async (request, init) => { const response = await original(request, init); if (request.url === other.company.tokenEndpoint && ++calls === 2) throw new Error('socket hang up'); return response; };
+  other.transport.fetch = async (request, init) => { const response = await original(request, init); if (request.url === other.company.tokenEndpoint && ++calls === 3) throw new Error('socket hang up'); return response; };
   const lost = await other.auth.renew(other.id);
-  assert.deepEqual([lost.status, lost.error, lost.connection.status, lost.connection.sessionId, calls], ['uncertain', 'lost_response', 'uncertain', other.sessionId, 2]);
+  assert.deepEqual([lost.status, lost.error, lost.connection.status, calls], ['uncertain', 'lost_response', 'uncertain', 3]);
   await assert.rejects(other.auth.renew(other.id), code('grant_uncertain'));
-  assert.equal(calls, 2);
-  // A replacement answered for the ended Session is malformed.
+  assert.equal(calls, 3);
+  // Legacy response fields are ignored; only the proof key selects the Session.
   const third = await signedIn();
   third.clock.t += 25 * 3600_000;
   third.company.behavior.tokenOverride = { session_id: third.sessionId };
   const bad = await third.auth.renew(third.id);
-  assert.deepEqual([bad.status, bad.error, third.store.raw.connections[third.id].sessionId], ['failed', 'invalid_response', third.sessionId]);
+  assert.deepEqual([bad.status, bad.error, third.store.raw.connections[third.id].sessionId], ['completed', undefined, bad.connection.sessionId]);
 });
 
 test('a lost rotation response is uncertain; the old Account Token is never resent', async () => {
@@ -1340,7 +1407,7 @@ test('a host SecretStore ref that looks like a memory ref still reaches the host
   secrets.stage = async secret => { const ref = `mem:${await stage(secret)}`; secrets.map.set(ref, expectValue(secrets.map.get(ref.slice(4)))); return ref; };
   const { auth, company, store } = await setup({ secrets });
   const { connection } = await auth.start(company.domain);
-  const key = store.raw.identities[company.issuer].dpopKeyRef;
+  const key = store.raw.connections[connection.id].dpopKeyRef;
   assert.ok(key.startsWith('mem:'));
   const response = await auth.authorizedFetch(connection.id, conversations(company), await auth.target(connection.id));
   assert.equal(response.status, 200);
@@ -1686,7 +1753,7 @@ test('different full issuers sharing a host keep identities, keys and credential
   const auth = createClientAuth(env.options), a = await auth.start(first.domain); current = second;
   const b = await auth.start(second.domain);
   const one = env.store.raw.identities[first.issuer], two = env.store.raw.identities[second.issuer];
-  assert.notEqual(one.userId, two.userId); assert.notEqual(one.dpopKeyRef, two.dpopKeyRef);
+  assert.notEqual(one.userId, two.userId); assert.notEqual(env.store.raw.connections[a.connection.id].dpopKeyRef, env.store.raw.connections[b.connection.id].dpopKeyRef);
   assert.notEqual(a.connection.issuer, b.connection.issuer);
   const count = second.requests.length;
   await assert.rejects(auth.renew(a.connection.id), code('metadata_changed'));

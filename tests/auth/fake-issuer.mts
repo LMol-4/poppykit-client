@@ -27,7 +27,7 @@ interface Code { redirectUri: string; challenge: string; scopes: string[]; accou
 interface FakeOptions { name?: string; jwks: { keys: JWK[] }; clientId: string; now(): number; issuerPath?: string; redirectUris?: string[]; directScopes?: string[]; conversationResource?: string; method?: string }
 export interface FakeCompany {
  domain: string; issuer: string; tokenEndpoint: string; endpoint: string; authorizationEndpoint: string;
- codes: Map<string | null, Code>; grants: Map<string | null, Grant>; sessions: Map<string | null, Session>; tokens: Map<string | null | undefined, Bound>;
+ codes: Map<string | null, Code>; grants: Map<string | null, Grant>; sessions: Map<string | null, Session>; sessionKeys: Map<string,string>; tokens: Map<string | null | undefined, Bound>;
  behavior: { requireNonce: boolean; rotateNonceEveryTime: boolean; tokenOverride: Record<string, unknown> | null; tokenError: {status:number;body:unknown} | null; resourceHandler: ((request:Request,bound:Bound)=>Response|Promise<Response>) | null; rotate: boolean; revokeStatus: number };
  revocations: {token:string|null;hint:string|null;dpop:boolean}[];
  requests: {url:string;method:string;mode?:'endpoint'|'discovery';authorization:string|null}[];
@@ -61,7 +61,7 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     behavior: { requireNonce: false, rotateNonceEveryTime: false, tokenOverride: null, tokenError: null, resourceHandler: null, rotate: true, revokeStatus: 200 },
     revocations: [],
     requests: [], assertions: [], proofs: [],
-    sessions: new Map(), tokens: new Map(), seenAssertionJti: new Set(), seenProofJti: new Set(), nonce: null,
+    sessions: new Map(), sessionKeys: new Map(), tokens: new Map(), seenAssertionJti: new Set(), seenProofJti: new Set(), nonce: null,
     devices: new Map(), challenges: new Map(), signInBehavior: { status: 'approved', scopes: directScopes, account: 'acct_1', code: '123456', codeRequired: false, attempts: 0 },
     verifyAssertion: async()=>{throw new Error('uninitialized assertion verifier');}, authorize:()=>{throw new Error('uninitialized authorization');}, handle:async()=>{throw new Error('uninitialized handler');},
   };
@@ -70,11 +70,11 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
   // A live Session for this User, or invalid_session (spec 4.2, 4.8); issuing a token for it keeps it alive.
   const liveSession = (sessionId:string|null, sub?:string) => {
     const session = company.sessions.get(sessionId);
-    if (!session || session.expires <= now() || (sub !== undefined && session.sub !== sub)) throw new Reject(400, 'invalid_session');
+    if (!session || session.expires <= now() || (sub !== undefined && session.sub !== sub)) throw new Reject(400, 'invalid_grant');
     session.expires = now() + SESSION_IDLE_MS;
     return session;
   };
-  const newSession = (sub:string, account:string|null = null) => { const id = `ses_${randomUUID()}`; company.sessions.set(id, { sub, account, expires: now() + SESSION_IDLE_MS }); return id; };
+  const newSession = (sub:string, jkt:string, account:string|null = null) => { const id = `ses_${randomUUID()}`; company.sessions.set(id, { sub, account, expires: now() + SESSION_IDLE_MS }); company.sessionKeys.set(jkt,id); return id; };
 
   // Verifies a client or session assertion; aud is compared character for character with the issuer.
   company.verifyAssertion = async (jwt, kind) => {
@@ -146,7 +146,7 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     if (!grant || grant.used) throw new Reject(400, 'invalid_grant');
     grant.used = true;
     if (form.get('redirect_uri') !== grant.redirectUri || sha256(form.get('code_verifier') ?? '') !== grant.challenge || form.get('resource') !== grant.resource) throw new Reject(400, 'invalid_grant');
-    return issueSignedIn(form.get('session_id'), jkt, grant.account, grant.scopes, grant.resource);
+    return issueSignedIn(company.sessionKeys.get(jkt) ?? null, jkt, grant.account, grant.scopes, grant.resource);
   }
   function issueSignedIn(sessionId:string|null,jkt:string,account:string|undefined,scopes:string[],resource:string|null) {
     const session = liveSession(sessionId);
@@ -157,7 +157,7 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     company.grants.set(refreshToken, { family: refreshToken, sub: session.sub, account, scopes, revoked: false, rotated: false });
     session.family = refreshToken;
     company.tokens.set(accessToken, { jkt, sessionId:sessionId!, sub: session.sub, account, scopes, resource, family: refreshToken, expires: now() + 3600_000 });
-    return json(200, { access_token: accessToken, token_type: 'DPoP', expires_in: 3600, refresh_token: refreshToken, refresh_token_expires_in: 2592000, scope: scopes.join(' '), session_id: sessionId, signed_in: true, ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });
+    return json(200, { access_token: accessToken, token_type: 'DPoP', expires_in: 3600, refresh_token: refreshToken, refresh_token_expires_in: 2592000, scope: scopes.join(' '), ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });
   }
 
   // Revoking a grant signs out every Session signed in with it; they continue signed out (spec 4.9).
@@ -175,7 +175,7 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     const grant = company.grants.get(presented);
     if (!grant || grant.revoked) throw new Reject(400, 'invalid_grant');
     if (grant.rotated) { revokeFamily(grant.family); throw new Reject(400, 'invalid_grant'); }
-    const sessionId = form.has('session_id') ? form.get('session_id') : newSession(grant.sub, grant.account);
+    const sessionId = company.sessionKeys.get(jkt) ?? newSession(grant.sub, jkt, grant.account);
     const session = liveSession(sessionId, grant.sub);
     if (session.account && session.account !== grant.account) throw new Reject(400, 'account_mismatch');
     const scopes = form.has('scope') ? (form.get('scope')??'').split(' ') : grant.scopes;
@@ -195,6 +195,7 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
   // RFC 7009 revocation with client authentication; unknown tokens still get 200.
   async function revoke(request:Request) {
     const form = new URLSearchParams(await request.text());
+    assert.equal(form.has('session_id'), false, 'token requests use only standard parameters');
     if (form.get('client_assertion_type') !== CLIENT_ASSERTION || form.get('client_id') !== clientId) throw new Reject(400, 'invalid_request');
     await company.verifyAssertion(form.get('client_assertion'), 'client');
     company.revocations.push({ token: form.get('token'), hint: form.get('token_type_hint'), dpop: request.headers.has('dpop') });
@@ -216,19 +217,19 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
       const behavior = company.signInBehavior;
       if (behavior.status !== 'approved') throw new Reject(400, behavior.status);
       device.used = true;
-      return issueSignedIn(form.get('session_id'), jkt, behavior.account, behavior.scopes.filter(scope => device.scopes.includes(scope)), form.get('resource'));
+      return issueSignedIn(company.sessionKeys.get(jkt) ?? null, jkt, behavior.account, behavior.scopes.filter(scope => device.scopes.includes(scope)), form.get('resource'));
     }
     if (form.get('grant_type') === 'refresh_token') return refresh(request, form);
     if (form.get('grant_type') !== JWT_BEARER) throw new Reject(400, 'unsupported_grant_type');
     await company.verifyAssertion(form.get('client_assertion'), 'client');
     const assertion = await company.verifyAssertion(form.get('assertion'), 'session');
     const jkt = await verifyProof(request);
-    let sessionId = form.get('session_id');
-    if (sessionId === null) sessionId = newSession(assertion.sub);
-    else liveSession(sessionId, assertion.sub);
+    let sessionId = company.sessionKeys.get(jkt);
+    if (sessionId === undefined) sessionId = newSession(assertion.sub, jkt);
+    else { const session = liveSession(sessionId, assertion.sub); if (session.family) throw new Reject(400, 'invalid_grant'); }
     const accessToken = `tok_${randomUUID()}`;
     company.tokens.set(accessToken, { jkt, sessionId, sub: assertion.sub, resource: form.get('resource'), expires: now() + 3600_000 });
-    return json(200, { access_token: accessToken, token_type: 'DPoP', expires_in: 3600, scope: '', session_id: sessionId, signed_in: false, ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });
+    return json(200, { access_token: accessToken, token_type: 'DPoP', expires_in: 3600, ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });
   }
 
   async function resource(request:Request) {

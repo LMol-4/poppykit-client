@@ -88,6 +88,18 @@ recovery of a token that the issuer rotated but never delivered.
 
 ## Development reset
 
+Normalized auth state version 1 upgrades to version 2 atomically on first access
+in both SQLite and PostgreSQL, under the namespace's writer lock. Stop old SDK
+processes before opening the candidate adapters; mixed-version writers are not
+supported. This is a record upgrade, with no SQL schema change. Owner, epoch,
+stable User IDs, grants, scopes, cleanup and internal connection/operation IDs stay.
+Legacy connections discard their volatile token slots and require a fresh key on
+next renewal. Old shared-key references remain retained, but are never used for
+another token request. Prepared old operations are cancelled; dispatched/staged
+ones still pass through `recover()`, preserving rotated tokens and uncertainty.
+Custom targeted adapters must provide the same complete-namespace upgrade under
+their writer lock; the client's fallback also upgrades whole-state snapshots.
+
 There is no automatic migration from old whole-state development stores. Stop all
 users of a disposable store, resolve uncertain remote outcomes, and explicitly move
 aside its database and WAL/SHM files and the matching host-managed secret namespace

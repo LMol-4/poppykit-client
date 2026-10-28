@@ -5,6 +5,19 @@ replacement, revocation and abandoned-operation recovery. Call `recover()` on
 startup. Another live process is never interrupted; an ambiguous dispatched
 exchange is uncertain and must not be replayed.
 
+Each `start` creates a new Session Key; only the issuer-specific User ID is reused.
+Renewal uses that Session Key. `Connection.sessionId` remains a local identifier
+for the key's lifetime, not the company's internal Session ID. Token requests
+carry no `session_id`, and token responses need neither it nor `signed_in`.
+The grant determines sign-in state. Omitted signed-in scope inherits the request's
+scope context; an explicit response can narrow it but cannot expand it.
+
+After a refresh returns definite `invalid_grant`, the client diagnoses the Session
+with a signed-out assertion before discarding the Account Token. A live Session
+means the Account Token is unusable. An ended key is retired durably before a fresh
+key attempts replacement. Ambiguous refresh responses remain uncertain and are
+never resent. Sign-out still disconnects locally before remote cleanup.
+
 Discovery accepts only draft 0.3, checks the final well-known path (including
 cache revalidation), exact issuer and reciprocal `protected_resources`.
 `signInMethods(metadata)` derives Direct/Device from issuer grants and endpoints
