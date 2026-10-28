@@ -7,7 +7,7 @@ if (!domain) throw new Error('usage: node examples/quickstart.mjs DOMAIN|--self-
 const transport = selfCheck ? {
   async fetch(request) {
     assert.equal(request.url, 'https://company.example/.well-known/poppy.json');
-    return Response.json({ protocol_version: '0.2', organization: { name: 'Example Company', domain }, web: {} });
+    return Response.json({ protocol_version: '0.3', organization: { name: 'Example Company', domain }, web: {} });
   },
 } : createNodeTransport();
 try {

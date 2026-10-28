@@ -5,8 +5,16 @@ replacement, revocation and abandoned-operation recovery. Call `recover()` on
 startup. Another live process is never interrupted; an ambiguous dispatched
 exchange is uncertain and must not be replayed.
 
+Discovery accepts only draft 0.3, checks the final well-known path (including
+cache revalidation), exact issuer and reciprocal `protected_resources`.
+`signInMethods(metadata)` derives Direct/Device from issuer grants and endpoints
+and uses `scopes_supported`; Mediated keeps `auth.mediated.scopes`. Company scope
+names cannot start with `poppy:`. Descriptions come from `auth.scopes` or a listed
+OpenAPI document. Prefer Direct when the user can receive its callback; Device is
+for appropriate device-flow situations. No sign-in method is user consent.
+
 Ask `authorization(connectionId, scopes)` for the current grant, missing scopes
-and advertised methods. Choose a method explicitly in `beginSignIn`. Direct
+and advertised methods, with `scopeDescriptions` from `auth.scopes`. Choose a method explicitly in `beginSignIn`. Direct
 requires an HTTPS registered callback and an authenticated browser binding.
 Display its URL in the user's browser. Device returns a checked link/code and
 company identity; call `continueSignIn(operationId)` when its deadline is due.

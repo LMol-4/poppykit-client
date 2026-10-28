@@ -98,12 +98,12 @@ test('hostile descriptions and forged final destinations never receive API crede
 
 test('signed-in MCP acquisition rotates through J2 and sign-out revokes every resource slot', async () => {
   const env = await fixture(), id = env.connection.id, binding = 'trusted-human-browser-binding-012345';
-  const begin = await env.auth.beginSignIn(id, { scopes: ['poppy:read'], redirectUri: 'https://agent.test/callback', browserBinding: binding });
-  const callbackUrl = env.company.authorize(expectValue(begin.authorizationUrl), { account: 'account', approve: ['poppy:read'] });
+  const begin = await env.auth.beginSignIn(id, { scopes: ['orders:read'], redirectUri: 'https://agent.test/callback', browserBinding: binding });
+  const callbackUrl = env.company.authorize(expectValue(begin.authorizationUrl), { account: 'account', approve: ['orders:read'] });
   assert.equal((await env.auth.completeSignIn({ callbackUrl, browserBinding: binding })).status, 'completed');
   const a = await env.auth.apiTarget(id, MCP), b = await env.auth.apiTarget(id, SECURE);
-  await env.auth.apiFetch(id, new Request(MCP, { method: 'POST' }), a, ['poppy:read']);
-  await env.auth.apiFetch(id, new Request(SECURE, { method: 'POST' }), b, ['poppy:read']);
+  await env.auth.apiFetch(id, new Request(MCP, { method: 'POST' }), a, ['orders:read']);
+  await env.auth.apiFetch(id, new Request(SECURE, { method: 'POST' }), b, ['orders:read']);
   assert.deepEqual(env.apiRequests.map(item => expectValue(item.request.headers.get('authorization')).split(' ')[0]), ['Bearer', 'DPoP']);
   assert.notEqual(env.apiRequests[0].token, env.apiRequests[1].token);
   assert.equal((await env.auth.signOut(id)).cleanup, 'complete');
@@ -113,8 +113,8 @@ test('signed-in MCP acquisition rotates through J2 and sign-out revokes every re
 
 test('successful Account Token rotation stages its successor without another fallible metadata fetch', async () => {
   const env = await fixture(), id = env.connection.id, binding = 'trusted-human-browser-binding-012345';
-  const begin = await env.auth.beginSignIn(id, { scopes: ['poppy:read'], redirectUri: 'https://agent.test/callback', browserBinding: binding });
-  await env.auth.completeSignIn({ callbackUrl: env.company.authorize(expectValue(begin.authorizationUrl), { account: 'account', approve: ['poppy:read'] }), browserBinding: binding });
+  const begin = await env.auth.beginSignIn(id, { scopes: ['orders:read'], redirectUri: 'https://agent.test/callback', browserBinding: binding });
+  await env.auth.completeSignIn({ callbackUrl: env.company.authorize(expectValue(begin.authorizationUrl), { account: 'account', approve: ['orders:read'] }), browserBinding: binding });
   const target = await env.auth.apiTarget(id, MCP), before = Object.values(env.raw().grants)[0].secretRef, original = env.company.handle;
   env.company.handle = async (request, options) => {
     const resource = request.url === env.company.tokenEndpoint ? new URLSearchParams(await request.clone().text()).get('resource') : null;
@@ -122,7 +122,7 @@ test('successful Account Token rotation stages its successor without another fal
     if (resource === MCP && response.status === 200) env.setMetadata({ resource: 'invalid-after-success' });
     return response;
   };
-  assert.equal((await env.auth.apiFetch(id, new Request(MCP), target, ['poppy:read'])).status, 200);
+  assert.equal((await env.auth.apiFetch(id, new Request(MCP), target, ['orders:read'])).status, 200);
   const grant = Object.values(env.raw().grants)[0]; assert.notEqual(grant.secretRef, before); assert.equal(grant.status, 'active'); assert.equal(grant.operationId, null);
   env.company.handle = original; env.setMetadata(null);
   assert.equal((await env.auth.renew(id, { resource: MCP })).status, 'completed', 'the known successor remains usable');
@@ -144,7 +144,7 @@ test('a conversation cannot share a Bearer-only MCP resource; sign-in fails befo
   env.setDocument(doc => { expectValue(expectValue(doc.agent).protocols.find(entry=>entry.type==='poppy')).resource = MCP; }); expectValue(env.metadata.invalidate).call(env.metadata);
   const fresh = await env.auth.start(env.company.domain); assert.equal(fresh.status, 'completed');
   await assert.rejects(env.auth.apiTarget(fresh.connection.id, MCP), { code: 'invalid_target' });
-  await assert.rejects(env.auth.beginSignIn(fresh.connection.id, { scopes: ['poppy:read'], redirectUri: 'https://agent.test/callback', browserBinding: 'trusted-human-binding-0123456789' }), { code: 'invalid_target' });
+  await assert.rejects(env.auth.beginSignIn(fresh.connection.id, { scopes: ['orders:read'], redirectUri: 'https://agent.test/callback', browserBinding: 'trusted-human-binding-0123456789' }), { code: 'invalid_target' });
   assert.deepEqual(env.issued, [null, null]);
 });
 

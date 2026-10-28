@@ -1,6 +1,6 @@
 # Conversation delivery and transport
 
-The SDK targets Personal Agent Protocol draft 0.2. Company content, messages,
+Conversation wire migration to draft 0.3 is pending; this layer still uses draft 0.2. Company content, messages,
 unknown events and partial text remain untrusted data for the host application.
 
 ## Client

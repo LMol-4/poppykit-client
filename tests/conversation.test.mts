@@ -285,8 +285,8 @@ test('token errors from WWW-Authenticate are exposed; unknown company codes beco
   await assert.rejects(client.read('cnv_1'), e => e instanceof ConversationError && e.code === 'invalid_token' && e.status === 401);
   server.hooks.failures.push(challenge({ status: 403, header: 'DPoP error="sign_in_required"' }));
   await assert.rejects(client.read('cnv_1'), e => e instanceof ConversationError && e.code === 'sign_in_required' && e.scope === undefined);
-  server.hooks.failures.push(challenge({ status: 403, header: 'DPoP error="insufficient_scope", scope="poppy:read poppy:write"' }));
-  await assert.rejects(client.read('cnv_1'), e => e instanceof ConversationError && e.code === 'insufficient_scope' && e.scope === 'poppy:read poppy:write');
+  server.hooks.failures.push(challenge({ status: 403, header: 'DPoP error="insufficient_scope", scope="orders:read orders:write"' }));
+  await assert.rejects(client.read('cnv_1'), e => e instanceof ConversationError && e.code === 'insufficient_scope' && e.scope === 'orders:read orders:write');
   server.hooks.failures.push(json({ error: 'x'.repeat(5000) }, 400));
   await assert.rejects(client.read('cnv_1'), e => e instanceof ConversationError && e.code === 'http_error' && e.message.length < 60);
   server.hooks.failures.push(challenge({ status: 403, header: 'DPoP error="made_up"' }));
@@ -305,7 +305,7 @@ test('operations are scoped to issuer as well as connection', async () => {
 
 test('dpopChallenge reads only the DPoP challenge and respects quoting and case', async () => {
   const { dpopChallenge } = await import('../dist/auth/challenge.js');
-  assert.deepEqual(dpopChallenge('Bearer scope="openid", DPoP error="insufficient_scope", scope="poppy:read poppy:write"'), { error: 'insufficient_scope', scope: 'poppy:read poppy:write' });
+  assert.deepEqual(dpopChallenge('Bearer scope="openid", DPoP error="insufficient_scope", scope="orders:read orders:write"'), { error: 'insufficient_scope', scope: 'orders:read orders:write' });
   assert.deepEqual(dpopChallenge('Bearer error="invalid_token", DPoP error="use_dpop_nonce"'), { error: 'use_dpop_nonce' });
   assert.deepEqual(dpopChallenge('DPoP error="invalid_token", Bearer error="insufficient_scope", scope="x"'), { error: 'invalid_token' });
   assert.deepEqual(dpopChallenge('DPoP error_description="a, b error=\\"x\\"", error="invalid_token"'), { error: 'invalid_token' });
@@ -318,8 +318,8 @@ test('dpopChallenge reads only the DPoP challenge and respects quoting and case'
 test('WWW-Authenticate with several schemes and garbage map to the right code', async () => {
   const { client, server } = setup({ maxAttempts: 1 });
   const with_ = (header: string ) => new Response('', { status: 401, headers: { 'www-authenticate': header } });
-  server.hooks.failures.push(with_('Bearer scope="openid", DPoP error="insufficient_scope", scope="poppy:read poppy:write"'));
-  await assert.rejects(client.read('cnv_1'), e => e instanceof ConversationError && e.code === 'insufficient_scope' && e.scope === 'poppy:read poppy:write');
+  server.hooks.failures.push(with_('Bearer scope="openid", DPoP error="insufficient_scope", scope="orders:read orders:write"'));
+  await assert.rejects(client.read('cnv_1'), e => e instanceof ConversationError && e.code === 'insufficient_scope' && e.scope === 'orders:read orders:write');
   server.hooks.failures.push(with_('Bearer error="invalid_token", DPoP error="use_dpop_nonce"'));
   await assert.rejects(client.read('cnv_1'), e => e instanceof ConversationError && e.code === 'use_dpop_nonce');
   server.hooks.failures.push(with_('DPoP Error="invalid_token", error_description="x, error=\\"sign_in_required\\""'));

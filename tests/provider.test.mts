@@ -80,7 +80,7 @@ async function fixture() {
   let at=1000000, subject='alice', allowSession=true;
   const key=await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},true,['sign','verify']);
   const publicJwk=await publicEcJwk(key.publicKey);
-  const metadata={...createMetadataResolver({async fetch(){throw new Error('unexpected metadata fetch');}}),resolveCompany:async(d:string)=>{assert.equal(d,domain);return {url:'https://company.example/.well-known/poppy.json',document:{protocol_version:'0.2' as const,organization:{domain,name:'Generic'},web:{browser_session_endpoint:'https://company.example/join'}},authorization:{issuer,token_endpoint:issuer+'/token',revocation_endpoint:issuer+'/revoke',poppy_domains:[domain]}};}};
+  const metadata={...createMetadataResolver({async fetch(){throw new Error('unexpected metadata fetch');}}),resolveCompany:async(d:string)=>{assert.equal(d,domain);return {url:'https://company.example/.well-known/poppy.json',document:{protocol_version:'0.3' as const,organization:{domain,name:'Generic'},web:{browser_session_endpoint:'https://company.example/join'}},authorization:{issuer,token_endpoint:issuer+'/token',revocation_endpoint:issuer+'/revoke',protected_resources:[`https://${domain}`],grant_types_supported:['urn:ietf:params:oauth:grant-type:jwt-bearer','refresh_token']}};}};
   const options:ProviderOptions={clientId,callbackUrl,jwksUri:'https://identity.example/jwks',clientName:'Generic provider',store,cipher:createResultCipher(randomBytes(32)),metadata,now:()=>at,
     authenticateEnrollment:async request =>request.headers.get('x-human')==='authenticated'?{subject,allowedCompanies:[domain]}:null,
     verifySession:async (b: { sessionId: string; }) =>allowSession&&b.sessionId==='owned',

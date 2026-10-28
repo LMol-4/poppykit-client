@@ -50,7 +50,7 @@ const json = (status:number, body:unknown, headers:Record<string,string> = {}) =
 // Sessions end after this long without a token issued for them (spec 4.2: the Company decides how long a Session lasts).
 const SESSION_IDLE_MS = 86_400_000;
 
-export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPath = '/tenant', redirectUris = [], directScopes = ['poppy:read', 'poppy:write'], conversationResource, method = 'direct' }: FakeOptions) {
+export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPath = '/tenant', redirectUris = [], directScopes = ['orders:read', 'orders:write'], conversationResource, method = 'direct' }: FakeOptions) {
   const domain = `${name}.test`;
   const issuer = `https://auth.${domain}${issuerPath}`;
   const tokenEndpoint = `${issuer}/token`;
@@ -251,8 +251,8 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     const url = new URL(request.url);
     company.requests.push({ url: request.url, method: request.method, mode: options?.mode, authorization: request.headers.get('authorization') });
     try {
-      if (url.href === `https://${domain}/.well-known/poppy.json`) return json(200, { protocol_version: '0.2', organization: { name, domain }, auth: { issuer, [method]: { scopes: directScopes, ...(method === 'mediated' ? { endpoint: `${issuer}/sign-in`, fields: [{ name: 'password', label: 'Password', secret: true }] } : {}) } }, agent: { protocols: [{ type: 'other', endpoint: `https://api.${domain}/other` }, { type: 'poppy', endpoint, ...(conversationResource ? { resource: conversationResource } : {}) }] } });
-      if (url.href === `https://auth.${domain}/.well-known/oauth-authorization-server${issuerPath}`) return json(200, { issuer, token_endpoint: tokenEndpoint, revocation_endpoint: `${issuer}/revoke`, ...(method === 'direct' ? { authorization_endpoint: authorizationEndpoint } : {}), ...(method === 'device' ? { device_authorization_endpoint: `${issuer}/device` } : {}), poppy_domains: [domain] });
+      if (url.href === `https://${domain}/.well-known/poppy.json`) return json(200, { protocol_version: '0.3', organization: { name, domain }, auth: { issuer, scopes: Object.fromEntries(directScopes.map(scope => [scope, `Company permission ${scope}`])), ...(method === 'mediated' ? { mediated: { scopes: directScopes, endpoint: `${issuer}/sign-in`, fields: [{ name: 'password', label: 'Password', secret: true }] } } : {}) }, agent: { protocols: [{ type: 'other', endpoint: `https://api.${domain}/other` }, { type: 'poppy', endpoint, ...(conversationResource ? { resource: conversationResource } : {}) }] } });
+      if (url.href === `https://auth.${domain}/.well-known/oauth-authorization-server${issuerPath}`) return json(200, { issuer, token_endpoint: tokenEndpoint, revocation_endpoint: `${issuer}/revoke`, ...(method === 'direct' ? { authorization_endpoint: authorizationEndpoint } : {}), ...(method === 'device' ? { device_authorization_endpoint: `${issuer}/device` } : {}), protected_resources: [`https://${domain}`], grant_types_supported: ['urn:ietf:params:oauth:grant-type:jwt-bearer', 'refresh_token', ...(method === 'direct' ? ['authorization_code'] : []), ...(method === 'device' ? ['urn:ietf:params:oauth:grant-type:device_code'] : [])], scopes_supported: directScopes });
       if (url.href === `${issuer}/device`) {
         const form = new URLSearchParams(await request.text()); await company.verifyAssertion(form.get('client_assertion'), 'client');
         const code = randomUUID(); company.devices.set(code, { scopes: expectValue(form.get('scope')).split(' '), used: false });

@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { calculateJwkThumbprint } from 'jose';
 import { parseJson, parseProtocolError, parseTokenResponse, retryAfterMilliseconds } from '../protocol/wire.js';
 import type { JsonObject, TokenResponse } from '../protocol/wire.js';
-import { validateClientId } from '../network/discovery.js';
+import { validateClientId, signInMethods } from '../network/discovery.js';
 import type { CompanyMetadata, MetadataResolver } from '../network/discovery.js';
 import type { HttpTransport } from '../network/transport.js';
 import { dpopChallenge, schemeChallenge } from './challenge.js';
@@ -38,6 +38,7 @@ export interface ProviderIdentity {
 }
 export type SignInMethod = 'direct' | 'device' | 'mediated';
 export interface AuthorizationRequirement {
+  scopeDescriptions?: Record<string, string>;
   requiredScopes: string[]; grantedScopes: string[]; missingScopes: string[]; sufficient: boolean;
   methods: { method: SignInMethod; scopes: string[] }[];
   organization: { name: string; domain: string };
@@ -859,7 +860,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (response.status !== 200) { await response.body?.cancel(); throw responseFailure(response, response.status === 429 ? 'rate_limited' : 'token_error'); }
       try { value = parseJson(await response.text()) as Record<string, unknown>; } catch { throw new AuthFailure('invalid_response'); }
       const { device_code, user_code, verification_uri, verification_uri_complete, expires_in, interval = 5 } = value ?? {};
-      const hosts = [new URL(connection.issuer).hostname, ...metadata.authorization!.poppy_domains];
+      const hosts = [new URL(connection.issuer).hostname, ...metadata.authorization!.protected_resources.map(resource => new URL(resource).hostname)];
       if (typeof device_code !== 'string' || !device_code || typeof user_code !== 'string' || !user_code || typeof verification_uri !== 'string' || !allowedHost(verification_uri, hosts) ||
         (verification_uri_complete !== undefined && (typeof verification_uri_complete !== 'string' || !allowedHost(verification_uri_complete, hosts))) ||
         typeof expires_in !== 'number' || !Number.isSafeInteger(expires_in) || expires_in <= 0 || expires_in > 86400 || typeof interval !== 'number' || !Number.isSafeInteger(interval) || interval < 1 || interval > 86400) throw new AuthFailure('invalid_response');
@@ -1065,13 +1066,10 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const connection = await currentConnection(connectionId), state = await load({ connectionId });
       const grantedScopes = publicConnection(state, connection).scopes;
       const grant = connection.grantId ? own(state.grants, connection.grantId) : undefined;
-      const methods = (['direct', 'device', 'mediated'] as const).flatMap(method => {
-        const supported = connection.metadata.document.auth?.[method];
-        return supported ? [{ method, scopes: [...supported.scopes] }] : [];
-      });
+      const methods = signInMethods(connection.metadata);
       const required = [...new Set(requiredScopes)], missingScopes = required.filter(scope => !grantedScopes.includes(scope));
       return { requiredScopes: required, grantedScopes, missingScopes, sufficient: connection.status === 'signed_in' && grant?.status === 'active' && (grant.expiresAt === null || grant.expiresAt > now()) && !missingScopes.length,
-        methods, organization: { ...connection.metadata.document.organization } };
+        methods, scopeDescriptions: { ...connection.metadata.document.auth?.scopes }, organization: { ...connection.metadata.document.organization } };
     },
     async beginSignIn(connectionId, input) {
       let found = await currentConnection(connectionId);
@@ -1082,7 +1080,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       }
       const method = input?.method ?? 'direct';
       if (!['direct', 'device', 'mediated'].includes(method)) throw new AuthFailure('unsupported_method', connectionId);
-      const supported = found.metadata.document.auth?.[method];
+      const supported = signInMethods(found.metadata).find(item => item.method === method);
       const authorizationEndpoint = found.metadata.authorization?.authorization_endpoint;
       if (!supported || (method === 'direct' && !authorizationEndpoint) || (method === 'device' && !found.metadata.authorization?.device_authorization_endpoint)) throw new AuthFailure(`${method}_unavailable`, connectionId);
       const { scopes, redirectUri, browserBinding, requiredExistingScopes } = input ?? {};

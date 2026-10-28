@@ -41,7 +41,7 @@ if (mode === 'prepare') {
     expectValue(process.send).call(process, { results: results.map(r => ({ status: r.status, operationId: r.operationId })) });
   } else {
     const { connection } = await auth.start(company.domain);
-    const begun = await auth.beginSignIn(connection.id, { scopes: ['poppy:read'], redirectUri, browserBinding });
+    const begun = await auth.beginSignIn(connection.id, { scopes: ['orders:read'], redirectUri, browserBinding });
     const callbackUrl = company.authorize(expectValue(begun.authorizationUrl), { account: 'account' });
     if (mode === 'rotation') await auth.completeSignIn({ callbackUrl, browserBinding });
     const handle = company.handle;

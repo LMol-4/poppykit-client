@@ -31,7 +31,7 @@ for (const engine of ['SQLite', ...(process.env.D1_POSTGRES === '1' ? ['Postgres
     const restore = loseTokenResponses(env.transport, env.company);
     const uncertain = await auth.completeSignIn({ callbackUrl: direct.callbackUrl, browserBinding: BROWSER });
     restore(); assert.equal(uncertain.status, 'uncertain');
-    const pending = (await auth.beginSignIn(initial.connection.id, { scopes: ['poppy:read'], redirectUri: REDIRECT, browserBinding: BROWSER, force: true })).outcome;
+    const pending = (await auth.beginSignIn(initial.connection.id, { scopes: ['orders:read'], redirectUri: REDIRECT, browserBinding: BROWSER, force: true })).outcome;
     const starts: string[] = [], completions: string[] = []; let oldestCallback = '';
     for (let i = 0; i < 104; i++) {
       env.clock.t += 2000;
@@ -61,7 +61,7 @@ test('independently constructed OAuth callbacks accept optional/unknown fields a
   const auth = createClientAuth({ ...env.options, redirectUris: [redirectUri] });
   const connection = (await auth.start(env.company.domain)).connection;
   for (const error of ['access_denied', 'server_error']) {
-    const begun = await auth.beginSignIn(connection.id, { scopes: ['poppy:read'], redirectUri, browserBinding: 'independent-browser-binding-012345', force: true });
+    const begun = await auth.beginSignIn(connection.id, { scopes: ['orders:read'], redirectUri, browserBinding: 'independent-browser-binding-012345', force: true });
     const state = new URL(expectValue(begun.authorizationUrl)).searchParams.get('state')!;
     const callback = new URL(redirectUri);
     for (const [name, value] of Object.entries({ state, iss: env.company.issuer, error, error_description: 'PRIVATE_DETAIL', error_uri: 'https://shop.test/error', unknown: 'ignored' })) callback.searchParams.set(name, value);
@@ -245,7 +245,7 @@ test('token responses other than a signed-out DPoP session are rejected without 
   for (const [override, expected] of [
     [{ token_type: 'Bearer' }, 'unsupported_token_type'],
     [{ signed_in: true }, 'invalid_response'],
-    [{ scope: 'poppy:read' }, 'invalid_response'],
+    [{ scope: 'orders:read' }, 'invalid_response'],
     [{ expires_in: 0 }, 'invalid_response'],
     [{ access_token: 7 }, 'invalid_response'],
   ] satisfies [Record<string,unknown>,string][]) {
@@ -326,7 +326,7 @@ test('authorizedFetch refuses foreign targets, URLs and handles before sending a
     [connection.id, new Request(`https://evil.test/poppy/conversations`), target, 'invalid_target'],
     [connection.id, new Request(`${company.endpoint}/x#frag`), target, 'invalid_target'],
     [connection.id, new Request(`${company.endpoint.replace('https', 'http')}/x`), target, 'invalid_target'],
-    [connection.id, conversations(company), target, 'insufficient_scope', ['poppy:read']],
+    [connection.id, conversations(company), target, 'insufficient_scope', ['orders:read']],
     ['__proto__', conversations(company), target, 'unknown_connection'],
     ['con_missing', conversations(company), target, 'unknown_connection'],
   ] satisfies [string,Request,ConversationTarget,string,string[]?][]) await assert.rejects(auth.authorizedFetch(id, request, wanted, scopes), code(expected), `${id} ${request.url} ${expected}`);
@@ -486,7 +486,7 @@ test('token expiry counts from before dispatch', async () => {
 const BROWSER = 'browser-session-0123456789abcdef';
 const OTHER_BROWSER = 'another-browser-0123456789abcdef';
 const exchanges = (company:FakeCompany) => company.requests.filter(item => item.url === company.tokenEndpoint).length;
-async function beginAndApprove(auth:ClientAuth, company:FakeCompany, connectionId:string, { scopes = ['poppy:read'], account = 'acct_1', approve, deny, browserBinding = BROWSER, requiredExistingScopes }: {scopes?:string[];account?:string;approve?:string[]|null;deny?:boolean;browserBinding?:string;requiredExistingScopes?:string[]} = {}) {
+async function beginAndApprove(auth:ClientAuth, company:FakeCompany, connectionId:string, { scopes = ['orders:read'], account = 'acct_1', approve, deny, browserBinding = BROWSER, requiredExistingScopes }: {scopes?:string[];account?:string;approve?:string[]|null;deny?:boolean;browserBinding?:string;requiredExistingScopes?:string[]} = {}) {
   const { outcome, authorizationUrl } = await auth.beginSignIn(connectionId, { scopes, redirectUri: REDIRECT, browserBinding, force: true, requiredExistingScopes });
   assert.equal(outcome.status, 'pending'); assert.equal(outcome.nextAction, 'wait'); assert.ok(authorizationUrl);
   return { begun: outcome, authorizationUrl, callbackUrl: company.authorize(authorizationUrl, { account, approve, deny }) };
@@ -502,13 +502,13 @@ test('Direct Sign-In isolates two users with two connections each', async () => 
   const accounts:{user:Awaited<ReturnType<typeof setup>>;id:string;account:string;sessionId:string|null}[] = [];
   for (const [user, account] of ([[alice, 'acct_alice_personal'], [alice, 'acct_alice_business'], [bob, 'acct_bob_1'], [bob, 'acct_bob_2']] satisfies [typeof alice,string][])) {
     const { connection } = await user.auth.start(user.company.domain);
-    const outcome = await signIn(user.auth, user.company, connection.id, { scopes: ['poppy:read', 'poppy:write'], account });
+    const outcome = await signIn(user.auth, user.company, connection.id, { scopes: ['orders:read', 'orders:write'], account });
     assert.equal(outcome.status, 'completed'); assert.equal(outcome.connection.status, 'signed_in');
-    assert.deepEqual(outcome.connection.scopes, ['poppy:read', 'poppy:write']); assert.equal(outcome.connection.sessionId, connection.sessionId);
+    assert.deepEqual(outcome.connection.scopes, ['orders:read', 'orders:write']); assert.equal(outcome.connection.sessionId, connection.sessionId);
     accounts.push({ user, id: connection.id, account, sessionId: connection.sessionId });
   }
   for (const { user, id, account, sessionId } of accounts) {
-    const response = await user.auth.authorizedFetch(id, conversations(user.company), await user.auth.target(id), ['poppy:write']);
+    const response = await user.auth.authorizedFetch(id, conversations(user.company), await user.auth.target(id), ['orders:write']);
     const body = await response.json();
     assert.equal(body.account, account); assert.equal(body.session_id, sessionId);
   }
@@ -530,7 +530,7 @@ test('Direct Sign-In after the Session idle-expired binds to a replacement Sessi
   const { connection } = await auth.start(company.domain);
   // A fresh credential proves a live Session: beginSignIn sends nothing.
   const sent = exchanges(company);
-  await auth.beginSignIn(connection.id, { scopes: ['poppy:read'], redirectUri: REDIRECT, browserBinding: BROWSER });
+  await auth.beginSignIn(connection.id, { scopes: ['orders:read'], redirectUri: REDIRECT, browserBinding: BROWSER });
   assert.equal(exchanges(company), sent);
   clock.t += 25 * 3600_000;
   const forms = tokenForms(company);
@@ -562,11 +562,11 @@ test('the authorization request and code exchange carry PKCE, state, issuer and 
   let exchange!:URLSearchParams;
   const original = company.handle;
   company.handle = async (request, options) => { if (request.url === company.tokenEndpoint) exchange = new URLSearchParams(await request.clone().text()); return original(request, options); };
-  const { authorizationUrl, callbackUrl } = await beginAndApprove(auth, company, connection.id, { scopes: ['poppy:read', 'poppy:write'] });
+  const { authorizationUrl, callbackUrl } = await beginAndApprove(auth, company, connection.id, { scopes: ['orders:read', 'orders:write'] });
   const url = new URL(authorizationUrl);
   assert.equal(url.origin + url.pathname, company.authorizationEndpoint);
   assert.equal(url.searchParams.get('client_id'), CLIENT_ID); assert.equal(url.searchParams.get('redirect_uri'), REDIRECT);
-  assert.equal(url.searchParams.get('scope'), 'poppy:read poppy:write'); assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
+  assert.equal(url.searchParams.get('scope'), 'orders:read orders:write'); assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
   assert.ok(expectValue(url.searchParams.get('state')).length >= 43);
   assert.equal(JSON.stringify(store.raw).includes(expectValue(url.searchParams.get('state'))), false);
   await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER });
@@ -579,12 +579,12 @@ test('the authorization request and code exchange carry PKCE, state, issuer and 
 test('beginSignIn rejects bad input before creating an operation', async () => {
   const { auth, company, store, options } = await setup();
   const { connection } = await auth.start(company.domain);
-  const good = { scopes: ['poppy:read'], redirectUri: REDIRECT, browserBinding: BROWSER };
+  const good = { scopes: ['orders:read'], redirectUri: REDIRECT, browserBinding: BROWSER };
   for (const [input, expected] of [
     [{ ...good, scopes: [] }, 'invalid_scope'],
-    [{ ...good, scopes: ['poppy:read', 'poppy:read'] }, 'invalid_scope'],
+    [{ ...good, scopes: ['orders:read', 'orders:read'] }, 'invalid_scope'],
     [{ ...good, scopes: ['admin'] }, 'invalid_scope'],
-    [{ ...good, scopes: 'poppy:read' }, 'invalid_scope'],
+    [{ ...good, scopes: 'orders:read' }, 'invalid_scope'],
     [{ ...good, redirectUri: 'https://agent.test/oauth/callback/' }, 'invalid_redirect'],
     [{ ...good, redirectUri: 'https://evil.test/cb' }, 'invalid_redirect'],
     [{ ...good, browserBinding: 'short' }, 'invalid_binding'],
@@ -595,9 +595,9 @@ test('beginSignIn rejects bad input before creating an operation', async () => {
   }
   await assert.rejects(auth.beginSignIn('con_missing', good), code('unknown_connection'));
   const operations = Object.keys(store.raw.operations).length;
-  delete expectValue(store.raw.connections[connection.id].metadata.document.auth).direct;
+  expectValue(store.raw.connections[connection.id].metadata.authorization).grant_types_supported = ['urn:ietf:params:oauth:grant-type:jwt-bearer','refresh_token'];
   const resolve = options.metadata.resolveCompany;
-  options.metadata.resolveCompany = async domain => { const fresh = structuredClone(await resolve(domain)); delete expectValue(fresh.document.auth).direct; return fresh; };
+  options.metadata.resolveCompany = async domain => { const fresh = structuredClone(await resolve(domain)); expectValue(fresh.authorization).grant_types_supported = ['urn:ietf:params:oauth:grant-type:jwt-bearer','refresh_token']; return fresh; };
   await assert.rejects(auth.beginSignIn(connection.id, good), code('direct_unavailable'));
   assert.equal(Object.keys(store.raw.operations).length, operations);
 });
@@ -669,17 +669,17 @@ test('denied, cancelled and expired sign-ins are terminal and keep the signed-ou
 test('partial consent keeps the previous grant and parks the new Account Token for revocation', async () => {
   const { auth, company, store, secrets } = await setup();
   const { connection } = await auth.start(company.domain);
-  const first = await signIn(auth, company, connection.id, { scopes: ['poppy:read'] });
+  const first = await signIn(auth, company, connection.id, { scopes: ['orders:read'] });
   assert.equal(first.status, 'completed');
   const before = structuredClone(store.raw.connections[connection.id]);
-  const partial = await signIn(auth, company, connection.id, { scopes: ['poppy:read', 'poppy:write'], approve: ['poppy:write'] });
+  const partial = await signIn(auth, company, connection.id, { scopes: ['orders:read', 'orders:write'], approve: ['orders:write'] });
   assert.equal(partial.status, 'failed'); assert.equal(partial.error, 'replacement_rejected');
-  assert.deepEqual(partial.missingScopes, ['poppy:read']); assert.deepEqual(partial.connection.scopes, ['poppy:read']);
+  assert.deepEqual(partial.missingScopes, ['orders:read']); assert.deepEqual(partial.connection.scopes, ['orders:read']);
   assert.deepEqual(store.raw.connections[connection.id], before);
   const [cleanup] = Object.values(store.raw.cleanup);
   assert.equal(cleanup.status, 'pending'); assert.equal(cleanup.revocationEndpoint, `${company.issuer}/revoke`);
   assert.equal(secrets.map.get(cleanup.secretRef), [...company.grants.keys()].at(-1));
-  assert.equal((await auth.authorizedFetch(connection.id, conversations(company), await auth.target(connection.id), ['poppy:read'])).status, 200);
+  assert.equal((await auth.authorizedFetch(connection.id, conversations(company), await auth.target(connection.id), ['orders:read'])).status, 200);
   // The parked token is revoked on request while the connection stays signed in.
   const cleaned = await auth.retryCleanup(connection.id);
   assert.deepEqual([cleaned.cleanup, cleaned.connection.status], ['complete', 'signed_in']);
@@ -687,19 +687,19 @@ test('partial consent keeps the previous grant and parks the new Account Token f
   assert.deepEqual(store.raw.cleanup, {}); assert.equal(secrets.map.has(cleanup.secretRef), false);
   // First-time partial consent retains useful access.
   const other = await auth.start(company.domain);
-  const none = await signIn(auth, company, other.connection.id, { scopes: ['poppy:read', 'poppy:write'], approve: ['poppy:write'] });
-  assert.deepEqual([none.status, none.missingScopes, none.connection.status], ['completed', ['poppy:read'], 'signed_in']);
-  assert.deepEqual(none.grantedScopes, ['poppy:write']);
+  const none = await signIn(auth, company, other.connection.id, { scopes: ['orders:read', 'orders:write'], approve: ['orders:write'] });
+  assert.deepEqual([none.status, none.missingScopes, none.connection.status], ['completed', ['orders:read'], 'signed_in']);
+  assert.deepEqual(none.grantedScopes, ['orders:write']);
 });
 
 test('a scope upgrade replaces the grant and parks the old one; old slots stop being selectable', async () => {
   const { auth, company, store, secrets } = await setup();
   const { connection } = await auth.start(company.domain);
-  await signIn(auth, company, connection.id, { scopes: ['poppy:read'] });
+  await signIn(auth, company, connection.id, { scopes: ['orders:read'] });
   const oldGrant = store.raw.connections[connection.id].grantId;
   const oldSlots = Object.values(store.raw.connections[connection.id].slots).map(slot => slot.secretRef);
-  const upgraded = await signIn(auth, company, connection.id, { scopes: ['poppy:read', 'poppy:write'] });
-  assert.equal(upgraded.status, 'completed'); assert.deepEqual(upgraded.connection.scopes, ['poppy:read', 'poppy:write']);
+  const upgraded = await signIn(auth, company, connection.id, { scopes: ['orders:read', 'orders:write'] });
+  assert.equal(upgraded.status, 'completed'); assert.deepEqual(upgraded.connection.scopes, ['orders:read', 'orders:write']);
   const record = store.raw.connections[connection.id];
   assert.notEqual(record.grantId, oldGrant); assert.equal(store.raw.grants[expectValue(oldGrant)], undefined);
   assert.deepEqual(Object.keys(store.raw.cleanup), [`cln_${oldGrant}`]);
@@ -710,16 +710,16 @@ test('a scope upgrade replaces the grant and parks the old one; old slots stop b
 test('failed replacement keeps the old connection; a different account on the same session is refused', async () => {
   const { auth, company } = await setup();
   const old = await auth.start(company.domain);
-  await signIn(auth, company, old.connection.id, { account: 'acct_a', scopes: ['poppy:read'] });
-  const oldAccount = async () => (await (await auth.authorizedFetch(old.connection.id, conversations(company), await auth.target(old.connection.id), ['poppy:read'])).json()).account;
+  await signIn(auth, company, old.connection.id, { account: 'acct_a', scopes: ['orders:read'] });
+  const oldAccount = async () => (await (await auth.authorizedFetch(old.connection.id, conversations(company), await auth.target(old.connection.id), ['orders:read'])).json()).account;
   // Same session, different account: the Company refuses and nothing changes locally.
-  const mismatch = await signIn(auth, company, old.connection.id, { account: 'acct_b', scopes: ['poppy:read'] });
+  const mismatch = await signIn(auth, company, old.connection.id, { account: 'acct_b', scopes: ['orders:read'] });
   assert.deepEqual([mismatch.status, mismatch.error, mismatch.connection.status], ['failed', 'account_mismatch', 'signed_in']);
   assert.equal(await oldAccount(), 'acct_a');
   const candidate = await auth.start(company.domain);
   assert.equal((await signIn(auth, company, candidate.connection.id, { account: 'acct_b', deny: true })).status, 'denied');
   assert.equal(await oldAccount(), 'acct_a');
-  const replaced = await signIn(auth, company, candidate.connection.id, { account: 'acct_b', scopes: ['poppy:read'] });
+  const replaced = await signIn(auth, company, candidate.connection.id, { account: 'acct_b', scopes: ['orders:read'] });
   assert.equal(replaced.status, 'completed'); assert.equal(await oldAccount(), 'acct_a');
 });
 
@@ -728,7 +728,7 @@ test('token responses that are not a usable signed-in grant fail and park any Ac
     [{ token_type: 'Bearer' }, 'unsupported_token_type', 1],
     [{ signed_in: false }, 'invalid_response', 1],
     [{ session_id: 'ses_other' }, 'invalid_response', 1],
-    [{ scope: 'poppy:read poppy:write' }, 'invalid_response', 1],
+    [{ scope: 'orders:read orders:write' }, 'invalid_response', 1],
     [{ refresh_token: undefined }, 'invalid_response', 0],
   ] satisfies [Record<string,unknown>,string,number][]) {
     const { auth, company, store } = await setup();
@@ -822,14 +822,14 @@ test('sign-in requests the conversation resource so the signed-in token works th
   assert.equal(new URL(authorizationUrl).searchParams.get('resource'), target.resource);
   assert.equal((await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER })).status, 'completed');
   assert.deepEqual(Object.keys(store.raw.connections[connection.id].slots), [JSON.stringify([connection.sessionId, target.resource])]);
-  const body = await (await auth.authorizedFetch(connection.id, conversations(company), target, ['poppy:read'])).json();
+  const body = await (await auth.authorizedFetch(connection.id, conversations(company), target, ['orders:read'])).json();
   assert.equal(body.account, 'acct_1');
 });
 
 async function signedIn(options:Parameters<typeof setup>[0] = {}) {
   const context = await setup(options);
   const { connection } = await context.auth.start(context.company.domain);
-  assert.equal((await signIn(context.auth, context.company, connection.id, { scopes: ['poppy:read', 'poppy:write'] })).status, 'completed');
+  assert.equal((await signIn(context.auth, context.company, connection.id, { scopes: ['orders:read', 'orders:write'] })).status, 'completed');
   return { ...context, id: connection.id, sessionId: connection.sessionId, target: await context.auth.target(connection.id) };
 }
 const grantOf = (store:{raw:ClientAuthState}, id:string) => store.raw.grants[expectValue(store.raw.connections[id].grantId)];
@@ -843,16 +843,16 @@ test('refresh rotates the Account Token once for parallel requests and keeps oth
   const { auth, company, store, secrets, clock, id, sessionId, target } = await signedIn();
   const forms = tokenForms(company);
   const other = 'https://api.shop.test/other';
-  const extra = await auth.renew(id, { resource: other, scopes: ['poppy:read'] });
+  const extra = await auth.renew(id, { resource: other, scopes: ['orders:read'] });
   assert.deepEqual([extra.status, extra.connection.status], ['completed', 'signed_in']);
-  assert.deepEqual([forms[0].get('grant_type'), forms[0].get('resource'), forms[0].get('scope'), forms[0].get('session_id')], ['refresh_token', other, 'poppy:read', sessionId]);
+  assert.deepEqual([forms[0].get('grant_type'), forms[0].get('resource'), forms[0].get('scope'), forms[0].get('session_id')], ['refresh_token', other, 'orders:read', sessionId]);
   assert.equal(forms[0].has('assertion'), false); assert.ok(forms[0].get('client_assertion'));
   const before = structuredClone(store.raw);
   const grant = grantOf({ raw: before }, id);
   const oldToken = secrets.map.get(grant.secretRef);
   const otherKey = JSON.stringify([sessionId, other]), defaultKey = JSON.stringify([sessionId, null]);
   clock.t += 3600_000;
-  const responses = await Promise.all([1, 2, 3, 4].map(() => auth.authorizedFetch(id, conversations(company), target, ['poppy:write'])));
+  const responses = await Promise.all([1, 2, 3, 4].map(() => auth.authorizedFetch(id, conversations(company), target, ['orders:write'])));
   assert.deepEqual(responses.map(response => response.status), [200, 200, 200, 200]);
   assert.equal(forms.length, 2, 'one refresh for four parallel requests');
   assert.equal(forms[1].get('refresh_token'), oldToken); assert.equal(forms[1].has('resource'), false); assert.equal(forms[1].has('scope'), false);
@@ -876,7 +876,7 @@ test('terminal start and sign-in operations are pruned beyond a bound; uncertain
   const uncertain = await auth.completeSignIn({ callbackUrl, browserBinding: BROWSER });
   restore();
   assert.equal(uncertain.status, 'uncertain');
-  const { outcome: pending } = await auth.beginSignIn(id, { scopes: ['poppy:read'], redirectUri: REDIRECT, browserBinding: BROWSER, force: true });
+  const { outcome: pending } = await auth.beginSignIn(id, { scopes: ['orders:read'], redirectUri: REDIRECT, browserBinding: BROWSER, force: true });
   const starts = [];
   for (let i = 0; i < 103; i++) { clock.t += 2000; starts.push((await auth.start(company.domain)).operationId); } // paced under the discovery fetch limit
   const kept = Object.values(store.raw.operations).filter(op => op.kind !== 'renew');
@@ -902,7 +902,7 @@ test('one rotation per grant: a second process gets the pending operation', asyn
 
 test('renew validates input and a definite refusal releases the grant', async () => {
   const { auth, company, store, id } = await signedIn();
-  for (const [input, expected] of [[{ scopes: ['admin'] }, 'invalid_scope'], [{ scopes: [] }, 'invalid_scope'], [{ scopes: 'poppy:read' }, 'invalid_scope'], [{ resource: 'not a url' }, 'invalid_target']] satisfies [unknown,string][]) {
+  for (const [input, expected] of [[{ scopes: ['admin'] }, 'invalid_scope'], [{ scopes: [] }, 'invalid_scope'], [{ scopes: 'orders:read' }, 'invalid_scope'], [{ resource: 'not a url' }, 'invalid_target']] satisfies [unknown,string][]) {
     // @ts-expect-error Deliberately malformed renewal input must reach SDK validation.
     await assert.rejects(auth.renew(id, input), code(expected), JSON.stringify(input));
   }
@@ -920,7 +920,7 @@ test('renew validates input and a definite refusal releases the grant', async ()
   const slot = Object.values(store.raw.connections[connection.id].slots)[0];
   assert.equal((await auth.renew(connection.id)).status, 'completed');
   assert.notEqual(Object.values(store.raw.connections[connection.id].slots)[0].secretRef, slot.secretRef);
-  await assert.rejects(auth.renew(connection.id, { scopes: ['poppy:read'] }), code('invalid_scope'));
+  await assert.rejects(auth.renew(connection.id, { scopes: ['orders:read'] }), code('invalid_scope'));
 });
 
 test('an idle-expired signed-in Session is replaced by refreshing without session_id, never by a new sign-in', async () => {
@@ -930,7 +930,7 @@ test('an idle-expired signed-in Session is replaced by refreshing without sessio
   const oldSlots = Object.values(store.raw.connections[id].slots).map(slot => slot.secretRef);
   const codes = company.codes.size;
   clock.t += 25 * 3600_000; // past the issuer's 24 h idle limit
-  const response = await auth.authorizedFetch(id, conversations(company), target, ['poppy:write']);
+  const response = await auth.authorizedFetch(id, conversations(company), target, ['orders:write']);
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.deepEqual(forms.map(form => [form.get('grant_type'), form.get('session_id'), form.get('refresh_token')]), [['refresh_token', sessionId, oldToken], ['refresh_token', null, oldToken]]);
@@ -980,10 +980,10 @@ test('a lost rotation response is uncertain; the old Account Token is never rese
   const sent = exchanges(company);
   await assert.rejects(auth.renew(id), code('grant_uncertain'));
   clock.t += 3600_000;
-  await assert.rejects(auth.authorizedFetch(id, conversations(company), target, ['poppy:read']), code('grant_uncertain'));
+  await assert.rejects(auth.authorizedFetch(id, conversations(company), target, ['orders:read']), code('grant_uncertain'));
   assert.equal(exchanges(company), sent);
   // Only a fresh sign-in recovers; it retires the uncertain grant.
-  const fresh = await signIn(auth, company, id, { scopes: ['poppy:read'], requiredExistingScopes: ['poppy:read'] });
+  const fresh = await signIn(auth, company, id, { scopes: ['orders:read'], requiredExistingScopes: ['orders:read'] });
   assert.deepEqual([fresh.status, fresh.connection.status], ['completed', 'signed_in']);
   assert.equal(Object.values(store.raw.cleanup).length, 1);
   // Revoking the token we hold cannot prove the unseen successor is gone.
@@ -1008,7 +1008,7 @@ test('presenting an already-rotated Account Token revokes the grant; the session
   const codes = company.codes.size;
   const response = await stale.authorizedFetch(id, conversations(company), target);
   assert.equal(response.status, 200); assert.equal((await response.json()).account, null);
-  await assert.rejects(stale.authorizedFetch(id, conversations(company), target, ['poppy:read']), code('insufficient_scope'));
+  await assert.rejects(stale.authorizedFetch(id, conversations(company), target, ['orders:read']), code('insufficient_scope'));
   assert.equal(company.codes.size, codes, 'no sign-in was started');
   assert.equal((await stale.renew(id)).connection.status, 'signed_out');
 });
@@ -1026,7 +1026,7 @@ test('sign-out disconnects first, revokes with a client assertion and never sign
   assert.equal(secrets.map.size, 1, 'only the DPoP key remains');
   await assert.rejects(auth.authorizedFetch(id, conversations(company), target), code('disconnected'));
   await assert.rejects(auth.renew(id), code('disconnected'));
-  await assert.rejects(auth.beginSignIn(id, { scopes: ['poppy:read'], redirectUri: REDIRECT, browserBinding: BROWSER }), code('sign_in_unavailable'));
+  await assert.rejects(auth.beginSignIn(id, { scopes: ['orders:read'], redirectUri: REDIRECT, browserBinding: BROWSER }), code('sign_in_unavailable'));
   assert.deepEqual(await auth.recover(), []);
   const again = await auth.signOut(id);
   assert.deepEqual(again, out); assert.equal(company.revocations.length, 1);
@@ -1127,7 +1127,7 @@ test('a crash after the refresh response: staged finishes on recovery, unstaged 
     assert.equal(exchanges(company), 3, 'recovery never refreshes again');
     if (expected === 'completed') {
       assert.equal(grantOf(store, id).secretRef, expectValue(operation.staged).refreshRef);
-      assert.equal((await restarted.authorizedFetch(id, conversations(company), target, ['poppy:read'])).status, 200);
+      assert.equal((await restarted.authorizedFetch(id, conversations(company), target, ['orders:read'])).status, 200);
     } else {
       assert.deepEqual([grantOf(store, id).status, store.raw.connections[id].status], ['uncertain', 'uncertain']);
     }
@@ -1185,7 +1185,7 @@ test('a 5xx or garbled code exchange answer is uncertain and the code is not res
   for (const reply of [
     () => new Response('<html>Bad Gateway</html>', { status: 502 }),
     () => new Response('{"access_token": tok', { status: 200, headers: { 'content-type': 'application/json' } }),
-    () => new Response(JSON.stringify({ access_token: 'tok_x', token_type: 'DPoP', expires_in: -1, scope: 'poppy:read', session_id: 'ses_x', signed_in: true }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    () => new Response(JSON.stringify({ access_token: 'tok_x', token_type: 'DPoP', expires_in: -1, scope: 'orders:read', session_id: 'ses_x', signed_in: true }), { status: 200, headers: { 'content-type': 'application/json' } }),
   ]) {
     const { auth, company, store } = await setup();
     const { connection } = await auth.start(company.domain);
@@ -1351,29 +1351,29 @@ for (const method of ['device', 'mediated'] as const) {
     const env = await setup({ method }); const { company, clock, store } = env;
     env.options.trustedInput = { collect: async () => ({ password: 'private-password' }) };
     const auth = createClientAuth(env.options), { connection } = await auth.start(company.domain);
-    const requirement = await auth.authorization(connection.id, ['poppy:read', 'poppy:write']);
-    assert.deepEqual(requirement.methods, [{ method, scopes: ['poppy:read', 'poppy:write'] }]);
-    assert.deepEqual(requirement.missingScopes, ['poppy:read', 'poppy:write']);
-    company.signInBehavior.scopes = ['poppy:read'];
+    const requirement = await auth.authorization(connection.id, ['orders:read', 'orders:write']);
+    assert.deepEqual(requirement.methods, [{ method, scopes: ['orders:read', 'orders:write'] }]);
+    assert.deepEqual(requirement.missingScopes, ['orders:read', 'orders:write']);
+    company.signInBehavior.scopes = ['orders:read'];
     let begun = await auth.beginSignIn(connection.id, { method, scopes: requirement.requiredScopes });
     let result = begun.outcome;
     if (method === 'device') { clock.t += 5000; result = await createClientAuth(env.options).continueSignIn(result.operationId); }
-    assert.deepEqual([result.status, result.grantedScopes, result.missingScopes], ['completed', ['poppy:read'], ['poppy:write']]);
+    assert.deepEqual([result.status, result.grantedScopes, result.missingScopes], ['completed', ['orders:read'], ['orders:write']]);
     let oldGrant = store.raw.connections[connection.id].grantId;
-    assert.equal((await auth.authorization(connection.id, ['poppy:read'])).sufficient, true);
-    assert.equal((await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] })).outcome.status, 'completed');
-    begun = await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read', 'poppy:write'] }); result = begun.outcome;
+    assert.equal((await auth.authorization(connection.id, ['orders:read'])).sufficient, true);
+    assert.equal((await auth.beginSignIn(connection.id, { method, scopes: ['orders:read'] })).outcome.status, 'completed');
+    begun = await auth.beginSignIn(connection.id, { method, scopes: ['orders:read', 'orders:write'] }); result = begun.outcome;
     if (method === 'device') { clock.t += 5000; result = await auth.continueSignIn(result.operationId); }
-    assert.equal(result.status, 'completed'); assert.deepEqual(result.missingScopes, ['poppy:write']);
+    assert.equal(result.status, 'completed'); assert.deepEqual(result.missingScopes, ['orders:write']);
     assert.notEqual(store.raw.connections[connection.id].grantId, oldGrant, 'partial replacement preserving all old access activates');
     oldGrant = store.raw.connections[connection.id].grantId;
-    company.signInBehavior.scopes = ['poppy:write'];
-    begun = await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read', 'poppy:write'] }); result = begun.outcome;
+    company.signInBehavior.scopes = ['orders:write'];
+    begun = await auth.beginSignIn(connection.id, { method, scopes: ['orders:read', 'orders:write'] }); result = begun.outcome;
     if (method === 'device') { clock.t += 5000; result = await auth.continueSignIn(result.operationId); }
     assert.equal(result.error, 'replacement_rejected'); assert.equal(store.raw.connections[connection.id].grantId, oldGrant);
-    begun = await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read', 'poppy:write'], requiredExistingScopes: [] }); result = begun.outcome;
+    begun = await auth.beginSignIn(connection.id, { method, scopes: ['orders:read', 'orders:write'], requiredExistingScopes: [] }); result = begun.outcome;
     if (method === 'device') { clock.t += 5000; result = await auth.continueSignIn(result.operationId); }
-    assert.deepEqual([result.status, result.connection.scopes], ['completed', ['poppy:write']], 'explicit replacement, never a union');
+    assert.deepEqual([result.status, result.connection.scopes], ['completed', ['orders:write']], 'explicit replacement, never a union');
     assert.equal((await auth.renew(connection.id)).status, 'completed');
     assert.equal((await auth.signOut(connection.id)).connection.status, 'disconnected');
     assert.equal(JSON.stringify(store.raw).includes('private-password'), false);
@@ -1388,7 +1388,7 @@ for (const method of ['device', 'mediated'] as const) {
       env.company.handle = async (request, options) => request.url === `${env.company.issuer}/${method === 'device' ? 'device' : 'sign-in'}` ? new Response('{}', { status: 200 }) : handle(request, options);
     }
     let auth = createClientAuth(env.options), { connection } = await auth.start(env.company.domain);
-    let { outcome } = await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] });
+    let { outcome } = await auth.beginSignIn(connection.id, { method, scopes: ['orders:read'] });
     auth = createClientAuth(env.options);
     if (terminal === 'cancel') outcome = await auth.cancelSignIn(outcome.operationId);
     if (terminal === 'expiry') { env.clock.t += 601_000; await auth.recover(); outcome = await auth.continueSignIn(outcome.operationId); }
@@ -1402,7 +1402,7 @@ for (const method of ['device', 'mediated'] as const) {
 
 test('Device pending/slowdown and exact Retry-After deadline survive restart', async () => {
   const env = await setup({ method: 'device' }), { connection } = await env.auth.start(env.company.domain);
-  const { outcome } = await env.auth.beginSignIn(connection.id, { method: 'device', scopes: ['poppy:read'] });
+  const { outcome } = await env.auth.beginSignIn(connection.id, { method: 'device', scopes: ['orders:read'] });
   const count = exchanges(env.company);
   assert.equal((await env.auth.continueSignIn(outcome.operationId)).retryAfterMs, 5000); assert.equal(exchanges(env.company), count);
   env.company.signInBehavior.status = 'slow_down'; env.clock.t += 5000;
@@ -1420,7 +1420,7 @@ test('Mediated challenge uses correlated operation/session; wrong-code attempts 
   env.company.signInBehavior.codeRequired = true;
   env.options.trustedInput = { collect: async request => { prompts.push(request); const values:Record<string,string> = request.challenge ? { code: 'wrong-code' } : { password: 'password-secret' }; inputs.push(values); return values; } };
   let auth = createClientAuth(env.options); const { connection } = await auth.start(env.company.domain);
-  let { outcome } = await auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['poppy:read'] });
+  let { outcome } = await auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['orders:read'] });
   const id = outcome.operationId;
   auth = createClientAuth(env.options);
   for (let i = 0; i < 3; i++) outcome = await auth.continueSignIn(id);
@@ -1436,7 +1436,7 @@ test('anonymous sign-in creates regular connection/session and discards its ephe
   const anonymous = await auth.start(company.domain, { anonymous: true });
   const old = structuredClone(store.raw.connections[anonymous.connection.id]);
   assert.deepEqual(store.raw.identities, {});
-  const begun = await auth.beginSignIn(old.id, { scopes: ['poppy:read'], redirectUri: REDIRECT, browserBinding: BROWSER });
+  const begun = await auth.beginSignIn(old.id, { scopes: ['orders:read'], redirectUri: REDIRECT, browserBinding: BROWSER });
   assert.notEqual(begun.outcome.connection.id, old.id); assert.notEqual(begun.outcome.connection.sessionId, old.sessionId);
   assert.notEqual(store.raw.identities[company.issuer].userId, old.userId);
   assert.equal(secrets.map.has(old.dpopKeyRef), false); assert.equal(expectValue((await auth.get(old.id))).status, 'disconnected');
@@ -1449,8 +1449,8 @@ for (const method of ['direct', 'device', 'mediated'] as const) test(`${method} 
   const auth = createClientAuth(env.options), { connection } = await auth.start(env.company.domain);
   let operationId: string, complete;
   if (method === 'direct') { const begun = await beginAndApprove(auth, env.company, connection.id); operationId = begun.begun.operationId; complete = () => auth.completeSignIn({ callbackUrl: begun.callbackUrl, browserBinding: BROWSER }); }
-  else if (method === 'device') { const begun = await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] }); operationId = begun.outcome.operationId; env.clock.t += 5000; complete = () => auth.continueSignIn(operationId); }
-  else complete = async () => (await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] })).outcome;
+  else if (method === 'device') { const begun = await auth.beginSignIn(connection.id, { method, scopes: ['orders:read'] }); operationId = begun.outcome.operationId; env.clock.t += 5000; complete = () => auth.continueSignIn(operationId); }
+  else complete = async () => (await auth.beginSignIn(connection.id, { method, scopes: ['orders:read'] })).outcome;
   const stage = env.secrets.stage;
   env.secrets.stage = async secret => {
     const ref = await stage(secret);
@@ -1464,7 +1464,7 @@ for (const method of ['direct', 'device', 'mediated'] as const) test(`${method} 
   const restart = createClientAuth(env.options), recovered = await restart.recover();
   assert.deepEqual(recovered.map(result => [result.operationId, result.status]), [[operationId, 'completed']]);
   const count = exchanges(env.company);
-  assert.equal((await restart.authorizedFetch(connection.id, conversations(env.company), await restart.target(connection.id), ['poppy:read'])).status, 200);
+  assert.equal((await restart.authorizedFetch(connection.id, conversations(env.company), await restart.target(connection.id), ['orders:read'])).status, 200);
   assert.equal(exchanges(env.company), count + 1, 'durable Account Token renews vanished memory token');
 });
 
@@ -1473,7 +1473,7 @@ test('Mediated cancel while awaiting trusted input prevents credential dispatch 
   const ready = new Promise<string>(resolve => { requested = resolve; });
   env.options.trustedInput = { collect: async request => { requested(request.operationId); return new Promise<Record<string,string>>(resolve => { deliver = resolve; }); } };
   const auth = createClientAuth(env.options), { connection } = await auth.start(env.company.domain);
-  const active = auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['poppy:read'] }), operationId = await ready;
+  const active = auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['orders:read'] }), operationId = await ready;
   assert.equal((await auth.cancelSignIn(operationId)).status, 'cancelled');
   const credentials = { password: 'must-not-send' }; expectValue(deliver)(credentials);
   assert.equal((await active).outcome.status, 'cancelled'); assert.deepEqual(credentials, {});
@@ -1487,7 +1487,7 @@ for (const body of ['<html>rate limited</html>', '{"error":"invalid_grant"}']) t
     const result = await handle(request, options);
     return request.url === `${env.company.issuer}/sign-in` ? new Response(body, { status: body.startsWith('<') ? 429 : 503, headers: { 'retry-after': '7200' } }) : result;
   };
-  const { outcome } = await auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['poppy:read'] });
+  const { outcome } = await auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['orders:read'] });
   assert.equal(outcome.status, body.startsWith('<') ? 'failed' : 'uncertain');
   env.company.handle = handle; env.clock.t += 3600000;
   await assert.rejects(createClientAuth(env.options).renew(connection.id), error => error instanceof AuthFailure && error.code === 'rate_limited' && error.retryAfterMs === 3600000);
@@ -1497,7 +1497,7 @@ test('Mediated rejects cross-operation challenge substitution and redacts thrown
   const env = await setup({ method: 'mediated' }); env.company.signInBehavior.codeRequired = true;
   env.options.trustedInput = { collect: async ({ challenge }):Promise<Record<string,string>> => challenge ? { code: 'wrong' } : { password: 'private-password' } };
   const auth = createClientAuth(env.options), { connection } = await auth.start(env.company.domain);
-  const first = await auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['poppy:read'] }), handle = env.company.handle;
+  const first = await auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['orders:read'] }), handle = env.company.handle;
   env.company.handle = async (request, options) => {
     const result = await handle(request, options);
     if (!request.url.includes('/sign-in/')) return result;
@@ -1505,14 +1505,14 @@ test('Mediated rejects cross-operation challenge substitution and redacts thrown
   };
   assert.equal((await auth.continueSignIn(first.outcome.operationId)).error, 'invalid_response');
   expectValue(env.options.trustedInput).collect = async () => { throw new Error('password-must-not-escape'); };
-  const failed = await auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['poppy:read'] });
+  const failed = await auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['orders:read'] });
   assert.equal(failed.outcome.error, 'input_unavailable'); assert.equal(JSON.stringify(failed).includes('password-must-not-escape'), false);
 });
 
 test('Direct rejects insecure, cross-domain and response-parameter registered callbacks before creating work', async () => {
   const env = await setup(), { connection } = await env.auth.start(env.company.domain), count = Object.keys(env.store.raw.operations).length;
   for (const redirectUri of ['http://agent.test/cb', 'https://user@agent.test/cb', 'https://sub.agent.test/cb', 'https://agent.test/cb#fragment', 'https://agent.test/cb?state=reserved']) {
-    await assert.rejects(createClientAuth({ ...env.options, redirectUris: [redirectUri] }).beginSignIn(connection.id, { scopes: ['poppy:read'], redirectUri, browserBinding: BROWSER }), code('invalid_redirect'));
+    await assert.rejects(createClientAuth({ ...env.options, redirectUris: [redirectUri] }).beginSignIn(connection.id, { scopes: ['orders:read'], redirectUri, browserBinding: BROWSER }), code('invalid_redirect'));
   }
   assert.equal(Object.keys(env.store.raw.operations).length, count);
 });
@@ -1520,8 +1520,8 @@ test('Direct rejects insecure, cross-domain and response-parameter registered ca
 test('existing connection metadata is refreshed, but changed saved endpoints never receive credentials', async () => {
   const env = await setup(), { connection } = await env.auth.start(env.company.domain), resolve = env.options.metadata.resolveCompany;
   const before = structuredClone(env.store.raw.connections[connection.id]);
-  env.options.metadata.resolveCompany = async domain => { const fresh = structuredClone(await resolve(domain)); expectValue(expectValue(fresh.document.auth).direct).scopes = ['poppy:write']; return fresh; };
-  assert.deepEqual((await env.auth.authorization(connection.id, ['poppy:write'])).methods[0].scopes, ['poppy:write']);
+  env.options.metadata.resolveCompany = async domain => { const fresh = structuredClone(await resolve(domain)); expectValue(fresh.authorization).scopes_supported = ['orders:write']; return fresh; };
+  assert.deepEqual((await env.auth.authorization(connection.id, ['orders:write'])).methods[0].scopes, ['orders:write']);
   env.options.metadata.resolveCompany = async domain => { const fresh = structuredClone(await resolve(domain)); expectValue(fresh.authorization).token_endpoint += '/new'; return fresh; };
   const count = exchanges(env.company);
   await assert.rejects(env.auth.renew(connection.id), code('metadata_changed'));
@@ -1578,8 +1578,8 @@ test('provider freshness tolerates bounded clock skew and classifies failures in
 
 test('a narrow Session Token renews from a sufficient grant without another sign-in', async () => {
   const { auth, company, id, target } = await signedIn();
-  await auth.renew(id, { scopes: ['poppy:read'] });
-  assert.equal((await auth.authorizedFetch(id, conversations(company), target, ['poppy:write'])).status, 200);
+  await auth.renew(id, { scopes: ['orders:read'] });
+  assert.equal((await auth.authorizedFetch(id, conversations(company), target, ['orders:write'])).status, 200);
 });
 
 for (const method of ['direct', 'device', 'mediated'] as const) test(`${method} cancellation during remote exchange fences late grant into durable cleanup`, async () => {
@@ -1587,8 +1587,8 @@ for (const method of ['direct', 'device', 'mediated'] as const) test(`${method} 
   const auth = createClientAuth(env.options), { connection } = await auth.start(env.company.domain);
   let operationId!:string, run!:()=>Promise<AuthOutcome>;
   if (method === 'direct') { const begun = await beginAndApprove(auth, env.company, connection.id); operationId = begun.begun.operationId; run = () => auth.completeSignIn({ callbackUrl: begun.callbackUrl, browserBinding: BROWSER }); }
-  else if (method === 'device') { const begun = await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] }); operationId = begun.outcome.operationId; env.clock.t += 5000; run = () => auth.continueSignIn(operationId); }
-  else run = async () => (await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] })).outcome;
+  else if (method === 'device') { const begun = await auth.beginSignIn(connection.id, { method, scopes: ['orders:read'] }); operationId = begun.outcome.operationId; env.clock.t += 5000; run = () => auth.continueSignIn(operationId); }
+  else run = async () => (await auth.beginSignIn(connection.id, { method, scopes: ['orders:read'] })).outcome;
   const handle = env.company.handle; let deliver!:()=>void,waiting!:()=>void; const ready = new Promise<void>(resolve => { waiting = resolve; });
   env.company.handle = async (request, options) => {
     const response = await handle(request, options);
@@ -1612,9 +1612,9 @@ test('Device rejects phishing links before exposing codes and persists a server 
     if (request.url !== `${env.company.issuer}/device`) return result;
     const body = await result.json(); body.verification_uri = 'https://unrelated.test/approve'; return new Response(JSON.stringify(body));
   };
-  const denied = await env.auth.beginSignIn(connection.id, { method: 'device', scopes: ['poppy:read'] }); assert.equal(denied.device, undefined);
+  const denied = await env.auth.beginSignIn(connection.id, { method: 'device', scopes: ['orders:read'] }); assert.equal(denied.device, undefined);
   env.company.handle = handle;
-  const { outcome } = await env.auth.beginSignIn(connection.id, { method: 'device', scopes: ['poppy:read'] }); env.clock.t += 5000;
+  const { outcome } = await env.auth.beginSignIn(connection.id, { method: 'device', scopes: ['orders:read'] }); env.clock.t += 5000;
   env.company.handle = async (request, options) => request.url === env.company.tokenEndpoint ? new Response('HTML', { status: 429, headers: { 'retry-after': '7200' } }) : handle(request, options);
   assert.equal((await env.auth.continueSignIn(outcome.operationId)).retryAfterMs, 7200000);
   const count = exchanges(env.company); env.clock.t += 1000;
@@ -1628,8 +1628,8 @@ for (const method of ['device', 'mediated'] as const) test(`${method} cancellati
   env.company.signInBehavior.codeRequired = true; env.company.signInBehavior.status = 'authorization_pending';
   const auth = createClientAuth(env.options), { connection } = await auth.start(env.company.domain);
   let operationId!:string,run!:()=>Promise<AuthOutcome>;
-  if (method === 'device') { const begun = await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] }); operationId = begun.outcome.operationId; env.clock.t += 5000; run = () => auth.continueSignIn(operationId); }
-  else run = async () => (await auth.beginSignIn(connection.id, { method, scopes: ['poppy:read'] })).outcome;
+  if (method === 'device') { const begun = await auth.beginSignIn(connection.id, { method, scopes: ['orders:read'] }); operationId = begun.outcome.operationId; env.clock.t += 5000; run = () => auth.continueSignIn(operationId); }
+  else run = async () => (await auth.beginSignIn(connection.id, { method, scopes: ['orders:read'] })).outcome;
   const handle = env.company.handle; let deliver!:()=>void,waiting!:()=>void; const ready = new Promise<void>(resolve => { waiting = resolve; });
   env.company.handle = async (request, options) => {
     const response = await handle(request, options);
@@ -1657,7 +1657,7 @@ test('canceling Device authorization disposes its late device code and exposes n
     }
     return response;
   };
-  const active = env.auth.beginSignIn(connection.id, { method: 'device', scopes: ['poppy:read'] }); await ready;
+  const active = env.auth.beginSignIn(connection.id, { method: 'device', scopes: ['orders:read'] }); await ready;
   await env.auth.cancelSignIn(expectValue(operationId)); expectValue(deliver)(); const result = await active;
   assert.equal(result.outcome.status, 'cancelled'); assert.equal(result.device, undefined);
   assert.equal([...env.secrets.map.values()].some(value => env.company.devices.has(value)), false);
@@ -1668,7 +1668,7 @@ test('Mediated one-time code approval resumes after restart without resending cr
   env.company.signInBehavior.codeRequired = true;
   env.options.trustedInput = { collect: async (request):Promise<Record<string,string>> => { prompts.push(request); return request.challenge ? { code: '123456' } : { password: 'private-password' }; } };
   const auth = createClientAuth(env.options), { connection } = await auth.start(env.company.domain);
-  const { outcome } = await auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['poppy:read'] });
+  const { outcome } = await auth.beginSignIn(connection.id, { method: 'mediated', scopes: ['orders:read'] });
   assert.equal(outcome.status, 'pending');
   assert.equal((await createClientAuth(env.options).continueSignIn(outcome.operationId)).status, 'completed');
   assert.deepEqual(prompts.map(prompt => prompt.fields.map(field => field.name)), [['password'], ['code']]);
@@ -1734,8 +1734,8 @@ test('real auth lifecycle selects streaming, cancels nonce failures and sends fr
 });
 for(const method of ['device','mediated'] as const)test(`conversation errors use real ${method}-only authorization lifecycle`,async()=>{
   const env=await setup({method});env.options.trustedInput={collect:async()=>({password:'private-password'})};const auth=createClientAuth(env.options),{connection}=await auth.start(env.company.domain),target=await auth.target(connection.id);
-  env.company.behavior.resourceHandler=(_request,bound)=>bound.account?Response.json({conversation_id:'c1',events:[],cursor:null,has_more:false,status:'idle',responder:'agent'}):Response.json({error:'sign_in_required'},{status:403,headers:{'www-authenticate':'DPoP error="sign_in_required", scope="poppy:read"'}});
+  env.company.behavior.resourceHandler=(_request,bound)=>bound.account?Response.json({conversation_id:'c1',events:[],cursor:null,has_more:false,status:'idle',responder:'agent'}):Response.json({error:'sign_in_required'},{status:403,headers:{'www-authenticate':'DPoP error="sign_in_required", scope="orders:read"'}});
   const client=createConversationClient({...target,connectionId:connection.id,store:new MemoryConversationStore(),clock:{now:()=>env.clock.t},authorizedRequest:request=>auth.authorizedFetch(connection.id,request,target),authorization:(id,scopes)=>auth.authorization(id,scopes)});
-  let error:unknown;try{await client.read('c1');}catch(value){error=value;}assert.ok(error instanceof ConversationError);const requirement=await client.authorization(error);assert.deepEqual(requirement.methods,[{method,scopes:['poppy:read','poppy:write']}]);assert.deepEqual(requirement.requiredScopes,['poppy:read']);
+  let error:unknown;try{await client.read('c1');}catch(value){error=value;}assert.ok(error instanceof ConversationError);const requirement=await client.authorization(error);assert.deepEqual(requirement.methods,[{method,scopes:['orders:read','orders:write']}]);assert.deepEqual(requirement.requiredScopes,['orders:read']);
   const begun=await auth.beginSignIn(connection.id,{method,scopes:requirement.requiredScopes});if(method==='device'){env.clock.t+=5000;await auth.continueSignIn(begun.outcome.operationId);}assert.equal((await client.read('c1')).conversation_id,'c1');
 });

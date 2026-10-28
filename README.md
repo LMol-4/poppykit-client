@@ -1,5 +1,9 @@
 # PoppyKit client
 
+Unreleased migration checkpoint (2026-10-28): discovery now targets draft 0.3.
+Authentication, conversation wire/storage and optional integrations still have
+staged migration work; this checkout is not ready to publish or deploy as 0.3.
+
 The Node 24.21.0 minimum is an owner-accepted compatibility baseline. Use a current patched Node 24 runtime where available; this minimum does not establish that older runtimes contain later security fixes. Build and release CI read `.node-version`.
 
 TypeScript SDK for [Personal Agent Protocol draft 0.2](https://personalagentprotocol.org/docs/0.2/spec):
@@ -20,7 +24,7 @@ npm install @poppykit/client
 ## Discover a company
 
 No credentials or database are needed. Replace `company.example` with a company
-publishing draft 0.2 discovery:
+publishing draft 0.3 discovery:
 
 ```js
 import { createMetadataResolver, createNodeTransport } from '@poppykit/client';
