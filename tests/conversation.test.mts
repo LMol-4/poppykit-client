@@ -195,18 +195,18 @@ test('malformed success body leaves the operation pending', async () => {
   assert.equal(expectValue((await client.operation('msg_l'))).phase, 'pending');
 });
 
-test('read drains has_more pages whole and keeps unknown events raw', async () => {
+test('read drains unknown-only pages without exposing unsupported events or losing cursors', async () => {
   const { client, server } = setup();
   const { conversation_id } = await client.start({ ...msg, id: 'msg_m' });
   const conv = server.conversations.get(conversation_id);
-  server.addEvent(conv, { type: 'x-vendor/new', payload: { secret: [1, 2, 3] } });
+  for(let i=0;i<3;i++)server.addEvent(conv, { type: 'x-vendor/new', payload: { secret: [1, 2, 3] } });
   server.addEvent(conv, { type: 'state', status: 'idle', responder: 'agent' });
   const pages = await client.drain(conversation_id);
-  assert.equal(pages.length, 2);
-  assert.deepEqual(pages.map(p => p.has_more), [true, false]);
+  assert.equal(pages.length, 3);
+  assert.deepEqual(pages.map(p => p.has_more), [true, true, false]);assert.deepEqual(pages[1].events,[],'an unknown-only page still advances its cursor');
   const events = pages.flatMap(p => p.events);
-  assert.equal(events.length, 3);
-  assert.deepEqual(events[1], { id: events[1].id, type: 'x-vendor/new', created_at: '2026-10-19T10:00:00Z', payload: { secret: [1, 2, 3] } });
+  assert.equal(events.length, 2);assert.ok(events.every(event=>event.type!=='x-vendor/new'));
+  assert.equal(pages[0].cursor,conv!.events[1].id,'wire cursor advances through the skipped event');
   assert.ok(server.log.some(l => l.includes('cursor=' + pages[0].cursor)));
 });
 
@@ -283,8 +283,8 @@ test('token errors from WWW-Authenticate are exposed; unknown company codes beco
   const challenge = (value:{status:number;header:string}) => new Response('', { status: value.status, headers: { 'www-authenticate': value.header } });
   server.hooks.failures.push(challenge({ status: 401, header: 'DPoP error="invalid_token"' }));
   await assert.rejects(client.read('cnv_1'), e => e instanceof ConversationError && e.code === 'invalid_token' && e.status === 401);
-  server.hooks.failures.push(challenge({ status: 403, header: 'DPoP error="sign_in_required"' }));
-  await assert.rejects(client.read('cnv_1'), e => e instanceof ConversationError && e.code === 'sign_in_required' && e.scope === undefined);
+  server.hooks.failures.push(challenge({ status: 401, header: 'Bearer scope="orders:read"' }));
+  await assert.rejects(client.read('cnv_1'), e => e instanceof ConversationError && e.code === 'insufficient_scope' && e.scope === 'orders:read');
   server.hooks.failures.push(challenge({ status: 403, header: 'DPoP error="insufficient_scope", scope="orders:read orders:write"' }));
   await assert.rejects(client.read('cnv_1'), e => e instanceof ConversationError && e.code === 'insufficient_scope' && e.scope === 'orders:read orders:write');
   server.hooks.failures.push(json({ error: 'x'.repeat(5000) }, 400));
@@ -668,4 +668,17 @@ test('watch backoff cancellation releases immediately and JSON fallback has its 
 test('conversation extension errors preserve bounded domain-qualified header and body details',async()=>{
   const {client,server}=setup();server.hooks.failures.push(json({error:'extension_required',extension:'example.com/gift-wrap'},403,{'www-authenticate':'DPoP error="extension_required", extension="other.example/thing"'}));
   await assert.rejects(client.read('c1'),error=>error instanceof ConversationError&&error.code==='extension_required'&&error.extensions.includes('example.com/gift-wrap')&&error.extensions.includes('other.example/thing'));
+});
+
+
+test('a successful authorization event and matching challenge accept one message without resend',async()=>{
+  const store=memoryStore();let posts=0;const event={id:'evt_auth',type:'authorization',created_at:'2026-10-19T10:00:00Z',error:'insufficient_scope',scope:'orders:read'};
+  const client=createConversationClient({endpoint:EP,issuer:'https://issuer.example',connectionId:'accepted',store,clock:{now:()=>0},authorizedRequest:async request=>{posts++;assert.equal(request.method,'POST');return json({conversation_id:'conv_accepted',events:[event],cursor:event.id,has_more:false,status:'idle',responder:'agent'},201,{'www-authenticate':'Bearer error="insufficient_scope", scope="orders:read"'});}});
+  const result=await client.start({id:'msg_accepted',author:{type:'agent'},text:'Look up the order'},{wait:0});assert.equal(posts,1);assert.deepEqual(result.events,[event]);assert.equal((await client.operation('msg_accepted'))!.phase,'accepted');
+  assert.deepEqual(await client.retry('msg_accepted'),{conversation_id:'conv_accepted',events:[event],cursor:event.id,has_more:false,status:'idle',responder:'agent'});assert.equal(posts,1,'an accepted message is never dispatched again because of its challenge');
+});
+
+test('unknown OAuth errors remain unknown rather than becoming an errorless account challenge',async()=>{
+  const client=createConversationClient({endpoint:EP,issuer:'https://issuer.example',connectionId:'unknown',store:memoryStore(),clock:{now:()=>0},authorizedRequest:async()=>new Response(null,{status:401,headers:{'www-authenticate':'Bearer error="future_error", scope="orders:read"'}})});
+  await assert.rejects(client.read('conv_unknown'),error=>error instanceof ConversationError&&error.code==='http_error');
 });

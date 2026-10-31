@@ -2,7 +2,7 @@ import type { AuthorizationRequirement } from './auth/client-auth.js';
 import { parseEventStream } from './protocol/sse.js';
 import type { ConversationEvent } from './protocol/wire.js';
 import type { ConversationStore } from './conversation-store.js';
-import { authChallenge } from './auth/challenge.js';
+import { authChallenge, schemeChallenge, dpopChallenge } from './auth/challenge.js';
 import { secureUrl, TransportError } from './network/transport.js';
 import { canonical, id as parseId, parseJson, parseConversationRequest, parseConversationState, parseEventPage, parseMessage, parseProtocolError, retryAfterMilliseconds, ValidationError } from './protocol/wire.js';
 import type { ConversationRequest, ConversationState, EventPage, Message } from './protocol/wire.js';
@@ -19,7 +19,9 @@ export interface ConversationClientState { version: 1; outbound: OutboundRecord[
 export const initialConversationClientState = (): ConversationClientState => ({ version: 1, outbound: [], consumers: [] });
 
 // Only known spec codes (7.13, 6) reach messages and callers; a company-chosen string never does.
-const knownCodes = new Set(['conversation_not_found', 'conversation_closed', 'direct_conversation_open', 'message_id_conflict', 'invalid_cursor', 'cursor_expired', 'invalid_request', 'extension_required', 'rate_limited', 'invalid_token', 'invalid_dpop_proof', 'use_dpop_nonce', 'sign_in_required', 'insufficient_scope']);
+const knownCodes = new Set(['conversation_not_found', 'conversation_closed', 'direct_conversation_open', 'message_id_conflict', 'invalid_cursor', 'cursor_expired', 'invalid_request', 'extension_required', 'rate_limited', 'invalid_token', 'invalid_dpop_proof', 'use_dpop_nonce', 'invalid_session', 'insufficient_scope']);
+const knownEvents = new Set(['message','state','authorization','user_requested','direct_opened','direct_closed']);
+const visiblePage = (page: EventPage): EventPage => ({ ...page, events: page.events.filter(event => knownEvents.has(event.type)) });
 export class ConversationError extends Error {
   constructor(readonly code: string, readonly status?: number, readonly retryAfterMs?: number, readonly scope?: string, readonly conversationId?: string, readonly extension?: string, readonly extensions: string[] = extension ? [extension] : []) { super(`Conversation ${code}`); this.name = 'ConversationError'; }
   get requiredScopes(): string[] { return this.scope?.split(' ').filter(Boolean) ?? []; }
@@ -84,7 +86,8 @@ export function createConversationClient(options: ConversationClientOptions) {
     try { body = parseJson(await responseText(response)); } catch { /* The header can carry the complete challenge. */ }
     const challenge = authChallenge(response.headers.get('www-authenticate'),body);
     const raw = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
-    let code = challenge.error ?? (typeof raw.error === 'string' && knownCodes.has(raw.error) ? raw.error : 'http_error');
+    const offered = dpopChallenge(response.headers.get('www-authenticate')) ?? schemeChallenge(response.headers.get('www-authenticate'),'Bearer');
+    let code = challenge.error ?? (response.status === 401 && offered !== undefined && offered.error === undefined ? 'insufficient_scope' : undefined) ?? (typeof raw.error === 'string' && knownCodes.has(raw.error) ? raw.error : 'http_error');
     let conversationId: string | undefined;
     try { if(challenge.conversationId)conversationId=parseId(challenge.conversationId,'conversation_id'); } catch { /* Invalid peer detail is never used as a destination. */ }
     if(code==='direct_conversation_open'&&!conversationId)code='http_error';
@@ -116,7 +119,7 @@ export function createConversationClient(options: ConversationClientOptions) {
     if (!record) throw new ConversationError('unknown_operation');
     if (record.endpoint !== endpoint) throw new ConversationError('invalid_target');
     if (record.phase === 'accepted') {
-      try { return record.response && 'events' in record.response ? parseEventPage(record.response, record.read?.cursor) : parseConversationState(record.response); }
+      try { return record.response && 'events' in record.response ? visiblePage(parseEventPage(record.response, record.read?.cursor)) : parseConversationState(record.response); }
       catch { throw new ConversationError('stored_operation_reset_required'); }
     }
     if (record.phase === 'rejected') throw new ConversationError(record.error!.code, record.error!.status, undefined, undefined, record.error!.conversationId);
@@ -135,7 +138,7 @@ export function createConversationClient(options: ConversationClientOptions) {
         state = body && typeof body === 'object' && ['events', 'cursor', 'has_more'].some(key => key in body) ? parseEventPage(body, record.read?.cursor) : parseConversationState(body);
       } catch { throw new ConversationError('invalid_response', response.status); }
       await store.settleOutbound(key, id, { phase: 'accepted', response: state });
-      return state;
+      return 'events' in state ? visiblePage(state as EventPage) : state;
     }
     const error = await failure(response);
     // direct_conversation_open lasts only until the Direct Conversation closes (spec 7.10), so the same message stays retryable.
@@ -176,7 +179,6 @@ export function createConversationClient(options: ConversationClientOptions) {
       let reconnects=0, attempts=0, pages=0, recovered=false;
       const maxReconnects=opts.maxReconnects ?? 4;
       if(!Number.isSafeInteger(maxReconnects)||maxReconnects<0)throw new ConversationError('invalid_request');
-      const knownEvents = new Set(['message','state','authorization','user_requested','direct_opened','direct_closed']);
       const seen = new Set<string>(); // Bounded per watch; durable consumers ack explicitly.
       const eventAck = (event: ConversationEvent, previous: string | undefined): WatchedEvent => ({event, async ack() { if(opts.consumer!==undefined) await store.advanceCheckpoint(key,{connectionId,issuer,conversationId,name:opts.consumer,cursor:event.id},[previous]); }});
       for (;;) {
@@ -233,7 +235,7 @@ export function createConversationClient(options: ConversationClientOptions) {
       const response = await call(() => new Request(url, { method: 'GET', signal: opts.signal }));
       if (!response.ok) throw await failure(response); // cursor_expired (410) is the explicit history gap: see resetConsumer
       let page: EventPage;
-      try { page = parseEventPage(parseJson(await responseText(response)), cursor); } catch { throw new ConversationError('invalid_response', response.status); }
+      try { page = visiblePage(parseEventPage(parseJson(await responseText(response)), cursor)); } catch { throw new ConversationError('invalid_response', response.status); }
       if (opts.consumer !== undefined) delivered.set(page, { conversationId, consumer: opts.consumer, chain: [cursor] });
       return page;
     },
@@ -249,7 +251,7 @@ export function createConversationClient(options: ConversationClientOptions) {
         pages.push(page);
         if (!page.has_more) return pages;
         // has_more with no new events or an unchanged cursor can never finish.
-        if (!page.events.length || page.cursor === null || page.cursor === cursor) throw new ConversationError('invalid_response');
+        if (page.cursor === null || page.cursor === cursor) throw new ConversationError('invalid_response');
         cursor = page.cursor; chain.push(cursor);
       }
       throw new ConversationError('too_many_pages');

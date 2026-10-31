@@ -42,5 +42,5 @@ without a network service.
 Keep Account Tokens, DPoP keys and PKCE in a secure SecretStore; never expose them
 to model tools. An uncertain remote result must not be silently replayed. SQLite
 is optional/experimental and is not vault encryption. Production issuers, vaults,
-browsers and hosting require operator validation; individual extensions and
-application business workflows are outside this SDK.
+browsers and hosting require operator validation; Mediated Sign-In v1 is supported. Application business policy belongs to the host;
+see [protocol boundaries](CONFORMANCE.md).

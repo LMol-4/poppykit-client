@@ -1,92 +1,95 @@
 # Authentication lifecycle
 
-`createClientAuth` owns Direct, Device and Mediated sign-in, token renewal,
-replacement, revocation and abandoned-operation recovery. Call `recover()` on
-startup. Another live process is never interrupted; an ambiguous dispatched
-exchange is uncertain and must not be replayed.
+`createClientAuth` owns discovery, local Sessions, Direct/Device/Mediated OAuth,
+refresh rotation, revocation and abandoned-operation recovery. Call `recover()`
+on startup. A dispatched exchange with an ambiguous result is never replayed.
 
-Each `start` creates a new Session Key; only the issuer-specific User ID is reused.
-Renewal uses that Session Key. `Connection.sessionId` remains a local identifier
-for the key's lifetime, not the company's internal Session ID. Token requests
-carry no `session_id`, and token responses need neither it nor `signed_in`.
-The grant determines sign-in state. Omitted signed-in scope inherits the request's
-scope context; an explicit response can narrow it but cannot expand it.
+`start(domain)` creates a random Session ID and a pairwise User ID for the verified
+Company identifier: its issuer, or `https://{organization.domain}` when issuerless.
+The User ID is stable across Sessions. No token request is needed to start or use
+a signed-out Session. Changing the Company identifier never transfers its identity,
+grants or pending work. Domain discovery errors do not establish an issuerless Company.
 
-After a refresh returns definite `invalid_grant`, the client diagnoses the Session
-with a signed-out assertion before discarding the Account Token. A live Session
-means the Account Token is unusable. An ended key is retired durably before a fresh
-key attempts replacement. Ambiguous refresh responses remain uncertain and are
-never resent. Sign-out still disconnects locally before remote cleanup.
+Every protected request gets a fresh ES256 `Poppy-Session` JWT, bound to its final
+method, URL without query/fragment, Company identifier and Session/User identity.
+A private delegated key and root-signed `pap-delegation+jwt` vouch for the request;
+the root key does not sign Session JWTs directly. Delegated keys are private to one
+User ID at one Company. A token-bearing request also binds the token with `ath`.
+OAuth endpoints receive client assertions and optional DPoP, without a Session JWT.
 
-Discovery accepts only draft 0.3, checks the final well-known path (including
-cache revalidation), exact issuer and reciprocal `protected_resources`.
-`signInMethods(metadata)` derives Direct/Device from issuer grants and endpoints
-and uses `scopes_supported`; Mediated keeps `auth.mediated.scopes`. Company scope
-names cannot start with `poppy:`. Descriptions come from `auth.scopes` or a listed
-OpenAPI document. Prefer Direct when the user can receive its callback; Device is
-for appropriate device-flow situations. No sign-in method is user consent.
+OAuth account grants are independent of Sessions. To reuse one explicitly:
 
-Ask `authorization(connectionId, scopes)` for the current grant, missing scopes
-and advertised methods, with `scopeDescriptions` from `auth.scopes`. Choose a method explicitly in `beginSignIn`. Direct
-requires a registered HTTPS callback on the client domain, or an RFC 8252 HTTP
-loopback IP callback (`127.0.0.1` or `[::1]`), and an authenticated browser binding.
-Only a loopback registration's port may vary; callback completion and code exchange
-use the exact port selected at initiation. Metadata/network endpoint address
-protections do not change. The URL's `dpop_jkt` binds the code to this Session Key.
-Display its URL in the user's browser. Device returns a checked link/code and
-company identity; call `continueSignIn(operationId)` when its deadline is due.
-Do not automate user approval. Mediated calls the configured `TrustedInput`
-adapter for declared fields and correlated one-time codes. Only trusted UI code
-implements this adapter. Values are cleared after each submission and never
-persisted by the SDK or exposed in public results. Input adapters must not log
-values, keep copies, or return them through model tools.
+```ts
+const other = await auth.start(domain, { accountFrom: signedInConnectionId });
+```
 
-Direct callbacks accept OAuth error details and ignore unknown response fields.
-The registered origin/path/query, browser binding, state and exact issuer still
-have to match; duplicate recognized fields and a simultaneous code/error fail.
-Error descriptions and error URLs are never included in public auth outcomes.
+The source must belong to the same local user/client namespace and Company, be
+regular rather than anonymous, and have an active grant. The new Session has its
+own sid and signing keys. Refresh rotation is serialized on the shared grant;
+ambiguous rotation stops every Session using it. A definite `invalid_grant` clears
+the shared grant and continues those Sessions signed out.
 
-First-time partial grants complete with `grantedScopes` and `missingScopes`.
-Replacement preserves every old grant scope by default. An explicit
-`requiredExistingScopes` subset permits dropping other old scopes. A rejected
-replacement retains the previous grant and queues the new token for revocation;
-accepted replacements queue the previous token instead. Grants are never unioned.
-`force: true` represents an explicit user request to sign in again. Otherwise a
-sufficient current grant is reused. Run `retryCleanup` to retry durable retirement.
+Use `authorization(id, scopes)` for current granted/missing scopes and eligible
+methods. Scopes may be documented outside `scopes_supported`; hints and descriptions
+do not authorize anything. Direct requires a registered callback, high-entropy
+browser binding, PKCE and exact callback `iss`. HTTPS callbacks stay on the client
+metadata domain; RFC 8252 loopback IP callbacks permit only the port to vary.
+The `dpop_jkt` is an OAuth proof-key binding, not the Poppy Session identifier.
 
-Metadata is refreshed through the supplied resolver. A changed exact issuer or
-saved destination fails with `metadata_changed`; start a new connection after
-reviewing the new metadata. Saved work is never rerouted. Server Retry-After
-deadlines are persisted as absolute decimal milliseconds, including enormous
-values, and survive restarts without a local delay cap.
+Direct and Device are for the human's own sign-in and consent. Show the checked
+Device link and code; keep the private device code out of model context. Never
+complete the approval page for the User. Prefer Direct where viable, then Device.
+Mediated v1 is transitional: the `mediated-sign-in` extension declares trusted
+credential fields/scopes, and the issuer's token endpoint accepts
+`https://personalagentprotocol.org/grant/mediated-sign-in` as a form grant.
+Continuation sends `sign_in_id` and `one_time_code`, without original credentials
+or scope. `TrustedInput` runs outside model tools and must not retain/log values.
+The SDK clears supplied credential/code objects on exit and persists neither.
 
-`start(domain, { anonymous: true })` uses a fresh identity and DPoP key. Ending
-it deletes that private key and local identity; sign-in starts a new regular
-connection/session. Consume the returned connection ID and do not transfer old
-conversations. Regular issuer identity remains stable and separate.
+Successful fresh sign-in activates a new sid, preventing account mixing even after
+sign-out. Failed replacement preserves the previous sid and grant. Partial grants
+report granted/missing scopes. Replacement preserves old required scopes unless
+`requiredExistingScopes` explicitly narrows that requirement; grants are not unioned.
+An old refresh grant is retired when no other local Session still references it.
+Accepting a newer grant does not expand a browser cookie's approved scopes.
 
-Provider adapters implement J1's `AssertionProvider` and `ProviderIdentity`;
-their authenticated identity supplies the issuer-specific UserID. Only purpose,
-issuer and operation binding are passed for assertions, never arbitrary bytes
-or claims. The operator must publish the signing key. For anonymous sessions a
-separate local `IdentitySigner` is required and its key must also be published in
-the client's JWKS. A provider-only configuration reports `anonymous_unavailable`;
-it never substitutes the provider's stable identity for an anonymous one.
+Access requests use the response's Bearer or DPoP scheme. Missing `expires_in` uses
+a conservative local 60-second lifetime. Missing rotated `refresh_token` retains
+the existing one. Resource metadata selects narrower API/conversation/MCP tokens;
+see [INTEGRATIONS.md](INTEGRATIONS.md). A repeated `invalid_session` restarts once
+with a new sid and fresh signatures, then stops. Feedback replaces a definitely
+ended sid but returns the failed POST without replay; an explicit later report
+uses the new Session. Browser authorization can restart once before one code-only
+browser submission. Session restart does not replay
+an uncertain OAuth exchange or discard an otherwise valid account grant.
 
-Provider `expiresAt` values are Unix seconds. Session/client assertions and browser
-joins accept a local freshness horizon of 60 seconds plus 30 seconds of clock skew;
-an assertion at or before the local current time is rejected. This freshness check
-does not verify the signed assertion's lifetime: the issuer verifies the signature,
-claims, replay and protocol maximum of five minutes between `iat` and `exp`.
-`provider_clock_skew` and `provider_assertion_expired` suggest checking automatic
-date/time and retrying. `provider_invalid_response`, `provider_unauthorized`,
-`provider_rate_limited` and `provider_network_error` distinguish malformed data,
-enrollment rejection, throttling and connectivity. Unknown failures remain
-`provider_unavailable`. Errors never include assertion or provider response text.
+`signOut(id)` revokes every locally held refresh grant for that local User and
+Company, clears their access credentials and continues regular Sessions signed out.
+OAuth does not reveal a standard opaque account identifier, so this conservative
+policy also signs out other accounts for that User at the same Company. Cleanup
+references survive remote/vault failures; call `retryCleanup(id)`. A pending or
+uncertain outcome is never reported as complete. Re-sign-in requires a User request.
 
-Account Tokens, device codes, PKCE and DPoP keys belong in the configured
-SecretStore; Session Tokens stay in memory. SQLite and secret storage are separate
-commit boundaries. A host must sweep orphan staged secrets only after checking
-ownership and a grace period; crashes between stage and durable reference can
-leave such orphans. Cancellation/revocation generation checks defeat late results.
-Revocation stops future protected work and never automatically reconnects.
+`start(domain, { anonymous: true })` gets a fresh User ID, sid and private keys.
+It never carries an account token. Sign-in ends it and starts a regular connection;
+use the returned connection ID. Ending anonymous browsing deletes its local private
+identity/key material, with durable cleanup references if deletion fails.
+
+`AssertionProvider.assert` supplies constrained client authentication;
+`delegate({operationId,jwk})` supplies a delegation for a locally generated public
+key. `ProviderIdentity` supplies the authenticated Company-specific identity.
+The optional bundled provider uses separate enrolled client identities; see
+[PROVIDER.md](PROVIDER.md). A provider-only configuration cannot substitute its
+regular identity for anonymous browsing. ES256 is supported directly; a host using
+blind PS384 root signatures supplies its own assertion/delegation adapter and
+protects cross-user isolation. Blind signing is not implemented by the bundled provider.
+
+Private keys, refresh tokens, device codes and PKCE belong in the host SecretStore;
+access tokens remain in process memory. The store and vault are separate commit
+boundaries: sweep orphan staged secrets only after ownership checks and a grace
+period. Preserve uncertain requests and cleanup references. See [STORAGE.md](STORAGE.md)
+for record upgrades and [DELIVERY.md](DELIVERY.md) for operator-signature integration.
+
+Delegations use coarse half-hour issuance buckets with a one-hour signed lifetime,
+leaving 30–60 minutes at creation. Host providers may return a different valid
+lifetime within the client's one-hour freshness bound. See [CONFORMANCE.md](CONFORMANCE.md).

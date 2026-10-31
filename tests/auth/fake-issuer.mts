@@ -20,28 +20,28 @@ function proofClaims(value: unknown): asserts value is ProofClaims {
   for (const key of ['htm','htu','jti']) assert.ok(key in value && typeof Reflect.get(value,key) === 'string');
   assert.ok('iat' in value && typeof value.iat === 'number');
 }
-interface Session { sub: string; account: string | null | undefined; expires: number; family?: string | null }
+interface Session { agentId?: string; sub: string; account: string | null | undefined; expires: number; family?: string | null }
 interface Grant { family: string; sub: string; account: string | undefined; scopes: string[]; revoked: boolean; rotated: boolean }
-interface Bound { jkt: string; sessionId: string; sub: string; resource: string | null; expires: number; account?: string; scopes?: string[]; family?: string }
+interface SessionClaims { iss:string;aud:string;sid:string;sub:string;agent_id?:string;htm:string;htu:string;iat:number;jti:string;ath?:string }
+interface Bound { tokenType?:'Bearer'|'DPoP'; jkt: string; sessionId: string; sub: string; resource: string | null; expires: number; account?: string; scopes?: string[]; family?: string }
 interface Code { sessionKey: string; redirectUri: string; challenge: string; scopes: string[]; account: string | undefined; resource: string | null; used: boolean }
 interface FakeOptions { name?: string; jwks: { keys: JWK[] }; clientId: string; now(): number; issuerPath?: string; redirectUris?: string[]; directScopes?: string[]; conversationResource?: string; method?: string }
 export interface FakeCompany {
  domain: string; issuer: string; tokenEndpoint: string; endpoint: string; authorizationEndpoint: string;
- codes: Map<string | null, Code>; grants: Map<string | null, Grant>; sessions: Map<string | null, Session>; sessionKeys: Map<string,string>; tokens: Map<string | null | undefined, Bound>;
+ codes: Map<string | null, Code>; grants: Map<string | null, Grant>; sessions: Map<string | null, Session>; sessionKeys: Map<string,string>; sessionRequests:{header:ProtectedHeaderParameters;payload:SessionClaims}[]; tokens: Map<string | null | undefined, Bound>;
  behavior: { requireNonce: boolean; rotateNonceEveryTime: boolean; tokenOverride: Record<string, unknown> | null; tokenError: {status:number;body:unknown} | null; resourceHandler: ((request:Request,bound:Bound)=>Response|Promise<Response>) | null; rotate: boolean; revokeStatus: number };
  revocations: {token:string|null;hint:string|null;dpop:boolean}[];
  requests: {url:string;method:string;mode?:'endpoint'|'discovery';authorization:string|null}[];
  assertions: {kind:string;header:ProtectedHeaderParameters;payload:AssertionClaims}[];
  proofs: {header:ProtectedHeaderParameters & {jwk:JWK};payload:ProofClaims;thumbprint:string}[];
  seenAssertionJti: Set<string>; seenProofJti: Set<string>; nonce: string | null;
- devices: Map<string|null,{scopes:string[];used:boolean;sessionKey?:string}>; challenges: Map<string,{sessionId:string;scopes:string[]}>;
+ devices: Map<string|null,{scopes:string[];used:boolean;sessionKey?:string}>; challenges: Map<string,{clientId:string;scopes:string[];resource:string|null;expires:number}>;
  signInBehavior: {status:string;scopes:string[];account:string;code:string;codeRequired:boolean;attempts:number};
  verifyAssertion(jwt:string|null,kind:string):Promise<AssertionClaims>;
  authorize(url:string,input:{account?:string;approve?:string[]|null;deny?:boolean}):string;
  handle(request:Request,options?:Options):Promise<Response>;
 }
 
-const JWT_BEARER = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
 const CLIENT_ASSERTION = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
 const sha256 = (text: string) => createHash('sha256').update(text).digest('base64url');
 class Reject extends Error { constructor(readonly status:number, readonly error:string, readonly headers:Record<string,string> = {}) { super(error); } }
@@ -61,21 +61,12 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     behavior: { requireNonce: false, rotateNonceEveryTime: false, tokenOverride: null, tokenError: null, resourceHandler: null, rotate: true, revokeStatus: 200 },
     revocations: [],
     requests: [], assertions: [], proofs: [],
-    sessions: new Map(), sessionKeys: new Map(), tokens: new Map(), seenAssertionJti: new Set(), seenProofJti: new Set(), nonce: null,
+    sessions: new Map(), sessionKeys: new Map(), sessionRequests: [], tokens: new Map(), seenAssertionJti: new Set(), seenProofJti: new Set(), nonce: null,
     devices: new Map(), challenges: new Map(), signInBehavior: { status: 'approved', scopes: directScopes, account: 'acct_1', code: '123456', codeRequired: false, attempts: 0 },
     verifyAssertion: async()=>{throw new Error('uninitialized assertion verifier');}, authorize:()=>{throw new Error('uninitialized authorization');}, handle:async()=>{throw new Error('uninitialized handler');},
   };
   const seconds = () => Math.floor(now() / 1000);
   const newNonce = () => (company.nonce = `n-${randomUUID()}`);
-  // A live Session for this User, or invalid_session (spec 4.2, 4.8); issuing a token for it keeps it alive.
-  const liveSession = (sessionId:string|null, sub?:string) => {
-    const session = company.sessions.get(sessionId);
-    if (!session || session.expires <= now() || (sub !== undefined && session.sub !== sub)) throw new Reject(400, 'invalid_grant');
-    session.expires = now() + SESSION_IDLE_MS;
-    return session;
-  };
-  const newSession = (sub:string, jkt:string, account:string|null = null) => { const id = `ses_${randomUUID()}`; company.sessions.set(id, { sub, account, expires: now() + SESSION_IDLE_MS }); company.sessionKeys.set(jkt,id); return id; };
-
   // Verifies a client or session assertion; aud is compared character for character with the issuer.
   company.verifyAssertion = async (jwt, kind) => {
     let header: ProtectedHeaderParameters; let payload: unknown;
@@ -141,23 +132,18 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
 
   async function exchangeCode(request:Request, form:URLSearchParams) {
     await company.verifyAssertion(form.get('client_assertion'), 'client');
-    const jkt = await verifyProof(request);
+    const jkt = request.headers.has('dpop') ? await verifyProof(request) : '';
     const grant = company.codes.get(form.get('code'));
     if (!grant || grant.used || grant.sessionKey !== jkt) throw new Reject(400, 'invalid_grant');
     grant.used = true;
     if (form.get('redirect_uri') !== grant.redirectUri || sha256(form.get('code_verifier') ?? '') !== grant.challenge || form.get('resource') !== grant.resource) throw new Reject(400, 'invalid_grant');
-    return issueSignedIn(company.sessionKeys.get(jkt) ?? null, jkt, grant.account, grant.scopes, grant.resource);
+    return issueSignedIn(jkt, grant.account, grant.scopes, grant.resource);
   }
-  function issueSignedIn(sessionId:string|null,jkt:string,account:string|undefined,scopes:string[],resource:string|null) {
-    const session = liveSession(sessionId);
-    // A Session remembers its account forever (spec 4.4).
-    if (session.account && session.account !== account) throw new Reject(400, 'account_mismatch');
-    session.account = account;
+  function issueSignedIn(jkt:string,account:string|undefined,scopes:string[],resource:string|null) {
     const refreshToken = `pat_${randomUUID()}`, accessToken = `tok_${randomUUID()}`;
-    company.grants.set(refreshToken, { family: refreshToken, sub: session.sub, account, scopes, revoked: false, rotated: false });
-    session.family = refreshToken;
-    company.tokens.set(accessToken, { jkt, sessionId:sessionId!, sub: session.sub, account, scopes, resource, family: refreshToken, expires: now() + 3600_000 });
-    return json(200, { access_token: accessToken, token_type: 'DPoP', expires_in: 3600, refresh_token: refreshToken, refresh_token_expires_in: 2592000, scope: scopes.join(' '), ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });
+    company.grants.set(refreshToken, { family: refreshToken, sub:'', account, scopes, revoked: false, rotated: false });
+    company.tokens.set(accessToken, { jkt, sessionId:'', sub:'', account, scopes, resource, family: refreshToken, expires: now() + 3600_000, tokenType:jkt?'DPoP':'Bearer' });
+    return json(200, { access_token: accessToken, token_type: jkt?'DPoP':'Bearer', expires_in: 3600, refresh_token: refreshToken, refresh_token_expires_in: 2592000, scope: scopes.join(' '), ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });
   }
 
   // Revoking a grant signs out every Session signed in with it; they continue signed out (spec 4.9).
@@ -170,25 +156,21 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
   // Account Token refresh (spec 4.8), rotating on success; without session_id it starts a new signed-in Session; presenting an already-rotated token is reuse and revokes the whole grant (RFC 9700 4.14.2).
   async function refresh(request:Request,form:URLSearchParams) {
     await company.verifyAssertion(form.get('client_assertion'), 'client');
-    const jkt = await verifyProof(request);
+    const jkt = request.headers.has('dpop') ? await verifyProof(request) : '';
     const presented = form.get('refresh_token');
     const grant = company.grants.get(presented);
     if (!grant || grant.revoked) throw new Reject(400, 'invalid_grant');
     if (grant.rotated) { revokeFamily(grant.family); throw new Reject(400, 'invalid_grant'); }
-    const sessionId = company.sessionKeys.get(jkt) ?? newSession(grant.sub, jkt, grant.account);
-    const session = liveSession(sessionId, grant.sub);
-    if (session.account && session.account !== grant.account) throw new Reject(400, 'account_mismatch');
     const scopes = form.has('scope') ? (form.get('scope')??'').split(' ') : grant.scopes;
     if (!scopes.every(scope => grant.scopes.includes(scope))) throw new Reject(400, 'invalid_scope');
-    session.account = grant.account; session.family = grant.family;
-    const body: {token_type:string;expires_in:number;scope:string;session_id:string|null;signed_in:boolean;refresh_token?:string;access_token?:string} = { token_type: 'DPoP', expires_in: 3600, scope: scopes.join(' '), session_id: sessionId, signed_in: true };
+    const body: {token_type:string;expires_in:number;scope:string;refresh_token?:string;access_token?:string} = { token_type: jkt?'DPoP':'Bearer', expires_in: 3600, scope: scopes.join(' ') };
     if (company.behavior.rotate) {
       body.refresh_token = `pat_${randomUUID()}`;
       company.grants.set(body.refresh_token, { ...grant });
       grant.rotated = true;
     }
     body.access_token = `tok_${randomUUID()}`;
-    company.tokens.set(body.access_token, { jkt, sessionId:sessionId!, sub: session.sub, account: grant.account, scopes, resource: form.get('resource'), family: grant.family, expires: now() + 3600_000 });
+    company.tokens.set(body.access_token, { jkt, tokenType:jkt?'DPoP':'Bearer', sessionId:'', sub:'', account: grant.account, scopes, resource: form.get('resource'), family: grant.family, expires: now() + 3600_000 });
     return json(200, { ...body, ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });
   }
 
@@ -209,53 +191,74 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     if (company.behavior.tokenError) return json(company.behavior.tokenError.status, company.behavior.tokenError.body);
     const form = new URLSearchParams(await request.text());
     if (form.get('client_assertion_type') !== CLIENT_ASSERTION || form.get('client_id') !== clientId) throw new Reject(400, 'invalid_request');
-    if (form.get('grant_type') === 'urn:ietf:params:oauth:grant-type:token-exchange') {
-      await company.verifyAssertion(form.get('client_assertion'), 'client'); const jkt = await verifyProof(request);
-      const subject = company.tokens.get(form.get('subject_token'));
-      if (!subject || subject.expires <= now() || subject.jkt !== jkt) throw new Reject(400, 'invalid_grant');
-      if (form.get('subject_token_type') !== 'urn:ietf:params:oauth:token-type:access_token') throw new Reject(400, 'invalid_request');
-      const scopes = form.has('scope') ? (form.get('scope') ?? '').split(' ').filter(Boolean) : subject.scopes ?? [];
-      if (!scopes.every(scope => (subject.scopes ?? []).includes(scope))) throw new Reject(400, 'invalid_scope');
-      const access = 'exchange_' + randomUUID(); company.tokens.set(access, { ...subject, jkt: '', resource: form.get('resource') });
-      return json(200, { access_token: access, issued_token_type: 'urn:ietf:params:oauth:token-type:access_token', token_type: 'Bearer', expires_in: 3600, scope: scopes.join(' '), ...company.behavior.tokenOverride });
-    }
     if (form.get('grant_type') === 'authorization_code') return exchangeCode(request, form);
     if (form.get('grant_type') === 'urn:ietf:params:oauth:grant-type:device_code') {
-      await company.verifyAssertion(form.get('client_assertion'), 'client'); const jkt = await verifyProof(request);
+      await company.verifyAssertion(form.get('client_assertion'), 'client'); const jkt = request.headers.has('dpop') ? await verifyProof(request) : '';
       const device = company.devices.get(form.get('device_code'));
       if (!device || device.used) throw new Reject(400, 'invalid_grant');
-      if (device.sessionKey !== undefined && device.sessionKey !== jkt) throw new Reject(400, 'invalid_grant');
-      device.sessionKey ??= jkt;
       const behavior = company.signInBehavior;
       if (behavior.status !== 'approved') throw new Reject(400, behavior.status);
       device.used = true;
-      return issueSignedIn(company.sessionKeys.get(jkt) ?? null, jkt, behavior.account, behavior.scopes.filter(scope => device.scopes.includes(scope)), form.get('resource'));
+      return issueSignedIn(jkt, behavior.account, behavior.scopes.filter(scope => device.scopes.includes(scope)), form.get('resource'));
     }
     if (form.get('grant_type') === 'refresh_token') return refresh(request, form);
-    if (form.get('grant_type') !== JWT_BEARER) throw new Reject(400, 'unsupported_grant_type');
-    await company.verifyAssertion(form.get('client_assertion'), 'client');
-    const assertion = await company.verifyAssertion(form.get('assertion'), 'session');
-    const jkt = await verifyProof(request);
-    let sessionId = company.sessionKeys.get(jkt);
-    if (sessionId === undefined) sessionId = newSession(assertion.sub, jkt);
-    else { const session = liveSession(sessionId, assertion.sub); if (session.family) throw new Reject(400, 'invalid_grant'); }
-    const accessToken = `tok_${randomUUID()}`;
-    company.tokens.set(accessToken, { jkt, sessionId, sub: assertion.sub, resource: form.get('resource'), expires: now() + 3600_000 });
-    return json(200, { access_token: accessToken, token_type: 'DPoP', expires_in: 3600, ...company.behavior.tokenOverride }, { 'cache-control': 'no-store' });
+    if (form.get('grant_type') === 'https://personalagentprotocol.org/grant/mediated-sign-in') {
+      await company.verifyAssertion(form.get('client_assertion'),'client');
+      const jkt=request.headers.has('dpop')?await verifyProof(request):'',behavior=company.signInBehavior,id=form.get('sign_in_id');
+      let scopes:string[],resource:string|null;
+      if(id){
+        const challenge=company.challenges.get(id);
+        if(!challenge||challenge.clientId!==clientId)throw new Reject(400,'invalid_grant');
+        if(challenge.expires<=now())throw new Reject(400,'expired_token');
+        assert.equal(form.has('scope'),false);assert.equal(form.has('password'),false);
+        if(++behavior.attempts>=3)throw new Reject(400,'invalid_grant');
+        if(form.get('one_time_code')!==behavior.code)return json(400,{error:'code_required',sign_in_id:id,sent_to:'Your phone',expires_in:Math.ceil((challenge.expires-now())/1000)});
+        scopes=challenge.scopes;resource=challenge.resource;company.challenges.delete(id);
+      }else{
+        if(!form.get('password')||behavior.status==='access_denied')throw new Reject(400,'invalid_grant');
+        scopes=(form.get('scope')??'').split(' ');resource=form.get('resource');
+        if(behavior.codeRequired){const id=randomUUID();company.challenges.set(id,{clientId,scopes,resource,expires:now()+60000});return json(400,{error:'code_required',sign_in_id:id,sent_to:'Your phone',expires_in:60});}
+      }
+      return issueSignedIn(jkt,behavior.account,behavior.scopes.filter(scope=>scopes.includes(scope)),resource);
+    }
+    throw new Reject(400,'unsupported_grant_type');
+  }
+
+  // This peer builds its verification independently of the SDK's Session codec.
+  async function verifySession(request:Request,token?:string):Promise<SessionClaims> {
+    try {
+      const jwt=request.headers.get('poppy-session');assert.ok(jwt);const header=decodeProtectedHeader(jwt);
+      assert.equal(header.typ,'poppy-session+jwt');assert.equal(header.alg,'ES256');assert.equal(typeof header.pap_dlg,'string');
+      const delegation=header.pap_dlg as string,delegationHeader=decodeProtectedHeader(delegation),root=jwks.keys.find(key=>key.kid===delegationHeader.kid);assert.ok(root);assert.equal(delegationHeader.typ,'pap-delegation+jwt');
+      const delegated=JSON.parse(new TextDecoder().decode((await compactVerify(delegation,await importJWK(root,'ES256'),{algorithms:['ES256']})).payload));
+      assert.equal(delegated.iss,clientId);assert.ok(delegated.exp>seconds()&&delegated.exp-delegated.iat<=86400);assert.ok(!('d' in delegated.cnf.jwk));assert.equal(header.kid,await calculateJwkThumbprint(delegated.cnf.jwk));
+      const claims=JSON.parse(new TextDecoder().decode((await compactVerify(jwt,await importJWK(delegated.cnf.jwk,'ES256'),{algorithms:['ES256']})).payload)) as SessionClaims;
+      assert.equal(claims.iss,clientId);assert.equal(claims.aud,issuer);assert.equal(claims.htm,request.method);const url=new URL(request.url);assert.equal(claims.htu,url.origin+url.pathname);assert.ok(claims.iat>=seconds()-60&&claims.iat<=seconds()+30);assert.ok(claims.iat<=delegated.exp);
+      assert.match(claims.sid,/^[A-Za-z0-9_-]{1,256}$/);assert.ok(claims.sub);assert.ok(claims.jti);
+      assert.equal(claims.ath,token===undefined?undefined:sha256(token));if(token===undefined)assert.equal('ath' in claims,false);
+      const old=company.sessions.get(claims.sid);
+      if(old){assert.ok(old.expires>now());assert.equal(old.sub,claims.sub);assert.equal(old.agentId,claims.agent_id);}
+      else company.sessions.set(claims.sid,{sub:claims.sub,agentId:claims.agent_id,account:null,expires:now()+SESSION_IDLE_MS});
+      company.sessionRequests.push({header,payload:claims});return claims;
+    }catch{throw new Reject(400,'invalid_session');}
   }
 
   async function resource(request:Request) {
-    const authorization = request.headers.get('authorization') ?? '';
-    const challenge = (error:string, headers:Record<string,string> = {}) => new Response(null, { status: 401, headers: { 'www-authenticate': `DPoP error="${error}"`, ...headers } });
-    const match = /^DPoP (\S+)$/.exec(authorization);
-    if (!match) return challenge('invalid_token');
-    const bound = company.tokens.get(match[1]);
-    if (!bound || bound.expires <= now()) return challenge('invalid_token');
-    // An entry with a resource accepts only tokens issued for it (spec 4.3).
-    if (conversationResource && bound.resource !== conversationResource) return challenge('invalid_token');
-    let jkt;
-    try { jkt = await verifyProof(request, match[1]); } catch (error) { if(!(error instanceof Reject))throw error; return challenge(error.error, error.headers); }
-    if (jkt !== bound.jkt) return challenge('invalid_dpop_proof');
+    const authorization=request.headers.get('authorization');
+    const challenge=(error:string,headers:Record<string,string>={})=>new Response(null,{status:401,headers:{'www-authenticate':`DPoP error="${error}", Bearer error="${error}"`,...headers}});
+    let credential:Bound|undefined,access:string|undefined;
+    if(authorization){
+      const match=/^(DPoP|Bearer) (\S+)$/.exec(authorization);if(!match)return challenge('invalid_token');
+      access=match[2];credential=company.tokens.get(access);if(!credential||credential.expires<=now()||(conversationResource&&credential.resource!==conversationResource))return challenge('invalid_token');
+      if(match[1]==='DPoP'){
+        let jkt;try{jkt=await verifyProof(request,access);}catch(error){if(!(error instanceof Reject))throw error;return challenge(error.error,error.headers);}
+        if(jkt!==credential.jkt)return challenge('invalid_dpop_proof');
+      }else if(credential.jkt)return challenge('invalid_token');
+    }
+    const claims=await verifySession(request,access),session=expectValue(company.sessions.get(claims.sid));
+    if(credential?.account){if(session.account&&session.account!==credential.account)throw new Reject(400,'invalid_session');session.account=credential.account;session.family=credential.family;}
+    if(credential?.jkt)company.sessionKeys.set(credential.jkt,claims.sid); // Diagnostic only; never used to identify or admit a Session.
+    const bound:Bound={jkt:credential?.jkt??'',sessionId:claims.sid,sub:claims.sub,resource:credential?.resource??null,expires:session.expires,...(credential?{account:credential.account,scopes:credential.scopes,family:credential.family}:{})};
     if (company.behavior.resourceHandler) return company.behavior.resourceHandler(request, bound);
     return json(200, { sub: bound.sub, session_id: bound.sessionId, account: bound.account ?? null, scopes: bound.scopes ?? [], method: request.method, body: await request.text() });
   }
@@ -264,34 +267,14 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
     const url = new URL(request.url);
     company.requests.push({ url: request.url, method: request.method, mode: options?.mode, authorization: request.headers.get('authorization') });
     try {
-      if (url.href === `https://${domain}/.well-known/poppy.json`) return json(200, { protocol_version: '0.3', organization: { name, domain }, auth: { issuer, scopes: Object.fromEntries(directScopes.map(scope => [scope, `Company permission ${scope}`])), ...(method === 'mediated' ? { mediated: { scopes: directScopes, endpoint: `${issuer}/sign-in`, fields: [{ name: 'password', label: 'Password', secret: true }] } } : {}) }, agent: { protocols: [{ type: 'other', endpoint: `https://api.${domain}/other` }, { type: 'poppy', endpoint, ...(conversationResource ? { resource: conversationResource } : {}) }] } });
-      if (url.href === `https://auth.${domain}/.well-known/oauth-authorization-server${issuerPath}`) return json(200, { issuer, token_endpoint: tokenEndpoint, revocation_endpoint: `${issuer}/revoke`, ...(method === 'direct' ? { authorization_endpoint: authorizationEndpoint } : {}), ...(method === 'device' ? { device_authorization_endpoint: `${issuer}/device` } : {}), protected_resources: [`https://${domain}`], grant_types_supported: ['urn:ietf:params:oauth:grant-type:jwt-bearer', 'refresh_token', ...(method === 'direct' ? ['authorization_code'] : []), ...(method === 'device' ? ['urn:ietf:params:oauth:grant-type:device_code'] : [])], scopes_supported: directScopes });
+      if (url.href === `https://${domain}/.well-known/oauth-protected-resource`) return json(200, { resource: `https://${domain}`, authorization_servers: [issuer] });
+      if (url.pathname.startsWith('/.well-known/oauth-protected-resource')) return conversationResource ? json(200,{resource:conversationResource,authorization_servers:[issuer]}) : new Response(null,{status:404});
+      if (url.href === `https://${domain}/.well-known/poppy.json`) return json(200, { protocol_version: '0.3', organization: { name, domain }, ...(method==='mediated'?{extensions:{'mediated-sign-in':{version:'1',scopes:directScopes,fields:[{name:'password',label:'Password',secret:true}]}}}:{}), auth: { issuer, scopes: Object.fromEntries(directScopes.map(scope => [scope, `Company permission ${scope}`])),  }, agent: { protocols: [{ type: 'other', endpoint: `https://api.${domain}/other` }, { type: 'poppy', endpoint, ...(conversationResource ? { resource: conversationResource } : {}) }] } });
+      if (url.href === `https://auth.${domain}/.well-known/oauth-authorization-server${issuerPath}`) return json(200, { issuer, token_endpoint: tokenEndpoint, revocation_endpoint: `${issuer}/revoke`, ...(method === 'direct' ? { authorization_endpoint: authorizationEndpoint } : {}), ...(method === 'device' ? { device_authorization_endpoint: `${issuer}/device` } : {}), protected_resources: [`https://${domain}`], dpop_signing_alg_values_supported:['ES256'],grant_types_supported: ['refresh_token',...(method==='mediated'?['https://personalagentprotocol.org/grant/mediated-sign-in']:[]), ...(method === 'direct' ? ['authorization_code'] : []), ...(method === 'device' ? ['urn:ietf:params:oauth:grant-type:device_code'] : [])], scopes_supported: directScopes });
       if (url.href === `${issuer}/device`) {
         const form = new URLSearchParams(await request.text()); await company.verifyAssertion(form.get('client_assertion'), 'client');
         const code = randomUUID(); company.devices.set(code, { scopes: expectValue(form.get('scope')).split(' '), used: false });
         return json(200, { device_code: code, user_code: 'ABCD-EFGH', verification_uri: `${issuer}/approve`, expires_in: 600, interval: 5 });
-      }
-      if (url.href === `${issuer}/sign-in` || url.href.startsWith(`${issuer}/sign-in/`)) {
-        const access = /^DPoP (\S+)$/.exec(request.headers.get('authorization') ?? '')?.[1], bound = company.tokens.get(access);
-        if (!bound) throw new Reject(401, 'invalid_token');
-        const jkt = await verifyProof(request, access); const input = await request.json(), behavior = company.signInBehavior;
-        const challengeId = url.href.split('/sign-in/')[1];
-        if (challengeId) {
-          const challenge = company.challenges.get(challengeId);
-          if (!challenge || challenge.sessionId !== bound.sessionId) throw new Reject(404, 'sign_in_not_found');
-          if (++behavior.attempts >= 3) return json(200, { status: 'failed' });
-          if (input.code !== behavior.code) return json(200, { status: 'code_required', sign_in_id: challengeId, code: { sent_to: 'Your phone' }, expires_at: new Date(now() + 60_000).toISOString() });
-        } else {
-          if (!input.credentials.password) return json(200, { status: 'failed' });
-          if (behavior.status === 'access_denied') return json(200, { status: 'failed' });
-          if (behavior.codeRequired) {
-            const id = randomUUID(); company.challenges.set(id, { sessionId: bound.sessionId, scopes: input.scope.split(' ') });
-            return json(200, { status: 'code_required', sign_in_id: id, code: { sent_to: 'Your phone' }, expires_at: new Date(now() + 60_000).toISOString() });
-          }
-        }
-        const requested = challengeId ? company.challenges.get(challengeId)!.scopes : input.scope.split(' ');
-        const result = await issueSignedIn(bound.sessionId, jkt, behavior.account, behavior.scopes.filter(scope => requested.includes(scope)), bound.resource);
-        return json(200, { status: 'complete', ...await result.json() });
       }
       if (url.href === tokenEndpoint && request.method === 'POST') return await token(request);
       if (url.href === `${issuer}/revoke` && request.method === 'POST') return await revoke(request);

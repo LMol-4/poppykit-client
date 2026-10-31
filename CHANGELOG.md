@@ -1,8 +1,18 @@
 # Changelog
 
+## Unreleased — current-spec core migration
+
+Separate delegated resource Sessions from OAuth account grants; discover issuers and
+service resources independently; support issuerless Companies, Bearer/DPoP tokens,
+current mediated grants, code-only browser joining, current errors and feedback.
+Client auth records upgrade to v3; reference issuer records upgrade to v5 without
+resetting credentials or pending/recovery records. Stop old writers before opening
+upgraded stores. Retired public APIs are removed; see [AUTH.md](AUTH.md) and
+[STORAGE.md](STORAGE.md). This checkpoint is not package-release acceptance.
+
 ## 0.5.0 — 2026-10-28
 
-Target pinned Personal Agent Protocol draft 0.3. Break discovery, Session Key/token, author, browser-controller and feedback contracts; retain explicit storage subpaths. Upgrade normalized auth state 1→2; stop old writers and reset incompatible conversation/outbox state before cutover.
+Historical snapshot of Personal Agent Protocol draft 0.3; the current live contract supersedes this entry. Break discovery, Session Key/token, author, browser-controller and feedback contracts; retain explicit storage subpaths. Upgrade normalized auth state 1→2; stop old writers and reset incompatible conversation/outbox state before cutover.
 
 Local migration candidate only. Publication and deployment require separate approval.
 

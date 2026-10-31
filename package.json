@@ -43,7 +43,8 @@
     "RELEASING.md",
     "examples",
     "LICENSE",
-    "migrations"
+    "migrations",
+    "CONFORMANCE.md"
   ],
   "exports": {
     ".": {

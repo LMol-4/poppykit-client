@@ -34,6 +34,15 @@ test('Direct custody rejects absent/malformed keys and incompatible saved callba
     await assert.rejects(f.api.takeResult(a.credential, { version: 1, installationId: 'install-a', operationId: input.operationId, issuer, sessionKey: 'k'.repeat(43) }), { code: 'binding_conflict' });
   } finally { await f.close(); }
 });
+test('Direct custody records an explicit unbound OAuth code without accepting an absent legacy binding',async()=>{
+  const f=await fixture();try{
+    const a=await f.enroll(),state=randomBytes(32).toString('base64url'),input={version:1,installationId:'install-a',operationId:'unbound',domain,issuer,purpose:'direct',state,sessionKey:null};
+    await f.api.begin(a.credential,input);const callback=`${callbackUrl}?state=${state}&iss=${encodeURIComponent(issuer)}&code=PRIVATE_UNBOUND`;await f.api.callback(callback);
+    const take={version:1,installationId:'install-a',operationId:'unbound',issuer,sessionKey:null};
+    await assert.rejects(f.api.takeResult(a.credential,{...take,sessionKey:'k'.repeat(43)}),{code:'binding_conflict'});
+    assert.equal((await f.api.takeResult(a.credential,take)).callbackUrl,callback);await assert.rejects(f.api.takeResult(a.credential,take),{code:'consumed'});
+  }finally{await f.close();}
+});
 test('HTTP decoding preserves split Unicode and rejects malformed, truncated and oversized bytes before enrollment', async () => {
   const f = await fixture();
   try {
@@ -52,9 +61,9 @@ test('HTTP decoding preserves split Unicode and rejects malformed, truncated and
     const response = await post('enroll', encode({ version: 1, installationId, idempotencyKey: 'split-utf8' }));
     assert.equal(response.status, 200); const enrollment = await response.json();
     assert.equal(calls, 1);
-    const begun = await post('begin', encode({ version: 1, installationId, operationId, domain, issuer, purpose: 'session' }), enrollment.credential);
+    const begun = await post('begin', encode({ version: 1, installationId, operationId, domain, issuer, purpose: 'client-authentication' }), enrollment.credential);
     assert.equal(begun.status, 200);
-    assert.ok((await f.api.assert(enrollment.credential, { version: 1, installationId, operationId, purpose: 'session' })).assertion);
+    assert.ok((await f.api.assert(enrollment.credential, { version: 1, installationId, operationId, purpose: 'client-authentication' })).assertion);
   } finally { await f.close(); }
 });
 test('independent HTTP success and denial callbacks ignore unknown fields while preserving recognized bindings', async () => {
@@ -162,7 +171,8 @@ test('authenticated enrollment, visitor/issuer identity and installation isolati
     await assert.rejects(f.api.enroll(new Request(clientId),{version:1,installationId:'a',idempotencyKey:'key'}),{code:'unauthorized'});
     const a=await f.enroll(), b=await f.enroll('install-b');
     const identity=(credential: string,installationId: string)=>f.api.identity(credential,{version:1,installationId,domain,issuer});
-    assert.deepEqual(await identity(a.credential,'install-a'),await identity(b.credential,'install-b'));
+    const first=await identity(a.credential,'install-a'),second=await identity(b.credential,'install-b');
+    assert.equal(first.userId,second.userId);assert.notEqual(first.clientId,second.clientId);
     await assert.rejects(identity(a.credential,'install-b'),{code:'unauthorized'});
     f.setSubject('bob');const c=await f.enroll('install-c');assert.notDeepEqual(await identity(a.credential,'install-a'),await identity(c.credential,'install-c'));
     const response=await f.api.handle(new Request('https://identity.example/v1/enroll',{method:'POST',headers:{'content-type':'application/json','x-human':'authenticated'},body:JSON.stringify({version:2,installationId:'a',idempotencyKey:'other'})}));assert.equal(response.status,409);assert.equal(response.headers.get('cache-control'),'no-store');
@@ -170,13 +180,13 @@ test('authenticated enrollment, visitor/issuer identity and installation isolati
 });
 test('constrained signing rejects claims, purposes, companies and unverified browser sessions',async()=>{
   const f=await fixture();try{
-    const a=await f.enroll(), binding={version:1,installationId:'install-a',operationId:'sign',domain,issuer,purpose:'session'};
+    const a=await f.enroll(), binding={version:1,installationId:'install-a',operationId:'sign',domain,issuer,purpose:'client-authentication'};
     for(const change of [{subject:'attacker'},{audience:'https://evil.example'},{purpose:'raw'},{issuer:'https://evil.example'},{domain:'evil.example'}])await assert.rejects(f.api.begin(a.credential,{...binding,...change}));
     await f.api.begin(a.credential,binding);
-    const result=await f.api.assert(a.credential,{version:1,installationId:'install-a',operationId:'sign',purpose:'session'});
-    const payload=decodeJwt(result.assertion);assert.equal(payload.aud,issuer);assert.equal(payload.iss,clientId);assert.equal(expectValue(payload.exp)-expectValue(payload.iat),60);assert.ok(expectValue(payload.jti).length>=22);assert.equal(decodeProtectedHeader(result.assertion).typ,'JWT');
-    await jwtVerify(result.assertion,await importJWK(await f.options.signer.publicJwk(),'ES256'),{issuer:clientId,audience:issuer,currentDate:new Date(1000000)});
-    await assert.rejects(f.api.assert(a.credential,{version:1,installationId:'install-a',operationId:'sign',purpose:'client-authentication'}),{code:'binding_conflict'});
+    const result=await f.api.assert(a.credential,{version:1,installationId:'install-a',operationId:'sign',purpose:'client-authentication'});
+    const payload=decodeJwt(result.assertion);assert.equal(payload.aud,issuer);assert.equal(payload.iss,a.clientId);assert.equal(expectValue(payload.exp)-expectValue(payload.iat),60);assert.ok(expectValue(payload.jti).length>=22);assert.equal(decodeProtectedHeader(result.assertion).typ,'client-authentication+jwt');
+    await jwtVerify(result.assertion,await importJWK(await f.options.signer.publicJwk(),'ES256'),{issuer:a.clientId,audience:issuer,currentDate:new Date(1000000)});
+    await assert.rejects(f.api.assert(a.credential,{version:1,installationId:'install-a',operationId:'sign',purpose:'session'}),{code:'binding_conflict'});
     for (const sessionId of ['other','owned']) await assert.rejects(f.api.begin(a.credential,{...binding,purpose:'browser',operationId:'browser',sessionId,returnTo:'https://company.example/'}),{code:'binding_conflict'});
     await assert.rejects(f.api.assert(a.credential,{version:1,installationId:'install-a',operationId:'sign',purpose:'browser'}),{code:'binding_conflict'});
     await assert.rejects(f.api.takeResult(a.credential,{version:1,installationId:'install-a',operationId:'sign',issuer,sessionKey:'k'.repeat(43),sessionId:null}),{code:'binding_conflict'});
@@ -247,7 +257,7 @@ test('revocation races KMS signing; issued assertions remain cryptographically v
   }finally{await f.close();}
 });
 test('bound HTTP client uses authenticated versioned handlers without raw-byte signing',async()=>{
-  const f=await fixture();try{const a=await f.enroll();const transport={fetch:(req: Request) =>f.api.handle(req)};const client=createProviderClient({url:'https://identity.example/v1',domain,installationId:'install-a',credential:async()=>a.credential,transport});assert.equal((await client.identity(issuer)).clientId,clientId);const result=await client.assert({operationId:'from-sdk',issuer,purpose:'session'});assert.equal(decodeJwt(result.assertion).aud,issuer);
+  const f=await fixture();try{const a=await f.enroll();const transport={fetch:(req: Request) =>f.api.handle(req)};const client=createProviderClient({url:'https://identity.example/v1',domain,installationId:'install-a',credential:async()=>a.credential,transport});assert.equal((await client.identity(issuer)).clientId,a.clientId);const result=await client.assert({operationId:'from-sdk',issuer,purpose:'client-authentication'});assert.equal(decodeJwt(result.assertion).aud,issuer);
     const unsafe=createProvider({...f.options,publishedKeys:async()=>[{...await f.options.signer.publicJwk(),kid:'key',d:'PRIVATE_KEY'}]});const response=await unsafe.handle(new Request('https://identity.example/jwks'));assert.equal(response.status,503);assert.ok(!(await response.text()).includes('PRIVATE_KEY'));
   }finally{await f.close();}
 });
@@ -266,7 +276,7 @@ test('authentication and policy precede metadata; malformed sessions never reach
 });
 test('tombstone flooding cannot hide quota records or ciphertext from revocation',async()=>{
   const f=await fixture();try{
-    const a=await f.enroll(),base={version:1,installationId:'install-a',domain,issuer,purpose:'session'};
+    const a=await f.enroll(),base={version:1,installationId:'install-a',domain,issuer,purpose:'client-authentication'};
     // Install retained tombstones through the same store contract to reach the hard cap quickly.
     await f.store.transaction({kind:'begin',enrollmentId:a.enrollmentId,operationId:'seed',issuer,at:1000000},tx=>{for(let i=0;i<999;i++)tx.put('operation',`${a.enrollmentId}:a${i.toString().padStart(4,'0')}`,{binding:{stateHash:null},expiresAt:1600000,status:'canceled',result:null});});
     const state=randomBytes(32).toString('base64url');await f.api.begin(a.credential,{...base,operationId:'\uffffx',purpose:'direct',sessionKey:'k'.repeat(43),sessionId:'owned',state});
@@ -303,10 +313,51 @@ test('Unicode operation IDs retain bindings, count towards quotas and clear ciph
       const started=await f.api.begin(a.credential,input);assert.deepEqual(await f.api.begin(a.credential,input),started);
       await f.api.callback(`${callbackUrl}?state=${states[i]}&iss=${encodeURIComponent(issuer)}&code=PRIVATE_UNICODE`);
     }
-    for(let i=0;i<8;i++)await f.api.begin(a.credential,{version:1,installationId:'install-a',operationId:'ascii-'+i,domain,issuer,purpose:'session'});
-    await assert.rejects(f.api.begin(a.credential,{version:1,installationId:'install-a',operationId:'overflow',domain,issuer,purpose:'session'}),{code:'rate_limited'});
+    for(let i=0;i<8;i++)await f.api.begin(a.credential,{version:1,installationId:'install-a',operationId:'ascii-'+i,domain,issuer,purpose:'client-authentication'});
+    await assert.rejects(f.api.begin(a.credential,{version:1,installationId:'install-a',operationId:'overflow',domain,issuer,purpose:'client-authentication'}),{code:'rate_limited'});
     await f.api.revokeEnrollment(a.credential,{version:1,installationId:'install-a'});
     const rows=await f.store.transaction({kind:'revoke',enrollmentId:a.enrollmentId},tx=>tx.list('operation',`${a.enrollmentId}:`,1001));
     assert.equal(rows.length,10);assert.ok(rows.every(row=>row.value.result===null&&row.value.status==='canceled'));
+  }finally{await f.close();}
+});
+
+
+test('delegations isolate enrollment clients and reject legacy, private-key and arbitrary-claim requests', async () => {
+  const f=await fixture();try {
+    const a=await f.enroll();f.setSubject('bob');const b=await f.enroll('install-b');
+    const pair=await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},true,['sign','verify']),jwk=await publicEcJwk(pair.publicKey);
+    const input={version:1,installationId:'install-a',operationId:'delegation',jwk};
+    const result=await f.api.delegate(a.credential,input),claims=decodeJwt(result.delegation);assert.equal(claims.iat!%1800,0);assert.equal(claims.exp,claims.iat!+3600);
+    assert.equal(claims.iss,a.clientId);assert.notEqual(a.clientId,b.clientId);
+    assert.deepEqual(Object.keys(claims).sort(),['cnf','exp','iat','iss','jti']);
+    assert.deepEqual(await f.api.delegate(a.credential,input),result,'repeat delivery keeps the original delegation and expiry');
+    await jwtVerify(result.delegation,await importJWK(await f.options.signer.publicJwk(),'ES256'),{issuer:a.clientId,currentDate:new Date(1000000)});
+    const response=await f.api.handle(new Request(a.clientId));assert.equal(response.status,200);assert.equal((await response.json()).client_id,a.clientId);
+    for(const extra of [{sub:'another-user'},{issuer:'https://other.example'},{jwk:{...jwk,d:'private'}}]) await assert.rejects(f.api.delegate(a.credential,{...input,...extra}),{code:'binding_conflict'});
+    await assert.rejects(f.api.delegate(a.credential,{...input,installationId:'install-b'}),{code:'unauthorized'});
+    const {CompactSign,calculateJwkThumbprint}=await import('jose'),{verifySessionJwt}=await import('../dist/protocol/session.js');
+    const forged=await new CompactSign(new TextEncoder().encode(JSON.stringify({iss:b.clientId,aud:issuer,sid:'forged_session',sub:'known-user-id',htm:'POST',htu:'https://company.example/api',iat:1000,jti:'request-random-id-1234'}))).setProtectedHeader({alg:'ES256',typ:'poppy-session+jwt',kid:await calculateJwkThumbprint(jwk),pap_dlg:result.delegation}).sign(pair.privateKey);
+    const metadata={...f.options.metadata,async resolveClient(id:string){const response=await f.api.handle(new Request(id));return response.json();},async resolveJwks(){return {keys:[{...await f.options.signer.publicJwk(),kid:f.options.signer.kid}]};}};
+    await assert.rejects(verifySessionJwt(forged,{companyId:issuer,method:'POST',url:'https://company.example/api',nowMs:1000000,metadata}));
+    await f.store.transaction({kind:'metadata',enrollmentId:a.enrollmentId},tx=>{const row=tx.get('enrollment',a.enrollmentId)!;delete row.clientId;tx.put('enrollment',a.enrollmentId,row);});
+    await assert.rejects(f.api.delegate(a.credential,{...input,operationId:'legacy'}),{code:'binding_conflict'});
+  }finally{await f.close();}
+});
+
+test('delegation issuance prunes 1000 expired records and linked state before inserting', async () => {
+  const f=await fixture();try {
+    const a=await f.enroll();
+    await f.store.transaction({kind:'begin',enrollmentId:a.enrollmentId,operationId:'seed',issuer,stateHash:'old-state',at:1000000},tx=>{
+      for(let i=0;i<1000;i++)tx.put('operation',a.enrollmentId+':old-'+i,{binding:{purpose:'delegation',stateHash:i===0?'old-state':null},expiresAt:1,status:'signed',result:null});
+      tx.put('state','old-state',{enrollmentId:a.enrollmentId,operationId:'old-0'});
+    });
+    const pair=await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},true,['sign','verify']);
+    await f.api.delegate(a.credential,{version:1,installationId:'install-a',operationId:'fresh',jwk:await publicEcJwk(pair.publicKey)});
+    const second=f.second();try {
+      const rows=await second.transaction({kind:'delegate',enrollmentId:a.enrollmentId,operationId:'fresh',at:1000000},tx=>tx.list('operation',a.enrollmentId+':',1001));
+      assert.equal(rows.length,1);assert.equal(rows[0]!.id,a.enrollmentId+':fresh');
+      const old=await second.transaction({kind:'callback',stateHash:'old-state'},tx=>tx.get('state','old-state'));assert.equal(old,undefined);
+    }finally{await second.close();}
+    await f.api.revokeEnrollment(a.credential,{version:1,installationId:'install-a'});
   }finally{await f.close();}
 });

@@ -6,6 +6,7 @@ const domain = selfCheck ? 'company.example' : process.argv[2];
 if (!domain) throw new Error('usage: node examples/quickstart.mjs DOMAIN|--self-check');
 const transport = selfCheck ? {
   async fetch(request) {
+    if (request.url === 'https://company.example/.well-known/oauth-protected-resource') return new Response(null, {status:404});
     assert.equal(request.url, 'https://company.example/.well-known/poppy.json');
     return Response.json({ protocol_version: '0.3', organization: { name: 'Example Company', domain }, web: {} });
   },

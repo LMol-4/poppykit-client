@@ -29,7 +29,7 @@ The optional Postgres entry point ships its adapters, `createPostgresPool`,
 `postgresMigration`, `migratePostgres` and schema-version export; see [storage](STORAGE.md).
 TypeScript Postgres consumers also install `@types/pg@8.23.1` as a development dependency.
 
-Custom `AuthStore` implementations must honor `AuthSelection.history` as described
+Custom `AuthStore` implementations must honor shared-grant/account aggregation and `AuthSelection.history` as described
 in [STORAGE.md](STORAGE.md). Provider callbacks now acknowledge identical consumed
 results without making `takeResult` reusable; see [PROVIDER.md](PROVIDER.md).
 

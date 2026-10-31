@@ -14,15 +14,17 @@ const conversationStore = new SqliteConversationStore('/private/path/messages.db
 ```
 
 Use one auth database per namespace/local user/client identity. The owner tuple is
-checked on every SDK auth read and mutation. Identities are keyed by the exact full
-issuer, connections by immutable IDs, operations by ID and callback state hash,
+checked on every SDK auth read and mutation. Identities are keyed by the exact Company
+identifier, connections by immutable IDs, operations by ID and callback state hash,
 cleanup by connection, and token slots by session/resource. Secret values are never
 stored in auth records: immutable references point to the host's `SecretStore`.
-Session Tokens remain in process memory. Conversation databases contain message
+Access tokens remain in process memory; Session JWTs are freshly signed. Conversation databases contain message
 bodies; operators must provide private storage and their required encryption.
 
-Auth selections load an identity or a connection aggregate (its grants, operations,
-and cleanup), never unrelated connections. Operation/callback selectors resolve the
+Auth selections load an identity or a connection aggregate, including all peers
+referencing its shared grants and their operations/cleanup. An `account: {issuer,
+userId}` selector loads every connection for that Company and pairwise User, its
+identity, grants, operations and cleanup; account-wide sign-out is one transaction. Operation/callback selectors resolve the
 owning connection through indexes. `list` explicitly enumerates connections.
 Recovery pages nonterminal operation IDs in batches of 100, then rechecks each
 operation and its owner inside its transaction. `cleanup(before, limit)` removes
@@ -88,14 +90,15 @@ recovery of a token that the issuer rotated but never delivered.
 
 ## Development reset
 
-Normalized auth state version 1 upgrades to version 2 atomically on first access
+Normalized auth state versions 1 and 2 upgrade to version 3 atomically on first access
 in both SQLite and PostgreSQL, under the namespace's writer lock. Stop old SDK
 processes before opening the candidate adapters; mixed-version writers are not
 supported. This is a record upgrade, with no SQL schema change. Owner, epoch,
 stable User IDs, grants, scopes, cleanup and internal connection/operation IDs stay.
 Legacy connections discard their volatile token slots and require a fresh key on
 next renewal. Old shared-key references remain retained, but are never used for
-another token request. Prepared old operations are cancelled; dispatched/staged
+another token request. Prepared old operations are cancelled and private verifier/device references are
+queued for cleanup before history can be pruned; dispatched/staged
 ones still pass through `recover()`, preserving rotated tokens and uncertainty.
 Custom targeted adapters must provide the same complete-namespace upgrade under
 their writer lock; the client's fallback also upgrades whole-state snapshots.

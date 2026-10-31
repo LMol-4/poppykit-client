@@ -16,8 +16,8 @@ export function scopedProviderTransaction(selection: ProviderSelection, raw: Pro
   const userKey = 'issuer' in selection && enrollment ? providerUserKey(enrollment.visitor, selection.issuer) : undefined;
   const states = new Set<string>();
   if (selection.kind === 'callback') states.add(selection.stateHash);
-  if (selection.kind === 'begin') {
-    if (selection.stateHash) states.add(selection.stateHash);
+  if (selection.kind === 'begin' || selection.kind === 'delegate') {
+    if ('stateHash' in selection && selection.stateHash) states.add(selection.stateHash);
     for (const row of raw.list('operation', `${enrollmentId}:`, 1001)) if (row.value.binding?.stateHash) states.add(row.value.binding.stateHash);
   }
   let createdEnrollment: string | undefined;
@@ -28,7 +28,7 @@ export function scopedProviderTransaction(selection: ProviderSelection, raw: Pro
       if (kind === 'enrollment' && write && (!createdEnrollment || createdEnrollment === id) && !raw.get(kind, id)) { createdEnrollment = id; allowed = true; }
     } else {
       allowed = (kind === 'enrollment' && id === enrollmentId) || (kind === 'user' && id === userKey) || (kind === 'state' && states.has(id));
-      if (kind === 'operation') allowed = (selection.kind === 'begin' || selection.kind === 'revoke') ? id.startsWith(`${enrollmentId}:`) : id === `${enrollmentId}:${operationId}`;
+      if (kind === 'operation') allowed = (selection.kind === 'begin' || selection.kind === 'delegate' || selection.kind === 'revoke') ? id.startsWith(`${enrollmentId}:`) : id === `${enrollmentId}:${operationId}`;
     }
     if (!allowed) throw new TypeError('provider access outside selection');
   };
@@ -37,7 +37,7 @@ export function scopedProviderTransaction(selection: ProviderSelection, raw: Pro
     put(kind, id, value) { check(kind, id, true); raw.put(kind, id, value); },
     remove(kind, id) { check(kind, id); raw.remove(kind, id); },
     list(kind, prefix, limit) {
-      if (!['begin', 'revoke'].includes(selection.kind) || kind !== 'operation' || prefix !== `${enrollmentId}:` || !Number.isSafeInteger(limit) || limit < 1 || limit > 1001) throw new TypeError('provider list outside selection');
+      if (!['begin', 'delegate', 'revoke'].includes(selection.kind) || kind !== 'operation' || prefix !== `${enrollmentId}:` || !Number.isSafeInteger(limit) || limit < 1 || limit > 1001) throw new TypeError('provider list outside selection');
       return raw.list(kind, prefix, limit);
     },
   };

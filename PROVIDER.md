@@ -80,12 +80,13 @@ const provider = createProvider({
 // await provider.handle(request)
 ```
 
-`operatorKeys`, `operatorLogin`, `operatorSessionVerifier` and
-`verifiedCompanyResolver` are operator-owned adapters, not globals supplied by
-the package. A session verifier must independently verify both the provider client
-and derived UserID; an opaque session ID alone does not prove ownership. Browser
-signing fails closed without that verifier. Starting a session signs a derived
-UserID assertion; the company checks session/client/UserID association on renewals.
+`operatorKeys`, `operatorLogin` and `verifiedCompanyResolver` are operator-owned
+adapters. A new enrollment receives a unique HTTPS client metadata URL beneath
+the configured clientId path. Serve that exact URL through provider.handle; the
+shared JWKS and callback remain unchanged. A shared origin does not make those
+client IDs interchangeable. Existing shared-client enrollments are retained for
+legacy assertion/cleanup, but cannot receive delegations; obtain fresh explicit
+enrollment rather than transferring old account grants to a different client ID.
 
 POST JSON operations use `version: 1` and `installationId`. Enroll additionally
 takes a fresh `idempotencyKey`; private operations carry `Authorization: Bearer
@@ -98,11 +99,14 @@ but cannot recover another installation's result. Enrollment never accepts calle
 subjects, arbitrary audiences, lifetimes, key IDs, raw bytes or signing claims.
 
 `identity` takes domain and exact issuer; `begin` registers immutable operation,
-issuer/domain, purpose (`session`, `client-authentication`, `direct`) and Direct Session Key binding. Company metadata is independently
+issuer/domain, purpose (`client-authentication`, `direct`) and Direct Session Key binding. Company metadata is independently
 resolved and enrollment company policy checked. `assert` takes operation/purpose
-only and constructs a 60-second assertion with fresh 256-bit jti. Browser-purpose
-operations/assertions and verifySession are removed; browser joining uses the
-locally held Session Key and browser-bound form code. `createProviderClient` binds
+only and constructs a 60-second assertion with fresh 256-bit jti. New Sessions use `delegate({operationId,jwk})`: an enrollment restricted to one
+Company can obtain a cnf-only ES256 delegation with coarse half-hour issuance and a one-hour signed lifetime for a public P-256 key.
+The payload contains no User/Company claims. Legacy shared-client and multi-Company
+enrollments are refused. Delegation results are encrypted for idempotent delivery,
+expired results/tombstones are pruned before the 1000-operation cap. Browser joining
+uses separate code authorization with the finalized Session JWT. `createProviderClient` binds
 enrollment credentials and automatically registers SDK assertion operations.
 
 Direct sign-in uses SDK-generated 256-bit state. Trusted CLI code privately
@@ -142,8 +146,8 @@ expires plus 30-second skew; never publish private JWK fields. The operator owns
 the publication grace period and KMS key lifecycle.
 
 Enrollment revocation stops new signing/retrieval and cancels pending results.
-It cannot invalidate delivered assertions, existing company Session Tokens,
-Account Tokens or DPoP keys. Revoke company authorization **before** disabling
+It cannot invalidate delivered assertions, existing delegated Session JWTs,
+OAuth account credentials or DPoP keys. Revoke company authorization **before** disabling
 provider signing, or use authenticated company account controls afterward.
 This is scoped authority, redaction and provider key custody; it does not isolate
 authority from unrestricted programs running as the same OS user.

@@ -100,8 +100,22 @@ unsupported. Human text must remain the person's exact words. Company authors
 may include `id`, `name` and an HTTPS `image`. Authorization events now contain
 `error: 'insufficient_scope'` and nonempty required `scope`.
 
-No backward compatibility is provided. Stop writers and explicitly reset old
-history, outboxes, checkpoints and caller retry handles before cutover, preserving
-configuration. Old pending `sender` requests fail `legacy_message_uncertain`
+Stop incompatible writers before cutover. Preserve old history, outboxes,
+checkpoints and retry handles for explicit reconciliation; do not silently reset them. Old pending `sender` requests fail `legacy_message_uncertain`
 without dispatch or mutation. Reconcile uncertain delivery before clearing it;
 never rebuild the body or allocate a replacement ID to hide uncertainty.
+
+
+## Operator signatures
+
+A host should wrap the supplied HttpTransport with an RFC 9421/Web Bot Auth signer.
+The auth lifecycle passes the finalized Request to both fetch and stream, after
+setting its fresh Poppy-Session and optional Authorization/DPoP headers. Sign at
+that boundary on every call, including retries, and forward the same method, target,
+body and signed headers without redirects. Cover poppy-session and authorization
+when present, in addition to the Web Bot Auth required components. Apply identical
+signing behavior to streaming calls. Never log the Request or signing material.
+The host supplies operator keys and the standards-compliant signer; the SDK does
+not invent a second operator-key registry or treat its signature as Session verification.
+Operator keys and delegated Session keys have separate roles. Companies still
+verify the Session independently, and may apply operator acceptance policy.

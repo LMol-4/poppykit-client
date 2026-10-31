@@ -34,12 +34,12 @@ export class PostgresProviderStore implements ProviderStore {
           await lock('enrollment', enrollmentId);
           const enrollment = await one('enrollment', enrollmentId);
           if ('issuer' in selection && enrollment) { const key = providerUserKey(enrollment.visitor, selection.issuer); await lock('user', key); await one('user', key); }
-          if (selection.kind === 'begin' || selection.kind === 'revoke') {
+          if (selection.kind === 'begin' || selection.kind === 'delegate' || selection.kind === 'revoke') {
             const operations = await this.db.query("SELECT id,body FROM poppy_provider.records WHERE ns=$1 AND kind='operation' AND split_part(id,':',1)=$2 ORDER BY id LIMIT 1001", [this.namespace, enrollmentId]);
             for (const row of operations) rows.set(JSON.stringify(['operation', row.id]), JSON.parse(row.body));
             if (operations.length > 1000) throw new Error('provider aggregate exceeds retained operation limit');
-            if (selection.kind === 'begin') {
-              const states = new Set<string>(); if (selection.stateHash) states.add(selection.stateHash);
+            if (selection.kind === 'begin' || selection.kind === 'delegate') {
+              const states = new Set<string>(); if ('stateHash' in selection && selection.stateHash) states.add(selection.stateHash);
               for (const row of operations) { const hash = JSON.parse(row.body).binding?.stateHash; if (hash) states.add(hash); }
               for (const hash of [...states].sort()) { await lock('state', hash); await one('state', hash); }
             }

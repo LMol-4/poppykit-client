@@ -21,7 +21,9 @@ export class SqliteAuthStore implements AuthStore {
     this.db.exec('PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
     this.db.exec('CREATE TABLE IF NOT EXISTS auth_meta (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL)');
     for (const table of tables) this.db.exec(`CREATE TABLE IF NOT EXISTS auth_${table} (id TEXT PRIMARY KEY, body TEXT NOT NULL)`);
-    this.db.exec(`CREATE INDEX IF NOT EXISTS operations_connection ON auth_operations(json_extract(body,'$.connectionId'));
+    this.db.exec(`CREATE INDEX IF NOT EXISTS connections_grant ON auth_connections(json_extract(body,'$.grantId'));
+      CREATE INDEX IF NOT EXISTS connections_account ON auth_connections(json_extract(body,'$.issuer'),json_extract(body,'$.userId'));
+      CREATE INDEX IF NOT EXISTS operations_connection ON auth_operations(json_extract(body,'$.connectionId'));
       CREATE UNIQUE INDEX IF NOT EXISTS operations_callback ON auth_operations(json_extract(body,'$.direct.stateHash'));
       CREATE INDEX IF NOT EXISTS operations_pending ON auth_operations(id) WHERE json_extract(body,'$.phase')!='terminal';
       CREATE INDEX IF NOT EXISTS operations_cleanup ON auth_operations(json_extract(body,'$.createdAt')) WHERE json_extract(body,'$.phase')='terminal' AND json_extract(body,'$.status')!='uncertain';
@@ -42,14 +44,14 @@ export class SqliteAuthStore implements AuthStore {
   }
   private select(selection: AuthSelection): ClientAuthState {
     const state: ClientAuthState = { ...JSON.parse(this.db.prepare('SELECT body FROM auth_meta WHERE id=1').get()!.body as string), identities: {}, connections: {}, grants: {}, operations: {}, cleanup: {} };
-    if (state.version === 1) {
+    if (state.version === 1 || state.version === 2) {
       for (const table of tables) for (const row of this.db.prepare(`SELECT id,body FROM auth_${table}`).all()) (state[table] as Record<string, unknown>)[row.id as string] = JSON.parse(row.body as string);
       upgradeClientAuthState(state);
       for (const table of tables) for (const [id, value] of Object.entries(state[table])) this.db.prepare(`UPDATE auth_${table} SET body=? WHERE id=?`).run(json(value), id);
       this.db.prepare('UPDATE auth_meta SET body=? WHERE id=1').run(json({ version: state.version, epoch: state.epoch, owner: state.owner }));
       for (const table of tables) state[table] = {};
     }
-    if (state.version !== 2) throw new Error('unsupported auth state version');
+    if (state.version !== 3) throw new Error('unsupported auth state version');
     const get = (table: typeof tables[number], id: string) => {
       const row = this.db.prepare(`SELECT body FROM auth_${table} WHERE id=?`).get(id);
       if (row) (state[table] as Record<string, unknown>)[id] = JSON.parse(row.body as string);
@@ -61,11 +63,14 @@ export class SqliteAuthStore implements AuthStore {
       if (selection.history) rows('operations', "WHERE json_extract(body,'$.phase')='terminal' AND json_extract(body,'$.status')!='uncertain' AND json_extract(body,'$.kind')!='renew' ORDER BY json_extract(body,'$.createdAt') DESC,id DESC LIMIT 201");
     };
     if ('issuer' in selection) { get('identities', selection.issuer); history(); return state; }
-    if ('connectionId' in selection) get('connections', selection.connectionId);
+    if ('account' in selection) { get('identities', selection.account.issuer); rows('connections', "WHERE json_extract(body,'$.issuer')=? AND json_extract(body,'$.userId')=?", selection.account.issuer, selection.account.userId); }
+    else if ('connectionId' in selection) get('connections', selection.connectionId);
     else if ('operationId' in selection) get('operations', selection.operationId);
     else if ('callbackHash' in selection) rows('operations', "WHERE json_extract(body,'$.direct.stateHash')=?", selection.callbackHash);
     else if ('list' in selection) rows('connections', '');
     for (const operation of Object.values(state.operations)) get('connections', operation.connectionId);
+    const linked = new Set([...Object.values(state.connections).map(row => row.grantId), ...Object.values(state.operations).map(row => row.grantId)].filter((id): id is string => id !== null));
+    for (const grantId of linked) rows('connections', "WHERE json_extract(body,'$.grantId')=?", grantId);
     for (const connection of Object.values(state.connections)) {
       if (connection.grantId) get('grants', connection.grantId);
       if (!('list' in selection)) {

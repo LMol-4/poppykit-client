@@ -19,26 +19,31 @@ const result = await fetchForClient(new Request('https://company.example/api/rec
 
 OpenAPI `apiUrl` is the description URL from verified company discovery. The third
 argument is the actual destination base; its host must independently serve verified
-company discovery naming the same issuer. This conservative policy requires API
+company discovery naming the same verified Company identifier. This conservative policy requires API
 hosts to publish discovery; a document's `servers` field alone grants no authority.
 Final requests must stay within the verified origin and slash-delimited base path.
 The proof binds the actual final method and URL. Destination changes require a new
 explicit connection; saved work never moves silently.
 
-For MCP, use `auth.apiTarget(connectionId, mcpUrl)` and the same fetch closure in an
-existing Streamable HTTP MCP client (version 2025-06-18 or later). The SDK does not
-encode JSON-RPC or manage MCP sessions. The exact discovery URL is the resource and
-endpoint; extra paths or queries are refused. Query-bearing discovery endpoints are
-not supported. Protected-resource metadata must name that exact resource and the
-verified company issuer. ES256 DPoP metadata selects DPoP; absence selects Bearer.
-A Bearer-only MCP resource cannot also authorize a conversation. Resource-specific
-credential slots use the shared nonce, cooldown and revocation
-lifecycle. Bearer-only MCP credentials come only from Token Exchange of a current
-DPoP Session Token, preserving its Session and limiting scopes to that subject. The
-issuer must advertise the exchange grant; exchange does not rotate the Account Token.
-DPoP-capable MCP keeps the normal token grants. The wire `token_type` must match verified metadata; there is no fallback
-from DPoP to Bearer. Redirects never forward tokens or proofs. Auth 401 rejection may
-cause one fresh-token retry; unknown results are not automatically retried.
+Service authorization comes from RFC 9728 protected-resource metadata, fetched
+without credentials before the first signed-in API/conversation request and cached
+through the resolver. A real 404 permits the default Company token; network errors
+and malformed metadata fail closed. A service resource other than the Company
+domain selects a token for that exact resource via normal sign-in/refresh. Discovery
+resource fields do not grant authority. An invalid_token challenge with
+resource_metadata causes one bounded revalidation/refresh retry.
+
+For MCP, use auth.apiTarget(connectionId, mcpUrl) and the same fetch closure in an
+existing MCP HTTP client. The exact discovery URL is the resource and endpoint,
+including any query; changed queries or child paths are refused. Its metadata must
+name that resource and the Company's issuer when sign-in exists. ES256 DPoP
+advertisement selects DPoP; absence selects Bearer. Account credentials use normal
+OAuth grants, without token exchange. Requests use the token response's scheme.
+
+The SDK does not encode JSON-RPC or manage MCP initialization/Mcp-Session-Id.
+Poppy Session continuity is independent of earlier MCP transport lifecycles and
+MCP 2026-07-28 per-request metadata. Signed-out issuerless APIs/MCP still get Session
+JWTs. Redirects never forward tokens or proofs; unknown results are not retried.
 
 ## Agent-controlled browser
 
@@ -65,35 +70,36 @@ await auth.joinBrowser(connectionId, 'https://company.example/account', {
 `controlledBrowser` is the host's existing controller, not an SDK driver. This hook
 is trusted code. Its network layer must reject loopback/private/link-local actual
 connected addresses unless narrowly configured, validate TLS and enforce redirect
-interception. Never replay the code or proof on 307/308 or send it in a URL. The supplied
+interception. Never replay the code on 307/308 or send it in a URL. The supplied
 validator permits only 303 to an HTTPS company page. After that redirect, the SDK
 asks the controller to navigate to the validated `returnTo`. HttpTransport cannot
 enforce network policy inside an unrelated browser engine. Keep this capability
 separate from the human consent-browser opener. Never join the user's browser.
 Use separate cookies/local storage for each session/user, join just before browsing,
 rejoin on lost recognition and close the context when the session ends. Custom
-controllers own those guarantees; the SDK signs a Session Key proof with the form
-code as nonce (no access token or identity assertion), and validates the destination and
-navigation contract but cannot inspect their internal browser implementation.
+controllers own those guarantees. The SDK separately authorizes the code at the
+endpoint path plus /authorize, preserving its query, with a signed Session request
+and current account token when signed in. It requires 204 before the browser
+submits only code. No JWT/token/proof enters the browser form. The cookie snapshots
+the approved account/scopes; later sign-in or scope expansion requires rejoin.
 
 ## Feedback
 
 ```ts
 await auth.feedback(connectionId, {
-  kind: 'missing', task: 'Export records',
+  task: 'Export records',
   description: 'There is no export operation in the API, conversation or website.',
 });
 ```
 
 Signed-out sessions are allowed and no account scope is required. Task and
-description are nonempty strings of at most 200 and 2000 Unicode codepoints. Only
-`missing` is supported client-side. Omit identifiers, personal data and secrets;
+description are nonempty strings of at most 200 and 2000 Unicode codepoints. Omit identifiers, personal data and secrets;
 report task limitations rather than individual errors. Success is an empty 202
 (returning undefined) or HTTP 200 with an `Alternative`. The SDK validates the latter
 and returns instructions/references as company data, never as user consent. Unlisted
 OpenAPI/MCP references and unknown reference types are ignored; known malformed
 references fail. Web links must be HTTPS. No alternative is executed automatically.
-There are no automatic POST retries (including nonce/auth rejection). A lost
+Feedback does not automatically repeat a POST after nonce/auth/Session rejection. A lost
 response can mean accepted; callers decide whether to repeat because the protocol
 defines no deduplication key. Prefer one report per unfulfilled task.
 

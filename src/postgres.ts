@@ -26,21 +26,24 @@ export class PostgresAuthStore implements AuthStore {
     const rows = async (table: typeof tables[number], where: string, values: unknown[] = []) => {
       for (const row of await this.db.query(`SELECT id,body FROM poppy_client.records WHERE ns=$1 AND kind=$2 ${where}`, [this.namespace, table, ...values])) (state[table] as Record<string, unknown>)[row.id] = JSON.parse(row.body);
     };
-    if (state.version === 1) {
+    if (state.version === 1 || state.version === 2) {
       for (const table of tables) await rows(table, '');
       upgradeClientAuthState(state);
       for (const table of tables) for (const [id, value] of Object.entries(state[table])) await this.put(table, id, value);
       await this.put('auth_meta', 'meta', { version: state.version, epoch: state.epoch, owner: state.owner });
       for (const table of tables) state[table] = {};
     }
-    if (state.version !== 2) throw new Error('unsupported auth state version');
+    if (state.version !== 3) throw new Error('unsupported auth state version');
     if ('issuer' in selection) await one('identities', selection.issuer);
     else {
-      if ('connectionId' in selection) await one('connections', selection.connectionId);
+      if ('account' in selection) { await one('identities', selection.account.issuer); await rows('connections', "AND body::jsonb->>'issuer'=$3 AND body::jsonb->>'userId'=$4", [selection.account.issuer, selection.account.userId]); }
+      else if ('connectionId' in selection) await one('connections', selection.connectionId);
       else if ('operationId' in selection) await one('operations', selection.operationId);
       else if ('callbackHash' in selection) await rows('operations', "AND body::jsonb#>>'{direct,stateHash}'=$3", [selection.callbackHash]);
       else await rows('connections', '');
       for (const operation of Object.values(state.operations)) await one('connections', operation.connectionId);
+      const linked = new Set([...Object.values(state.connections).map(row => row.grantId), ...Object.values(state.operations).map(row => row.grantId)].filter((id): id is string => id !== null));
+      for (const grantId of linked) await rows('connections', "AND body::jsonb->>'grantId'=$3", [grantId]);
       for (const connection of Object.values(state.connections)) {
         if (connection.grantId) await one('grants', connection.grantId);
         if (!('list' in selection)) {

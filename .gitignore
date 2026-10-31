@@ -70,3 +70,9 @@ coverage/
 /tests/postgres.test.mjs.map
 /scripts/postgres-ci.mjs
 /scripts/postgres-ci.mjs.map
+
+/tests/auth/session.test.mjs
+/tests/auth/session.test.mjs.map
+
+/tests/auth/account-grants.test.mjs
+/tests/auth/account-grants.test.mjs.map
