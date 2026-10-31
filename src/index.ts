@@ -25,3 +25,6 @@ export type { Author, AuthorType, Message, RecordedMessage, ConversationRequest,
 
 export type { Alternative, AlternativeReference, ExcludedTask } from './network/tasks.js';
 export type { ScopeHint } from './network/discovery.js';
+
+export * from './operations.js';
+export * from './protocol/operations.js';

@@ -1,3 +1,5 @@
+import { supportsOperations } from './protocol/operations.js';
+import type { ClientMetadata, PoppyDocument } from './network/discovery.js';
 import type { AuthorizationRequirement } from './auth/client-auth.js';
 import { parseEventStream } from './protocol/sse.js';
 import type { ConversationEvent } from './protocol/wire.js';
@@ -27,6 +29,8 @@ export class ConversationError extends Error {
   get requiredScopes(): string[] { return this.scope?.split(' ').filter(Boolean) ?? []; }
 }
 export interface ConversationClientOptions {
+  /** Verified metadata for both peers; omit until trusted Operations consent/recovery is configured. */
+  operations?: { client: ClientMetadata; company: PoppyDocument };
   authorizedRequest(request: Request): Promise<Response>;
   endpoint: string; connectionId: string; issuer: string;
   store: ConversationStore;
@@ -46,6 +50,7 @@ const definite = (status: number) => status >= 400 && status < 500 && ![401, 403
 
 export function createConversationClient(options: ConversationClientOptions) {
   const { authorizedRequest, store, clock, connectionId, issuer } = options;
+  const operations = !!options.operations && supportsOperations(options.operations.client) && supportsOperations(options.operations.company);
   const endpoint = secureUrl(options.endpoint).href;
   const newId = options.newId ?? (() => `msg_${Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('base64url')}`); // 128 random bits
   const random = options.random ?? Math.random;
@@ -119,13 +124,13 @@ export function createConversationClient(options: ConversationClientOptions) {
     if (!record) throw new ConversationError('unknown_operation');
     if (record.endpoint !== endpoint) throw new ConversationError('invalid_target');
     if (record.phase === 'accepted') {
-      try { return record.response && 'events' in record.response ? visiblePage(parseEventPage(record.response, record.read?.cursor)) : parseConversationState(record.response); }
+      try { return record.response && 'events' in record.response ? visiblePage(parseEventPage(record.response, record.read?.cursor, operations)) : parseConversationState(record.response); }
       catch { throw new ConversationError('stored_operation_reset_required'); }
     }
     if (record.phase === 'rejected') throw new ConversationError(record.error!.code, record.error!.status, undefined, undefined, record.error!.conversationId);
     // A legacy pending body may already be accepted remotely. Never rewrite or replay it as a new contract.
     if ('sender' in record.request.message) throw new ConversationError('legacy_message_uncertain');
-    parseConversationRequest(record.request);
+    parseConversationRequest(record.request, operations);
     const url = new URL(record.target === null ? endpoint : conversationUrl(record.target, 'messages'));
     if (record.read?.cursor !== undefined) url.searchParams.set('cursor', record.read.cursor);
     if (record.read?.wait !== undefined) url.searchParams.set('wait', String(record.read.wait));
@@ -135,7 +140,7 @@ export function createConversationClient(options: ConversationClientOptions) {
       try {
         const body = parseJson(await responseText(response));
         // A 2xx means accepted; a company that ignores wait answers with a plain state.
-        state = body && typeof body === 'object' && ['events', 'cursor', 'has_more'].some(key => key in body) ? parseEventPage(body, record.read?.cursor) : parseConversationState(body);
+        state = body && typeof body === 'object' && ['events', 'cursor', 'has_more'].some(key => key in body) ? parseEventPage(body, record.read?.cursor, operations) : parseConversationState(body);
       } catch { throw new ConversationError('invalid_response', response.status); }
       await store.settleOutbound(key, id, { phase: 'accepted', response: state });
       return 'events' in state ? visiblePage(state as EventPage) : state;
@@ -151,8 +156,8 @@ export function createConversationClient(options: ConversationClientOptions) {
     if (target !== null) parseId(target, 'conversation_id');
     if (read.wait !== undefined && (!Number.isSafeInteger(read.wait) || read.wait < 0)) throw new ConversationError('invalid_request');
     if (read.cursor !== undefined) { parseId(read.cursor, 'cursor'); if (read.wait === undefined) throw new ConversationError('invalid_request'); } // spec 7.3 adds cursor alongside wait
-    const message = parseMessage({ ...input, id: input.id ?? newId() }) as Message;
-    const request = parseConversationRequest({ message, ...(parent === undefined ? {} : { parent_conversation_id: parent }) });
+    const message = parseMessage({ ...input, id: input.id ?? newId() }, { operations }) as Message;
+    const request = parseConversationRequest({ message, ...(parent === undefined ? {} : { parent_conversation_id: parent }) }, operations);
     if(Buffer.byteLength(JSON.stringify(request))>1048576)throw new ConversationError('body_limit');
     const fingerprint = canonical({ target, request });
     const existing = await store.prepareOutbound(key, { connectionId, issuer, endpoint, id: message.id, target, request, fingerprint, phase: 'pending', ...(read.wait === undefined && read.cursor === undefined ? {} : { read: { ...(read.wait === undefined ? {} : { wait: read.wait }), ...(read.cursor === undefined ? {} : { cursor: read.cursor }) } }) });
@@ -194,7 +199,7 @@ export function createConversationClient(options: ConversationClientOptions) {
           if(response.headers.get('content-type')?.split(';')[0].trim()==='text/event-stream') {
             if(!response.body)throw new ConversationError('invalid_response');
             let partialBytes=0;
-            for await(const frame of parseEventStream(response.body,{signal:opts.signal})){
+            for await(const frame of parseEventStream(response.body,{signal:opts.signal, operations})){
               if(frame.kind==='delta'){partialBytes+=Buffer.byteLength(frame.text);if(partialBytes>1048576)throw new ConversationError('body_limit');opts.onPartial?.({messageId:frame.messageId,text:frame.text});continue;}
               const event=frame.event,previous=cursor;
               if(seen.has(event.id))continue;
@@ -204,7 +209,7 @@ export function createConversationClient(options: ConversationClientOptions) {
           } else {
             if(++pages>maxPages)throw new ConversationError('too_many_pages');
             const beforePage=cursor;
-            const page=parseEventPage(parseJson(await responseText(response)),cursor);
+            const page=parseEventPage(parseJson(await responseText(response)),cursor, operations);
             more=page.has_more;
             for(const event of page.events){if(seen.has(event.id))continue;const previous=cursor;if(seen.size>=10000)throw new ConversationError('too_many_events');seen.add(event.id);if(knownEvents.has(event.type))yield eventAck(event,previous);else await eventAck(event,previous).ack();cursor=event.id;}
             closed=page.status==='closed'&&!more;
@@ -235,7 +240,7 @@ export function createConversationClient(options: ConversationClientOptions) {
       const response = await call(() => new Request(url, { method: 'GET', signal: opts.signal }));
       if (!response.ok) throw await failure(response); // cursor_expired (410) is the explicit history gap: see resetConsumer
       let page: EventPage;
-      try { page = visiblePage(parseEventPage(parseJson(await responseText(response)), cursor)); } catch { throw new ConversationError('invalid_response', response.status); }
+      try { page = visiblePage(parseEventPage(parseJson(await responseText(response)), cursor, operations)); } catch { throw new ConversationError('invalid_response', response.status); }
       if (opts.consumer !== undefined) delivered.set(page, { conversationId, consumer: opts.consumer, chain: [cursor] });
       return page;
     },

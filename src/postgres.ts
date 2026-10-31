@@ -1,3 +1,4 @@
+import type { BusinessAttemptStore } from './operations.js';
 import type { Pool } from 'pg';
 import { initialClientAuthState, upgradeClientAuthState } from './auth/client-auth.js';
 import type { ClientAuthState } from './auth/client-auth.js';
@@ -122,4 +123,28 @@ export class PostgresConversationStore implements ConversationStore {
     });
   }
   resetCheckpoint(key: ConversationKey, conversation: string, name: string): Promise<void> { return this.db.run(async () => { const values = this.checkpointValues(key, conversation, name); await this.db.lock(JSON.stringify(['checkpoint', ...values])); await this.db.query('DELETE FROM poppy_client.checkpoints WHERE ns=$1 AND connection=$2 AND issuer=$3 AND endpoint=$4 AND conversation=$5 AND name=$6', values); }); }
+}
+
+export class PostgresBusinessAttemptStore implements BusinessAttemptStore {
+  private readonly db: PostgresRuntime;
+  constructor(pool: Pool, readonly namespace: string) { this.db = new PostgresRuntime(pool, 'poppy_client'); }
+  close(): Promise<void> { return this.db.close(); }
+  pending(after: string | undefined, limit: number): Promise<string[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new TypeError('business recovery limit');
+    return this.db.run(async () => (await this.db.query("SELECT id FROM poppy_client.records WHERE ns=$1 AND kind='business_attempts' AND id COLLATE \"C\">$2 AND body::jsonb->>'phase' IN ('pending_consent','consenting','approved','uncertain') ORDER BY id COLLATE \"C\" LIMIT $3", [this.namespace, after ?? '', limit])).map(row => row.id));
+  }
+  transaction<T>(id: string, action: (slot: { record?: import('./operations.js').BusinessAttempt }) => T): Promise<T> {
+    return this.db.run(async () => {
+      await this.db.lock(JSON.stringify([this.namespace, 'business_attempts', id]));
+      const row = (await this.db.query("SELECT body FROM poppy_client.records WHERE ns=$1 AND kind='business_attempts' AND id=$2", [this.namespace, id]))[0];
+      const slot = { record: row ? JSON.parse(row.body) as import('./operations.js').BusinessAttempt : undefined };
+      if (slot.record && slot.record.version !== 1) throw new Error('unsupported business attempt version');
+      const result = synchronous(action(slot));
+      if (slot.record) {
+        if (slot.record.version !== 1 || slot.record.id !== id) throw new TypeError('business attempt binding');
+        await this.db.query("INSERT INTO poppy_client.records(ns,kind,id,body) VALUES($1,'business_attempts',$2,$3) ON CONFLICT(ns,kind,id) DO UPDATE SET body=excluded.body", [this.namespace, id, json(slot.record)]);
+      }
+      return result;
+    });
+  }
 }

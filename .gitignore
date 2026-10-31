@@ -76,3 +76,6 @@ coverage/
 
 /tests/auth/account-grants.test.mjs
 /tests/auth/account-grants.test.mjs.map
+
+/tests/operations.test.mjs
+/tests/operations.test.mjs.map

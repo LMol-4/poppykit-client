@@ -7,7 +7,7 @@ import type { AuthStore, SecretStore } from '../../dist/auth/client-auth.js';
 import { createMetadataResolver } from '../../dist/network/discovery.js';
 import { publicEcJwk } from '../../test-support/assertions.mjs';
 
-async function fixture() {
+async function fixture(operations?: {company:string;client:string}) {
   const pair=await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},true,['sign','verify']),jwk=await publicEcJwk(pair.publicKey);
   const clientId='https://independent-agent.example/client.json',endpoint='https://shop.example/conversations';
   let state=initialClientAuthState(),at=1790900000000,refuse=0,alwaysRefuse=false,failRemoval:string|null=null;
@@ -15,7 +15,8 @@ async function fixture() {
   const store:AuthStore={async read(){return structuredClone(state);},async transaction(_selection,change){const draft=structuredClone(state),result=change(draft);state=draft;return structuredClone(result);},async pendingOperations(){return [];}};
   const secrets:SecretStore={async stage(secret){const ref=randomUUID();vault.set(ref,secret);return ref;},async read(ref){return vault.get(ref)??null;},async remove(ref){if(ref===failRemoval)throw new Error('synthetic vault deletion failure');vault.delete(ref);}};
   const transport={async fetch(request:Request){
-    if(request.url==='https://shop.example/.well-known/poppy.json')return Response.json({protocol_version:'0.3',organization:{name:'Independent issuerless Company',domain:'shop.example'},agent:{protocols:[{type:'poppy',endpoint}]},web:{browser_session_endpoint:'https://shop.example/browser?route=1'}});
+    if(request.url===clientId)return Response.json({client_id:clientId,client_name:'Independent agent',jwks_uri:'https://independent-agent.example/jwks',redirect_uris:[],token_endpoint_auth_method:'private_key_jwt',...(operations?{extensions:{operations:{version:operations.client}}}:{})});
+    if(request.url==='https://shop.example/.well-known/poppy.json')return Response.json({...(operations?{extensions:{operations:{version:operations.company}}}:{}),protocol_version:'0.3',organization:{name:'Independent issuerless Company',domain:'shop.example'},agent:{protocols:[{type:'poppy',endpoint}]},web:{browser_session_endpoint:'https://shop.example/browser?route=1'}});
     if(request.url==='https://shop.example/.well-known/oauth-protected-resource')return new Response(null,{status:404});
     assert.ok([endpoint,'https://shop.example/browser/authorize?route=1'].includes(request.url));assert.equal(request.headers.get('authorization'),null);assert.equal(request.headers.get('dpop'),null);assert.equal(request.headers.get('cookie'),null);
     const jwt=request.headers.get('poppy-session');assert.ok(jwt);const header=decodeProtectedHeader(jwt),delegation=header.pap_dlg;assert.equal(typeof delegation,'string');
@@ -81,4 +82,10 @@ test('browser authorization bounds Session recovery before submitting its one ow
   await f.auth.joinBrowser(f.start.connection.id,'https://shop.example/account',controller);
   assert.equal(f.requests.length,2);assert.equal(loaded,1);assert.equal(submitted,1);
   assert.notEqual((await f.auth.get(f.start.connection.id))!.sessionId,f.start.connection.sessionId);
+});
+
+test('businessContext binds verified metadata and keeps authentication work separate',async()=>{
+  const f=await fixture({company:'2',client:'2'}),c=await f.auth.businessContext(f.start.connection.id);
+  assert.equal(c.operations,true);assert.equal(c.companyId,'https://shop.example');assert.equal(c.authority,'session:'+f.start.connection.sessionId);assert.equal(c.userId,f.raw().connections[f.start.connection.id].userId);
+  const unsupported=await fixture({company:'2',client:'1'});assert.equal((await unsupported.auth.businessContext(unsupported.start.connection.id)).operations,false);
 });

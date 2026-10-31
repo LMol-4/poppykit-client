@@ -361,3 +361,16 @@ test('delegation issuance prunes 1000 expired records and linked state before in
     await f.api.revokeEnrollment(a.credential,{version:1,installationId:'install-a'});
   }finally{await f.close();}
 });
+
+test('Operations provider metadata is enrollment-specific and stays unadvertised without readiness',async()=>{
+  const f=await fixture();try{
+    const enrollment=await f.enroll();
+    const identity=await f.api.identity(enrollment.credential,{version:1,installationId:'install-a',issuer,domain});
+    const scoped=identity.clientId;
+    assert.equal((await (await f.api.handle(new Request(scoped))).json()).extensions,undefined);
+    let ready=false;const api=createProvider({...f.options,operations:{ready:async id=>id===enrollment.enrollmentId&&ready}});
+    assert.equal((await (await api.handle(new Request(scoped))).json()).extensions,undefined);
+    ready=true;assert.deepEqual((await (await api.handle(new Request(scoped))).json()).extensions,{operations:{version:'2'}});
+    assert.equal((await (await api.handle(new Request(clientId))).json()).extensions,undefined);
+  }finally{await f.close();}
+});

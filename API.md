@@ -37,3 +37,9 @@ results without making `takeResult` reusable; see [PROVIDER.md](PROVIDER.md).
 `PostgresConnection` type are exported only by `@poppykit/client/provider/postgres`.
 They explicitly enlist provider SQL in a host-owned guarded transaction; the host
 retains commit/rollback, deadline and privilege responsibility.
+
+## Business Operations v2
+
+See [OPERATIONS.md](OPERATIONS.md) for the complete consent/effect contract. Root exports include `BusinessOperation`, `OperationApproval`, `OperationRequest`, `operationsV2`, `supportsOperations`, `parseBusinessOperation`, `parseOperationApproval`, `parseApprovalHeader`, `approvalHeader`, `mcpApproval`, `approvalMetaKey`, `captureApiOperationRequest`, `operationExpiry`, `operationRequiredResponse` and `operationToolError`.
+
+Client exports `createOperationClient`, `createOperationSender`, `OperationClientError`, the three approved-channel serializers, `BusinessClientContext`, `BusinessAttempt`, `BusinessAttemptStore`, `TrustedOperationConsent` and `OperationDelivery`. `ClientAuth.businessContext` supplies a verified binding. SQLite/PostgreSQL subpaths export `SqliteBusinessAttemptStore`/`PostgresBusinessAttemptStore`. The adapter-contract subpath exports `runBusinessAttemptAdapterContract`. Conversation options accept verified `operations:{client,company}` metadata.

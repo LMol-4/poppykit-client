@@ -1,3 +1,5 @@
+import type { BusinessClientContext } from '../operations.js';
+import { supportsOperations } from '../protocol/operations.js';
 import { parseAlternative } from '../network/tasks.js';
 import type { Alternative, ExcludedTask } from '../network/tasks.js';
 import { registeredRedirect } from '../network/redirect.js';
@@ -90,6 +92,7 @@ export interface ClientAuth {
   start(domain: string, input?: { anonymous?: boolean; accountFrom?: string }): Promise<AuthOutcome>;
   get(connectionId: string): Promise<Connection | null>;
   list(): Promise<Connection[]>;
+  businessContext(connectionId: string): Promise<BusinessClientContext>;
   target(connectionId: string): Promise<ConversationTarget>;
   authorization(connectionId: string, requiredScopes: readonly string[]): Promise<AuthorizationRequirement>;
   beginSignIn(connectionId: string, input: SignInInput): Promise<SignInStart>;
@@ -1387,6 +1390,15 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     },
     retryCleanup: cleanupNow,
 
+    async businessContext(connectionId) {
+      const connection = await currentConnection(connectionId);
+      if (!connection.sessionId || !['signed_out','signed_in'].includes(connection.status)) throw new AuthFailure('invalid_state', connectionId);
+      const client = await options.metadata.resolveClient(options.clientId);
+      return { companyId: connection.issuer, companyName: connection.metadata.document.organization.name,
+        clientId: options.clientId, userId: connection.userId,
+        authority: connection.status === 'signed_in' && connection.grantId ? 'grant:' + connection.grantId : 'session:' + connection.sessionId,
+        operations: supportsOperations(client) && supportsOperations(connection.metadata.document) };
+    },
     async apiTarget(connectionId, apiUrl, destination) {
       const connection = await currentConnection(connectionId);
       try { return await resolveApiTarget(connection.metadata, options.metadata, transport, apiUrl, destination); } catch { throw new AuthFailure('invalid_target', connectionId); }

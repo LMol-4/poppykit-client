@@ -121,3 +121,7 @@ Hints and excluded task phrases are company claims, never user approval. The hos
 agent decides whether a phrase matches its task. The SDK/CLI intentionally omit the
 SHOULD-level automatic pre-task check: they have no task planner; callers choose
 when to read the metadata. No task-policy engine or alternative executor is supplied.
+
+## Operations v2
+
+[OPERATIONS.md](OPERATIONS.md) defines API403/Poppy-Approval, MCP structuredContent/_meta and conversation operation/approval integration. Publish support only after all interfaces in use have trusted consent and durable effect recovery. Ordinary MCP clients retain their OAuth flow; one unsupported tool returns a tool error. No v1 extension endpoint is added.

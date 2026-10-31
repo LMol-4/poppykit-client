@@ -186,3 +186,7 @@ transaction handle. It uses the supplied handle rather than its configured pool;
 the host owns the entire commit/rollback. Savepoints protect individual provider
 operations, while the host must abort the outer transaction on failure. Never
 span model/network I/O. See the [provider example](PROVIDER.md).
+
+## Business operation persistence
+
+[Operations storage contracts](OPERATIONS.md#persistence-and-migration) are separate from authentication lifecycle operations and message receipts. BusinessAttemptStore uses a synchronous transaction callback and an ascending nonterminal `pending` selector. SQLite adds a separate business_attempts table; PostgreSQL uses a separate record kind. No existing SQL history, credentials or uncertain work is deleted. Unknown versions fail closed. External effects require a durable downstream idempotency/reconciliation contract. Never prune or release an uncertain business claim after a worker deadline.

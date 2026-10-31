@@ -31,6 +31,8 @@ without a network service.
 
 ## Guides
 
+- [Business operations](OPERATIONS.md): exact per-operation approval, durable retries and effect contracts.
+
 - [Authentication](AUTH.md): sessions, Direct/Device/Mediated, consent, renewal and revocation.
 - [Storage](STORAGE.md): targeted adapters, secret references, recovery and explicit resets.
 - [Delivery](DELIVERY.md): messages, streaming, cancellation, retries and retention.

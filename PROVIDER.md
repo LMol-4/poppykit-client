@@ -174,3 +174,7 @@ and cannot turn local synchronous I/O into remote persistence. New remote/custom
 stores implement the targeted contract directly. The bundled Postgres adapter is
 `PostgresProviderStore` from `@poppykit/client/provider/postgres`; see
 [storage](STORAGE.md) for explicit migrations, TLS and lifecycle.
+
+## Operations capability metadata
+
+Provider authentication/callback operations are not business operations. Optional `operations:{ready(enrollmentId)}` publishes `extensions.operations.version:"2"` only for that isolated enrollment when its complete agent consent, all used channels and durable recovery are installed. Omission/false publishes nothing. The legacy shared client document never advertises v2. Readiness must reflect host configuration, never Company/model claims or enrollment/OAuth approval. [OPERATIONS.md](OPERATIONS.md) defines the separate business contract.

@@ -50,6 +50,8 @@ export class ProviderError extends Error {
 export interface ProviderOptions {
   clientId: string; callbackUrl: string; jwksUri: string; clientName: string;
   store: ProviderStore; cipher: ResultCipher; metadata: MetadataResolver;
+  /** Publish only for enrollments whose agent has all Operations channels, trusted consent and durable recovery configured. */
+  operations?: { ready(enrollmentId: string): Promise<boolean> };
   signer: IdentitySigner;
   /** Publish new keys before use and retain retired public keys through assertion expiry + skew. */
   publishedKeys?: () => Promise<Record<string, any>[]>;
@@ -287,7 +289,7 @@ export function createProvider(options: ProviderOptions) {
             if (!/^[A-Za-z0-9_-]{43}$/.test(enrollmentId) || request.url !== enrolledClientId(enrollmentId)) return new Response(null,{status:404});
             const enrollment = await store.transaction({kind:'metadata',enrollmentId},tx=>tx.get('enrollment',enrollmentId));
             if (!enrollment || enrollment.revoked || enrollment.clientId !== request.url) return new Response(null,{status:404});
-            return Response.json({client_id:request.url,client_name:options.clientName,jwks_uri:options.jwksUri,redirect_uris:[options.callbackUrl],token_endpoint_auth_method:'private_key_jwt'},{headers});
+            return Response.json({client_id:request.url,client_name:options.clientName,jwks_uri:options.jwksUri,redirect_uris:[options.callbackUrl],token_endpoint_auth_method:'private_key_jwt',...(await options.operations?.ready(enrollmentId) ? {extensions:{operations:{version:'2'}}} : {})},{headers});
           }
         }
         if (request.url === options.jwksUri && request.method === 'GET') return Response.json({ keys: (options.publishedKeys ? await options.publishedKeys() : [{ ...await options.signer.publicJwk(), kid: options.signer.kid }]).map(publicKey) }, { headers });

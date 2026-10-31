@@ -119,3 +119,5 @@ The host supplies operator keys and the standards-compliant signer; the SDK does
 not invent a second operator-key registry or treat its signature as Session verification.
 Operator keys and delegated Session keys have separate roles. Companies still
 verify the Session independently, and may apply operator acceptance policy.
+
+Business-operation retries use the operation ID and approved revision, independently of message/work IDs. A conversation acceptance is not proof the action completed. [Operations v2](OPERATIONS.md) preserves uncertain claims/attempts through timeout, process death, expiry and restart. A different operation returned on retry does not establish the earlier outcome.

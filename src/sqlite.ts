@@ -1,3 +1,5 @@
+import { validateJson } from './protocol/wire.js';
+import type { BusinessAttemptStore } from './operations.js';
 import { DatabaseSync } from 'node:sqlite';
 import { initializeSqlite } from './sqlite-init.js';
 export { SqliteAuthStore } from './auth/sqlite-store.js';
@@ -66,5 +68,36 @@ export class SqliteConversationStore implements ConversationStore {
   }
   async resetCheckpoint(key: ConversationKey, conversation: string, name: string): Promise<void> {
     this.db.prepare('DELETE FROM checkpoints WHERE connection=? AND issuer=? AND endpoint=? AND conversation=? AND name=?').run(key.connectionId, key.issuer, key.endpoint, conversation, name);
+  }
+}
+
+/** Separate from authentication lifecycle operations. Never discard uncertain business attempts. */
+export class SqliteBusinessAttemptStore implements BusinessAttemptStore {
+  private readonly db: DatabaseSync;
+  constructor(path: string, readonly namespace: string) {
+    this.db = new DatabaseSync(path);
+    initializeSqlite(this.db, () => this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+      CREATE TABLE IF NOT EXISTS business_attempts (ns TEXT NOT NULL, id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(ns,id));`));
+  }
+  close(): void { this.db.close(); }
+  async pending(after: string | undefined, limit: number): Promise<string[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new TypeError('business recovery limit');
+    return this.db.prepare("SELECT id FROM business_attempts WHERE ns=? AND id>? AND json_extract(body,'$.phase') IN ('pending_consent','consenting','approved','uncertain') ORDER BY id LIMIT ?").all(this.namespace, after ?? '', limit).map(row => row.id as string);
+  }
+  async transaction<T>(id: string, action: (slot: { record?: import('./operations.js').BusinessAttempt }) => T): Promise<T> {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db.prepare('SELECT body FROM business_attempts WHERE ns=? AND id=?').get(this.namespace, id);
+      const slot = { record: row ? JSON.parse(row.body as string) as import('./operations.js').BusinessAttempt : undefined };
+      if (slot.record && slot.record.version !== 1) throw new Error('unsupported business attempt version');
+      const result = action(slot);
+      if (result && typeof (result as { then?: unknown }).then === 'function') throw new TypeError('async business attempt transaction');
+      if (slot.record) {
+        if (slot.record.version !== 1 || slot.record.id !== id) throw new TypeError('business attempt binding');
+        validateJson(slot.record);
+        this.db.prepare('INSERT INTO business_attempts VALUES (?,?,?) ON CONFLICT(ns,id) DO UPDATE SET body=excluded.body').run(this.namespace, id, JSON.stringify(slot.record));
+      }
+      this.db.exec('COMMIT'); return structuredClone(result);
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 }
