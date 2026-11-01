@@ -1,3 +1,5 @@
+import { CredentialEchoGuard, protectCompanyResponse } from './credential-echo.js';
+import type { CredentialFingerprint } from './credential-echo.js';
 import type { BusinessClientContext } from '../operations.js';
 import { supportsOperations } from '../protocol/operations.js';
 import { parseAlternative } from '../network/tasks.js';
@@ -89,6 +91,8 @@ export interface AuthOutcome {
 export interface SignOutOutcome { connection: Connection; cleanup: 'complete' | 'pending' | 'uncertain' }
 export interface ConversationTarget { issuer: string; endpoint: string; resource?: string }
 export interface ClientAuth {
+  /** Call recover() first; validate saved Company content before exposing or retaining it. */
+  rejectCredentialEcho(value: unknown): void;
   start(domain: string, input?: { anonymous?: boolean; accountFrom?: string }): Promise<AuthOutcome>;
   get(connectionId: string): Promise<Connection | null>;
   list(): Promise<Connection[]>;
@@ -117,6 +121,7 @@ export interface CredentialRecord {
   scopes: string[]; expiresAt: number; generation: number;
 }
 export interface ConnectionRecord {
+  credentialFingerprints?: CredentialFingerprint[];
   id: string; domain: string; issuer: string; metadata: CompanyMetadata;
   userId: string; dpopKeyRef: string; sessionId: string | null;
   generation: number; status: ConnectionStatus; grantId: string | null;
@@ -272,6 +277,8 @@ interface DpopKey { privateKey: CryptoKey; jwk: PublicEcJwk; thumbprint: string 
 interface AcquiredToken { token: TokenResponse; scheme: 'DPoP' | 'Bearer' }
 
 export function createClientAuth(options: ClientAuthOptions): ClientAuth {
+  let echoRecovered = false;
+  const echo = new CredentialEchoGuard(() => { throw new AuthFailure('upstream_reflected_credential'); }, options.clientId, options.now ?? Date.now);
   const { namespace, localUserId, clientId, identity, store, transport } = options;
   // Session Tokens live in memory only (guide "Storing tokens"); after a restart the missing token triggers a renewal.
   const sessionTokens = new Map<string, string>(); // keyed by refs this closure created, so a host ref can never match
@@ -458,7 +465,19 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
   }
   // OAuth requests use client authentication and optional DPoP, independently of Sessions.
   // Throws transport_error only when the request may have reached the issuer without a readable answer.
-  async function tokenRequest(metadata: CompanyMetadata, dpopKeyRef: string, fields: Record<string, string>, operationId?: string): Promise<AcquiredToken> {
+  async function rememberEcho(connectionId: string, values: string[], expiresAt: number) {
+    const fingerprints = echo.remember(values, expiresAt);
+    if (!fingerprints.length) return;
+    const existing = (await record(connectionId)).credentialFingerprints ?? [];
+    if (fingerprints.every(value => existing.some(saved => saved.digest === value.digest && saved.expiresAt >= value.expiresAt))) return;
+    await transaction({ connectionId }, state => {
+      const current = own(state.connections, connectionId)!;
+      const retained = new Map((current.credentialFingerprints ?? []).filter(value => value.expiresAt > now()).map(value => [value.digest, value]));
+      for (const value of fingerprints) if ((retained.get(value.digest)?.expiresAt ?? 0) < value.expiresAt) retained.set(value.digest, value);
+      current.credentialFingerprints = [...retained.values()];
+    });
+  }
+  async function tokenRequest(connectionId: string, metadata: CompanyMetadata, dpopKeyRef: string, fields: Record<string, string>, operationId?: string): Promise<AcquiredToken> {
     const authorization = (await verified(metadata)).authorization!;
     const endpoint = authorization.token_endpoint;
     const key = await loadDpopKey(dpopKeyRef);
@@ -472,6 +491,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       body.set('client_assertion', await assertion('client-authentication', authorization.issuer, key));
       const headers = new Headers({ accept: 'application/json' });
       if (scheme === 'DPoP') headers.set('dpop', await proof(key, 'POST', endpoint));
+      await rememberEcho(connectionId, [...body].filter(([name]) => !['grant_type','scope','resource','client_id','client_assertion_type','redirect_uri'].includes(name)).map(([, value]) => value), now() + 10 * 60_000);
       const request = new Request(endpoint, { method: 'POST', body, headers });
       let response: Response, text: string;
       try { response = await transport.fetch(request); } catch { throw new AuthFailure('transport_error'); }
@@ -482,6 +502,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (response.status === 200) {
         try {
           const token = parseTokenResponse(json);
+          if (token.refresh_token) echo.live.set(connectionId, token.refresh_token);
           if (token.token_type === 'DPoP' && !headers.has('dpop')) throw 0;
           return { token, scheme: token.token_type };
         } catch { throw new AuthFailure('invalid_response'); }
@@ -627,7 +648,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     });
     if (!dispatched) return await endRefresh(operationId, 'failed', 'state_changed');
     const issuedAt = now();
-    const send = () => tokenRequest(claim.connection.metadata, claim.connection.dpopKeyRef, fields);
+    const send = () => tokenRequest(claim.connection.id, claim.connection.metadata, claim.connection.dpopKeyRef, fields);
     let acquired: AcquiredToken | undefined;
     try {
       acquired = await send();
@@ -990,7 +1011,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const issuedAt = now(), fields: Record<string, string> = { grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: code };
       if (operation.resource) fields.resource = operation.resource;
       let token: TokenResponse;
-      try { token = (await tokenRequest(connection.metadata, connection.dpopKeyRef, fields)).token; }
+      try { token = (await tokenRequest(connection.id, connection.metadata, connection.dpopKeyRef, fields)).token; }
       catch (error) {
         if (error instanceof AuthFailure && ['authorization_pending', 'slow_down', 'rate_limited'].includes(error.code)) {
           await holdOff(connection.id, error);
@@ -1033,7 +1054,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if(operation.resource)params.resource=operation.resource;
       const issuedAt=now();
       try {
-        const {token}=await tokenRequest(connection.metadata,connection.dpopKeyRef,params,operationId);
+        const {token}=await tokenRequest(connection.id, connection.metadata,connection.dpopKeyRef,params,operationId);
         return await acceptSignIn(operationId,token,issuedAt);
       } catch(error) {
         if(error instanceof MediatedCodeRequired){
@@ -1102,25 +1123,29 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       headers.set('poppy-session', await sessionHeader(connection, request, token));
       if ((await record(connectionId)).generation !== connection.generation) continue;
       const authorized = new Request(request.clone(), { headers, credentials: 'omit', redirect: 'error' });
+      echo.add(connection.credentialFingerprints ?? []);
+      if (token) await rememberEcho(connectionId, [token], credential!.expiresAt);
+      if ((await record(connectionId)).generation !== connection.generation) continue;
       const streaming = request.headers.get('accept')?.split(',').some(value => value.trim().split(';')[0] === 'text/event-stream');
       const response = await (streaming && transport.stream ? transport.stream(authorized) : transport.fetch(authorized, { waitMs }));
+      const protectedResponse = () => protectCompanyResponse(response, echo.check);
       rememberNonce(request.url, response);
       if (response.status === 429 || response.status === 503) await holdOff(connectionId, responseFailure(response, 'rate_limited'));
       if (response.status === 400) {
         let invalid = false; try { invalid = parseProtocolError(parseJson(await response.clone().text())).error === 'invalid_session'; } catch { /* Not a Session refusal. */ }
         if (invalid && !restarted) {
-          await response.body?.cancel().catch(() => {}); restarted = true;
+          if (retryRejected) await response.body?.cancel().catch(() => {}); restarted = true;
           await transaction({ connectionId }, state => {
             const live = own(state.connections, connectionId)!;
             if (live.generation !== connection.generation) return;
             live.sessionId = randomId('ses_'); live.generation++;
             live.slots = Object.fromEntries(Object.entries(live.slots).map(([key, slot]) => [slotKey(live.sessionId, JSON.parse(key)[1]), slot]));
           });
-          if (!retryRejected) return response;
+          if (!retryRejected) return protectedResponse();
           continue;
         }
       }
-      if (response.status !== 401 || !retryRejected) return response;
+      if (response.status !== 401 || !retryRejected) return protectedResponse();
       const challenge = schemeChallenge(response.headers.get('www-authenticate'), credential?.tokenType ?? scheme), error = challenge?.error;
       if (error === 'use_dpop_nonce' && !nonceRetried && response.headers.has('dpop-nonce')) { await response.body?.cancel().catch(() => {}); nonceRetried = true; continue; }
       if (error === 'invalid_token' && credential && !renewed) {
@@ -1131,11 +1156,12 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         }
         await credentialFor(connectionId, resource, credential.secretRef); continue;
       }
-      return response;
+      return protectedResponse();
     }
   }
 
   const api: ClientAuth = {
+    rejectCredentialEcho(value) { if (!echoRecovered) throw new AuthFailure('credential_guard_not_ready'); echo.check(value); },
     async start(domain, input) {
       let metadata: CompanyMetadata;
       try { metadata = await options.metadata.resolveCompany(domain); } catch { throw new AuthFailure('discovery_failed'); }
@@ -1288,7 +1314,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (operation.resource !== null) fields.resource = operation.resource;
       const issuedAt = now();
       let token: TokenResponse;
-      try { token = (await tokenRequest(connection.metadata, connection.dpopKeyRef, fields)).token; } catch (error) {
+      try { token = (await tokenRequest(connection.id, connection.metadata, connection.dpopKeyRef, fields)).token; } catch (error) {
         if (error instanceof AuthFailure) await holdOff(connection.id, error);
         // A definite rejection is a failure; a lost or non-OAuth answer may have consumed the code, so it is never resent.
         const definite = error instanceof AuthFailure && !AMBIGUOUS.has(error.code);
@@ -1326,6 +1352,16 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
 
     // Host calls this at startup; it never repeats a remote exchange.
     async recover() {
+      const retained = await load({ list: true });
+      for (const connection of Object.values(retained.connections)) echo.add(connection.credentialFingerprints ?? []);
+      for (const connection of Object.values(retained.connections)) {
+        const selected = await load({ connectionId: connection.id });
+        const references = new Set([...Object.values(selected.grants).map(grant => grant.secretRef),
+          ...Object.values(selected.cleanup).map(row => row.secretRef),
+          ...Object.values(selected.operations).filter(operation => operation.phase !== 'terminal' || operation.status === 'uncertain').flatMap(operation => [...privateRefs(operation), ...(operation.staged?.refreshRef ? [operation.staged.refreshRef] : [])])]);
+        for (const reference of references) { const value = await secrets.read(reference); if (value) echo.live.set(reference, value); }
+      }
+      echoRecovered = true;
       const at = now();
       const results: AuthOutcome[] = [];
       let after: string | undefined;

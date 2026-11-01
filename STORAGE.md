@@ -196,3 +196,20 @@ Connection loss invalidates the transaction, rejects the operation and discards
 the broken connection. A successful retry must reconcile durable state first;
 a lost COMMIT response does not prove rollback. Callers still own their pool and
 its idle `error` handler, and host-enlisted connection lifetimes.
+
+
+## Credential reflection records
+
+Connections add optional `credentialFingerprints` (length, lookup hint, SHA-256 and
+expiry) before credential-bearing dispatch. Opaque access tokens are protected for
+their validity window; dispatched OAuth form secrets retain a ten-minute recovery
+window. Current grant secrets are also loaded from custody during recovery, including
+unresolved grants. Typed DPoP/Session/delegation proofs and this client's assertions
+are recognized directly, so polling does not retain every JWT or rewrite auth state
+for each fresh proof. Expired fingerprints are dropped on the next changed credential.
+
+Custom adapters must preserve these additive fields with connection records through
+restart and restore. No SQL/schema reset or migration is required. Fingerprints contain
+no usable credential copies. Unknown historical opaque credentials, including retired
+values outside their protection window, cannot be reconstructed; no historical content
+purge is performed. Stop old writers before release.

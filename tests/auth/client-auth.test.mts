@@ -667,7 +667,10 @@ test('partial consent keeps the previous grant and parks the new Account Token f
   const partial = await signIn(auth, company, connection.id, { scopes: ['orders:read', 'orders:write'], approve: ['orders:write'] });
   assert.equal(partial.status, 'failed'); assert.equal(partial.error, 'replacement_rejected');
   assert.deepEqual(partial.missingScopes, ['orders:read']); assert.deepEqual(partial.connection.scopes, ['orders:read']);
-  assert.deepEqual(store.raw.connections[connection.id], before);
+  const {credentialFingerprints: observed, ...afterAuthority} = store.raw.connections[connection.id];
+  const {credentialFingerprints: prior, ...beforeAuthority} = before;
+  assert.deepEqual(afterAuthority, beforeAuthority);
+  assert.ok(prior!.every(value=>observed!.some(saved=>saved.digest===value.digest)), 'failed consent retains earlier reflection protection');
   const [cleanup] = Object.values(store.raw.cleanup);
   assert.equal(cleanup.status, 'pending'); assert.equal(cleanup.revocationEndpoint, `${company.issuer}/revoke`);
   assert.equal(secrets.map.get(cleanup.secretRef), [...company.grants.keys()].at(-1));
@@ -1756,4 +1759,105 @@ test('shared-grant uncertainty fences a peer fetch paused during Session signing
   await assert.rejects(request,code('grant_uncertain'));
   assert.equal(env.company.requests.filter(request=>request.url===env.company.endpoint).length,count,'no dispatch after uncertainty');
   assert.equal((await env.auth.get(peer.connection.id))!.status,'uncertain');
+});
+
+for (const field of ['authorization', 'dpop', 'poppy-session']) for (const escaped of [false, true]) test(`company ${field} echo is rejected before SDK persistence and retry (${escaped ? 'escaped' : 'literal'})`, async () => {
+  const env = await signedIn(), store = new MemoryConversationStore();
+  const client = () => createConversationClient({...env.target,connectionId:env.id,store,clock:{now:()=>env.clock.t},
+    authorizedRequest:request=>createClientAuth(env.options).authorizedFetch(env.id,request,env.target),maxAttempts:1});
+  let marker = '';
+  env.company.behavior.resourceHandler = request => {
+    marker = request.headers.get(field)!;
+    if (field === 'authorization') marker = marker.replace(/^\S+\s+/, '');
+    const body = {conversation_id:'conversation1',events:[],cursor:null,has_more:false,status:'idle',responder:'agent',extension:{operation:{summary:marker}}};
+    const text = JSON.stringify(body);
+    return new Response(escaped ? text.replaceAll(marker,[...marker].map(char=>'\\u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join('')) : text,{headers:{'content-type':'application/json'}});
+  };
+  for (let retry = 0; retry < 2; retry++) {
+    await assert.rejects(client().start({id:'reflected',author:{type:'agent'},text:'ordinary request'},{wait:0}),{code:'upstream_reflected_credential'});
+    const saved = await store.getOutbound({connectionId:env.id,...env.target},'reflected');
+    assert.equal(saved?.phase,'pending'); assert.equal(saved?.response,undefined);
+    assert.ok(!JSON.stringify(saved).includes(marker));
+  }
+  env.company.behavior.resourceHandler = () => Response.json({conversation_id:'conversation1',events:[],cursor:null,has_more:false,status:'idle',responder:'agent',
+    business:{token:'ordinary business value',authorization:'approved by buyer'}});
+  const safe = await client().retry('reflected');
+  assert.deepEqual(safe.business,{token:'ordinary business value',authorization:'approved by buyer'});
+  assert.deepEqual(await client().retry('reflected'),safe,'safe saved result replays without company I/O');
+});
+
+test('company error extensions and streamed escaped/split credentials never reach consumers',async()=>{
+  const env=await signedIn();
+  env.company.behavior.resourceHandler=request=>Response.json({error:'extension_required',extension:request.headers.get('authorization')},{status:403});
+  await assert.rejects(env.auth.authorizedFetch(env.id,conversations(env.company),env.target),{code:'upstream_reflected_credential'});
+  for(const escaped of [false,true]) for (const separator of ['\n\n','\n\r\n','\r\r','\r\n\r\n']){
+    let currentToken='';
+    env.company.behavior.resourceHandler=request=>{
+      const token=request.headers.get('authorization')!.replace(/^\S+\s+/,'');
+      currentToken=token;
+      const middle=Math.floor(token.length/2),chunks=[token.slice(0,middle),token.slice(middle)].map(text=>JSON.stringify({message_id:'m1',text}));
+      const frames=chunks.map((data,index)=>'event: text-delta\ndata: '+(escaped?data.replaceAll(/[A-Za-z0-9]/g,char=>'\\u'+char.charCodeAt(0).toString(16).padStart(4,'0')):data)+(index===0?separator:'\n\n')).join('');
+      return new Response(frames,{headers:{'content-type':'text/event-stream'}});
+    };
+    const partials:string[]=[];
+    const client=createConversationClient({...env.target,connectionId:env.id,store:new MemoryConversationStore(),clock:{now:()=>env.clock.t},authorizedRequest:request=>env.auth.authorizedFetch(env.id,request,env.target)});
+    await assert.rejects(async()=>{for await(const _ of client.watch('stream1',{onPartial:value=>{if(value)partials.push(value.text);}}))assert.fail('no complete event expected');},{code:'upstream_reflected_credential'});
+    assert.ok(!partials.join('').includes(currentToken),'onPartial never exposes the complete credential');
+  }
+});
+
+
+for (const field of ['authorization','dpop','poppy-session']) test(`earlier ${field} stays protected after nonce retry, restart and saved-result replay`,async()=>{
+  const env=await signedIn();let previous='',calls=0;
+  env.company.behavior.resourceHandler=request=>{
+    if(!calls++){
+      previous=request.headers.get(field)!;if(field==='authorization')previous=previous.replace(/^\S+\s+/,'');
+      return Response.json({error:'use_dpop_nonce'},{status:401,headers:{'www-authenticate':'DPoP error="use_dpop_nonce"','dpop-nonce':'new-nonce'}});
+    }
+    return Response.json({text:'prefix '+previous+' suffix'});
+  };
+  await assert.rejects(env.auth.authorizedFetch(env.id,conversations(env.company),env.target),{code:'upstream_reflected_credential'});
+  const restarted=createClientAuth(env.options);await restarted.recover();
+  assert.throws(()=>restarted.rejectCredentialEcho({text:'prefix '+previous+' suffix'}),{code:'upstream_reflected_credential'});
+  assert.throws(()=>restarted.rejectCredentialEcho({body:Buffer.from(previous).toString('base64')}),{code:'upstream_reflected_credential'});
+  const store=new MemoryConversationStore(),key={connectionId:env.id,...env.target};
+  const safe=createConversationClient({...key,store,clock:{now:()=>env.clock.t},authorizedRequest:async()=>Response.json({conversation_id:'safe',status:'idle',responder:'agent'})});
+  await safe.start({id:'saved',author:{type:'agent'},text:'hello'});
+  const saved=await store.getOutbound(key,'saved');
+  const forged=new MemoryConversationStore();await forged.prepareOutbound(key,{...saved!,response:{...saved!.response!,text:previous}});
+  const guarded=createConversationClient({...key,store:forged,clock:{now:()=>env.clock.t},validateResponse:restarted.rejectCredentialEcho,authorizedRequest:async()=>assert.fail('saved response must not dispatch')});
+  await assert.rejects(guarded.retry('saved'),{code:'upstream_reflected_credential'});
+  assert.ok(!JSON.stringify(env.store.raw).includes(previous),'durable guard stores no credential copy');
+});
+
+test('fingerprint candidate collisions cannot reject ordinary business text',async()=>{
+  const {CredentialEchoGuard}=await import('../../dist/auth/credential-echo.js');
+  const echo=new CredentialEchoGuard(()=>{throw new Error('reflected');});
+  echo.remember(['AAAAAAAAaabb','AAAAAAAAzzzz']);
+  echo.check({text:'AAAAAAAAordinary',token:'business value',authorization:'buyer approved'});
+  assert.throws(()=>echo.check({text:'prefixAAAAAAAAaabbsuffix'}),/reflected/);
+  const hydrated=new CredentialEchoGuard(()=>{throw new Error('reflected');});hydrated.add([...echo.fingerprints.values()]);
+  assert.throws(()=>hydrated.check({nested:'AAAAAAAAzzzz'}),/reflected/);
+});
+
+
+test('OAuth refresh secrets are protected before dispatch and after SDK restart',async()=>{
+  const env=await signedIn(),old=env.secrets.map.get(grantOf(env.store,env.id).secretRef)!;
+  await env.auth.renew(env.id);
+  const restarted=createClientAuth(env.options);await restarted.recover();
+  for(const value of [old,env.secrets.map.get(grantOf(env.store,env.id).secretRef)!]) {
+    assert.throws(()=>restarted.rejectCredentialEcho({text:value}),{code:'upstream_reflected_credential'});
+    env.company.behavior.resourceHandler=()=>Response.json({text:value});
+    await assert.rejects(restarted.authorizedFetch(env.id,conversations(env.company),env.target),{code:'upstream_reflected_credential'});
+  }
+});
+
+test('polling keeps no per-proof fingerprint history and expired opaque records are retired',async()=>{
+  const env=await signedIn();
+  const before=env.store.raw.connections[env.id].credentialFingerprints!.length;
+  for(let i=0;i<25;i++)await env.auth.authorizedFetch(env.id,conversations(env.company),env.target);
+  assert.equal(env.store.raw.connections[env.id].credentialFingerprints!.length,before,'fresh JWT proofs create no durable history');
+  env.clock.t+=3600001;
+  await env.auth.authorizedFetch(env.id,conversations(env.company),env.target);
+  assert.ok(env.store.raw.connections[env.id].credentialFingerprints!.every(value=>value.expiresAt>env.clock.t));
 });

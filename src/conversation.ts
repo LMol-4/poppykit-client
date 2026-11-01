@@ -32,6 +32,8 @@ export interface ConversationClientOptions {
   /** Verified metadata for both peers; omit until trusted Operations consent/recovery is configured. */
   operations?: { client: ClientMetadata; company: PoppyDocument };
   authorizedRequest(request: Request): Promise<Response>;
+  /** Validate decoded/stored Company content before persistence, replay or display. */
+  validateResponse?: (value: unknown) => void;
   endpoint: string; connectionId: string; issuer: string;
   store: ConversationStore;
   clock: { now(): number };
@@ -122,6 +124,7 @@ export function createConversationClient(options: ConversationClientOptions) {
     parseId(id, 'message.id');
     const record = await store.getOutbound(key, id);
     if (!record) throw new ConversationError('unknown_operation');
+    options.validateResponse?.(record);
     if (record.endpoint !== endpoint) throw new ConversationError('invalid_target');
     if (record.phase === 'accepted') {
       try { return record.response && 'events' in record.response ? visiblePage(parseEventPage(record.response, record.read?.cursor, operations)) : parseConversationState(record.response); }
@@ -142,6 +145,7 @@ export function createConversationClient(options: ConversationClientOptions) {
         // A 2xx means accepted; a company that ignores wait answers with a plain state.
         state = body && typeof body === 'object' && ['events', 'cursor', 'has_more'].some(key => key in body) ? parseEventPage(body, record.read?.cursor, operations) : parseConversationState(body);
       } catch { throw new ConversationError('invalid_response', response.status); }
+      options.validateResponse?.(state);
       await store.settleOutbound(key, id, { phase: 'accepted', response: state });
       return 'events' in state ? visiblePage(state as EventPage) : state;
     }
@@ -226,7 +230,7 @@ export function createConversationClient(options: ConversationClientOptions) {
     send: (conversationId: string, message: OutboundInput, opts: ReadParams = {}) => submit(message, conversationId, opts),
     /** Re-dispatch a pending outbound operation with its original ID and content. */
     retry: dispatch,
-    async operation(messageId: string): Promise<OutboundRecord | undefined> { return store.getOutbound(key, messageId); },
+    async operation(messageId: string): Promise<OutboundRecord | undefined> { const record = await store.getOutbound(key, messageId); options.validateResponse?.(record); return record; },
     handoff: (conversationId: string, opts: { signal?: AbortSignal } = {}) => simplePost(conversationId, 'handoff',opts.signal),
     close: (conversationId: string, opts: { signal?: AbortSignal } = {}) => simplePost(conversationId, 'close',opts.signal),
     /** Reads one whole page. Explicit `cursor`, or the checkpoint of a named `consumer` (not both). Never acknowledges. */

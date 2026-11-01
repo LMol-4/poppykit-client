@@ -17,7 +17,7 @@ for complete option/result types. This map describes the supported integration s
 
 ClientAuth methods include `start/get/list/target`, `authorization`,
 `beginSignIn/continueSignIn/completeSignIn/cancelSignIn/operation`, `renew`,
-`signOut/retryCleanup/recover`, `authorizedFetch`, `apiTarget/apiFetch`,
+`signOut/retryCleanup/recover`, `rejectCredentialEcho`, `authorizedFetch`, `apiTarget/apiFetch`,
 `joinBrowser`, `feedback` and `excludedTasks`. Conversation operations bind one connection, issuer
 and endpoint; never substitute profile names or model-provided URLs for that binding.
 

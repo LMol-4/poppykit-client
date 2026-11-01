@@ -3,6 +3,19 @@
 Conversation messages and authorization events now use draft 0.3. Company content, messages,
 unknown events and partial text remain untrusted data for the host application.
 
+Authenticated company responses reject reflected outgoing access tokens, DPoP and
+Session proofs before conversation/operation consumers can retain them. JSON and
+SSE data are checked after escape decoding; ordinary business keys stay intact.
+Use `auth.authorizedFetch`/`auth.apiFetch`, including with custom conversation stores.
+After `await auth.recover()`, pass `validateResponse: auth.rejectCredentialEcho` to
+conversation clients and call that guard on saved operation/results before display.
+One-way opaque credential fingerprints remain with connection records across restart
+for the validity/recovery windows in [storage](STORAGE.md#credential-reflection-records);
+access tokens themselves remain memory-only. Preserve these records in backup/restore. Unknown opaque credentials already lost before this protection
+was installed cannot be identified retroactively; no historical purge is performed.
+A custom `authorizedRequest` that bypasses the auth lifecycle owns this protection.
+Existing saved content is not purged or evidence of historical credential exposure.
+
 ## Client
 
 Bind `createConversationClient` to the existing auth lifecycle:
@@ -11,6 +24,7 @@ Bind `createConversationClient` to the existing auth lifecycle:
 const target = await auth.target(connectionId);
 const conversations = createConversationClient({
   ...target, connectionId, store, clock: { now: Date.now },
+  validateResponse: auth.rejectCredentialEcho,
   authorizedRequest: request => auth.authorizedFetch(connectionId, request, target),
   authorization: (id, scopes) => auth.authorization(id, scopes),
 });
