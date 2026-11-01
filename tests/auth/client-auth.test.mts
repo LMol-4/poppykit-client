@@ -1861,3 +1861,22 @@ test('polling keeps no per-proof fingerprint history and expired opaque records 
   await env.auth.authorizedFetch(env.id,conversations(env.company),env.target);
   assert.ok(env.store.raw.connections[env.id].credentialFingerprints!.every(value=>value.expiresAt>env.clock.t));
 });
+
+test('renew rejects fragmented resources before claiming work and preserves exact absolute resource identifiers', async () => {
+  const { auth, company, store, secrets, id } = await signedIn(), forms = tokenForms(company);
+  const before = structuredClone(store.raw), retainedSecrets = new Map(secrets.map);
+  for (const resource of ['https://api.shop.test/resource#fragment', 'https://api.shop.test/resource#', 'urn:shop:orders#fragment', '/relative', 'https://api.shop.test/a b', ' https://api.shop.test/resource']) {
+    await assert.rejects(auth.renew(id, { resource }), code('invalid_target'));
+    assert.equal(forms.length, 0);
+    assert.deepEqual(store.raw, before, 'invalid input must not claim a grant or create an operation');
+    assert.deepEqual(secrets.map, retainedSecrets);
+  }
+  for (const resource of ['https://api.shop.test/resource?tenant=one', 'urn:shop:orders', 'https://api.shop.test/resource%23part']) {
+    const outcome = await auth.renew(id, { resource });
+    assert.equal(outcome.status, 'completed');
+    assert.equal(expectValue(forms.at(-1)).get('resource'), resource);
+    assert.equal(expectValue(forms.at(-1)).get('grant_type'), 'refresh_token');
+    assert.equal(grantOf(store, id).operationId, null);
+  }
+  assert.equal(forms.length, 3);
+});

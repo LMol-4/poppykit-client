@@ -1397,7 +1397,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
 
     async renew(connectionId, input) {
       const { resource = null, scopes } = (input ?? {}) as { resource?: unknown; scopes?: unknown };
-      if (resource !== null && (typeof resource !== 'string' || !URL.canParse(resource))) throw new AuthFailure('invalid_target', connectionId);
+      if (resource !== null && (typeof resource !== 'string' || !URL.canParse(resource) || /[#\\\s\x00-\x1f\x7f]/.test(resource))) throw new AuthFailure('invalid_target', connectionId);
       if (scopes !== undefined && (!Array.isArray(scopes) || !scopes.length || new Set(scopes).size !== scopes.length || !scopes.every(scope => typeof scope === 'string'))) throw new AuthFailure('invalid_scope', connectionId);
       return renewal(await currentConnection(connectionId), resource, scopes ?? null);
     },
