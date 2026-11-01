@@ -35,6 +35,7 @@ async function main() {
     const required = client ? ['global auth history pruning uses bounded durable selectors (Postgres)', 'callback results encrypted, correlated, atomic, one time; restart, replay, cancel and expiry', 'provider explicitly enlists a separate host transaction and rolls back delivery without pool fallback','shared account grants rotate independently of Sessions and sign-out revokes all local grants (Postgres)']
       : ['Direct completion survives lost commit responses, independent handles and restart without minting a new callback', 'adapter contract: reserved output IDs persist atomic reply and prompt receipts across handles'];
     required.push(client ? 'Operations interrupted consent, persistent uncertainty, expiry and restart replay (Postgres)' : 'Operations two independent processes race approved revisions without duplicate effects (Postgres)');
+    required.push('Postgres socket loss while checked out rejects and rolls back without an uncaught error');
     if (!client) required.push('Operations process crash external-after-effect preserves atomic effects and restart replay (Postgres)', 'Operations running external deadline stays fenced until its late result is reconciled (Postgres)');
     console.log(JSON.stringify({ postgresVersion: version, tests: checkPostgresTap(result.stdout, client ? 161 : 22, required), skipped: 0 }));
   } finally { await pool.end(); }
