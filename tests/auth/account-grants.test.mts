@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { publicEcJwk } from '../../test-support/assertions.mjs';
 
-async function peer(options:{mediated?:boolean;codeRequired?:boolean;input?:TrustedInput;endpoint?:string;resourceMetadata?:(request:Request)=>Response;store?:AuthStore;password?:string;sentTo?:string}={}) {
+async function peer(options:{mediated?:boolean;codeRequired?:boolean;input?:TrustedInput;endpoint?:string;resourceMetadata?:(request:Request)=>Response|Promise<Response>;store?:AuthStore;password?:string;sentTo?:string}={}) {
   const clientId='https://agent.example/client.json',issuer='https://auth.shop.example',endpoint=options.endpoint??'https://shop.example/conversations',redirect='https://agent.example/callback';
   const root=await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},true,['sign','verify']),rootJwk=await publicEcJwk(root.publicKey);
   let state=initialClientAuthState(),tokenCount=0,at=1790900000000,deny=false,lose=false;let resourceReply:((request:Request)=>Response)|undefined,beforeRefresh:(()=>Promise<void>)|undefined;
@@ -174,4 +174,16 @@ test('mediated activation failure keeps the staged grant recoverable without res
 test('a short secret echoed by a Company hint is never shown back or persisted',async()=>{
   const f=await peer({mediated:true,codeRequired:true,password:'a',sentTo:'Company echoes a',input:{async collect(request):Promise<Record<string,string>>{if(request.challenge){assert.equal(request.challenge.sentTo,'The company sent a one-time code.');return {code:'123456'};}return {password:'a'};}}});
   const result=await f.auth.beginSignIn(f.started.connection.id,{method:'mediated',scopes:['orders:read']});assert.equal(result.outcome.status,'pending');assert.ok(!JSON.stringify(f.raw()).includes('Company echoes a'));assert.equal((await f.auth.continueSignIn(result.outcome.operationId)).status,'completed');
+});
+
+test('approved operation context refuses authority replacement during service discovery',async()=>{
+  let hold=false,entered!:()=>void,release!:()=>void;
+  const ready=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r);
+  const f=await peer({resourceMetadata:async()=>{if(hold){entered();await gate;}return new Response(null,{status:404});}});
+  await f.direct();const id=f.started.connection.id,connection=f.raw().connections[id]!;
+  const expected={companyId:connection.issuer,companyName:'Company',clientId:'https://agent.example/client.json',userId:connection.userId,authority:'grant:'+connection.grantId,operations:true};
+  f.advance(61000);hold=true;
+  const sending=f.auth.authorizedFetch(id,new Request('https://shop.example/conversations',{method:'POST',body:'approved-request'}),await f.auth.target(id),[],expected).catch(error=>error);
+  await ready;await f.auth.signOut(id);release();
+  assert.equal((await sending).code,'business_owner_changed');assert.equal(f.resourceRequests.length,0,'a saved approval cannot dispatch under replacement authorization');
 });

@@ -76,20 +76,20 @@ not evidence of failure. Completed results cannot be overwritten by late sends.
 
 `createOperationSender({api,mcp,conversation})` preserves the saved channel:
 
-- API: implement `api(request)` with `auth.apiFetch(connectionId,request,target,
-  scopes)` using the verified original target. `approvedApiRequest` repeats the
+- API: implement `api(request,context)` with `auth.apiFetch(connectionId,request,target,
+  scopes,context)` using the verified original target. `approvedApiRequest` repeats the
   exact method, URL and bytes with `Poppy-Approval`. It drops the initial
   Idempotency-Key; approved retries use the operation ID and no additional key.
   Saved headers exclude credentials/cookies. Successful final status, headers and body
   are stored as JSON (body base64); HTTP202 and non-success remain uncertain with Retry-After.
-- MCP: implement `mcp(url,params,signal)` with your authenticated Streamable HTTP
+- MCP: implement `mcp(url,params,signal,context)` with your authenticated Streamable HTTP
   transport. `approvedMcpParams` repeats the original tool/arguments with approval
   in `params._meta['personalagentprotocol.org/approval']`. Preserve HTTP503 and
   Retry-After as a pending delivery in custom transport adapters. An error tool
   result remains uncertain, including a new operation.
 - Conversation: configure `createConversationClient` with `operations:{client,
   company}` from verified metadata. Both must advertise v2. Implement
-  `conversation(binding,message,signal)` with that client's `send` and original
+  `conversation(binding,message,signal,context)` with that client's `send` and original
   conversation ID. `approvedConversationMessage` is approval-only and retains its
   message ID on retry. Acceptance is pending, not completion; reconcile the later
   business result. Event pages and SSE support operation-only Company messages.
@@ -116,3 +116,5 @@ cancellation. Bundled adapters preserve all decisions by default.
 Run `node examples/operations.mjs --self-check` for a local synthetic flow that
 declines without dispatch. Without the flag it asks through a terminal interface.
 See tests/operations.test.mts for independent-wire and real persistent cases.
+
+Every sender callback receives the original `BusinessClientContext`. Pass it as the final `expectedContext` argument to `auth.apiFetch` or `auth.authorizedFetch`, including conversation approval dispatch. The authentication lifecycle checks it through metadata/credential waits and retries, so a changed Session/account cannot silently supply replacement authority. Custom MCP transports must pin that same context through their final dispatch.

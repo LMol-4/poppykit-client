@@ -104,9 +104,9 @@ export interface ClientAuth {
   signOut(connectionId: string): Promise<SignOutOutcome>;
   retryCleanup(connectionId: string): Promise<SignOutOutcome>;
   recover(): Promise<AuthOutcome[]>;
-  authorizedFetch(connectionId: string, request: Request, target: ConversationTarget, requiredScopes?: readonly string[]): Promise<Response>;
+  authorizedFetch(connectionId: string, request: Request, target: ConversationTarget, requiredScopes?: readonly string[], expectedContext?: BusinessClientContext): Promise<Response>;
   apiTarget(connectionId: string, apiUrl: string, destination?: string): Promise<ApiTarget>;
-  apiFetch(connectionId: string, request: Request, target: ApiTarget, requiredScopes?: readonly string[]): Promise<Response>;
+  apiFetch(connectionId: string, request: Request, target: ApiTarget, requiredScopes?: readonly string[], expectedContext?: BusinessClientContext): Promise<Response>;
   joinBrowser(connectionId: string, returnTo: string, controller: AgentBrowserController): Promise<void>;
   feedback(connectionId: string, report: FeedbackReport): Promise<Alternative | void>;
   excludedTasks(connectionId: string): Promise<ExcludedTask[]>;
@@ -1059,7 +1059,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     finally {if(sensitive)for(const name of Object.keys(sensitive))delete sensitive[name];releaseOwner(executionOwner);}
   }
 
-  async function sendAuthorized(connectionId: string, request: Request, target: ConversationTarget, requiredScopes: readonly string[], scheme: 'DPoP' | 'Bearer' = 'DPoP', retryRejected = true, service?: 'mcp' | 'openapi' | 'conversation'): Promise<Response> {
+  async function sendAuthorized(connectionId: string, request: Request, target: ConversationTarget, requiredScopes: readonly string[], scheme: 'DPoP' | 'Bearer' = 'DPoP', retryRejected = true, service?: 'mcp' | 'openapi' | 'conversation', expectedContext?: BusinessClientContext): Promise<Response> {
     const url = new URL(request.url), endpoint = new URL(target.endpoint), base = endpoint.pathname.replace(/\/$/, '');
     if (!safeHttps(request.url) || url.origin !== endpoint.origin || (url.pathname !== endpoint.pathname && !url.pathname.startsWith(`${base}/`))) throw new AuthFailure('invalid_target', connectionId);
     let resource = target.resource ?? null;
@@ -1068,6 +1068,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     let restarted = false, nonceRetried = false, renewed = false, discovered = false;
     for (;;) {
       const connection = await record(connectionId);
+      if(expectedContext && (expectedContext.companyId!==connection.issuer || expectedContext.clientId!==clientId || expectedContext.userId!==connection.userId || expectedContext.authority!==(connection.status==='signed_in'&&connection.grantId?'grant:'+connection.grantId:'session:'+connection.sessionId)))throw new AuthFailure('business_owner_changed',connectionId);
       if (connection.status === 'disconnected') throw new AuthFailure('disconnected', connectionId);
       if (connection.status === 'uncertain') throw new AuthFailure('grant_uncertain', connectionId);
       checkCooldown(connection);
@@ -1403,11 +1404,11 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const connection = await currentConnection(connectionId);
       try { return await resolveApiTarget(connection.metadata, options.metadata, transport, apiUrl, destination); } catch { throw new AuthFailure('invalid_target', connectionId); }
     },
-    async apiFetch(connectionId, request, target, requiredScopes = []) {
+    async apiFetch(connectionId, request, target, requiredScopes = [], expectedContext) {
       const expected = await api.apiTarget(connectionId, target.apiUrl, target.endpoint);
       if (expected.kind !== target.kind || expected.issuer !== target.issuer || expected.endpoint !== target.endpoint || expected.resource !== target.resource || expected.scheme !== target.scheme) throw new AuthFailure('invalid_target', connectionId);
       if (expected.kind === 'mcp' && request.url !== expected.endpoint) throw new AuthFailure('invalid_target', connectionId);
-      return sendAuthorized(connectionId, request, expected, requiredScopes, expected.scheme, true, expected.kind);
+      return sendAuthorized(connectionId, request, expected, requiredScopes, expected.scheme, true, expected.kind, expectedContext);
     },
     async joinBrowser(connectionId, returnTo, controller) {
       const connection = await currentConnection(connectionId), endpoint = connection.metadata.document.web?.browser_session_endpoint;
@@ -1449,10 +1450,10 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       if (!options.metadata.resolveExcludedTasks) throw new AuthFailure('excluded_tasks_unavailable', connectionId);
       return options.metadata.resolveExcludedTasks(connection.metadata.document);
     },
-    async authorizedFetch(connectionId, request, target, requiredScopes = []) {
+    async authorizedFetch(connectionId, request, target, requiredScopes = [], expectedContext) {
       const connection = await currentConnection(connectionId), expected = targetOf(connection);
       if (target.issuer !== expected.issuer || target.endpoint !== expected.endpoint || target.resource !== expected.resource) throw new AuthFailure('invalid_target', connectionId);
-      return sendAuthorized(connectionId, request, expected, requiredScopes, 'DPoP', true, 'conversation');
+      return sendAuthorized(connectionId, request, expected, requiredScopes, 'DPoP', true, 'conversation', expectedContext);
     },
   };
   return api;

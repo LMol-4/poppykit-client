@@ -43,7 +43,7 @@ async function fixture(t: test.TestContext) {
   return join(dir, 'state.db');
 }
 function worker(t: test.TestContext, mode: string, path: string) {
-  const options:SpawnOptions={windowsHide:true,stdio:['ignore','ignore','pipe','ipc']};
+  const options:SpawnOptions={windowsHide:true,stdio:['ignore','ignore','pipe','ipc'],env:{...process.env,D1_POSTGRES:'0'}};
   const child = fork(new URL('../test-support/storage-worker.mjs', import.meta.url), [mode,path],options);
   const exited = once(child, 'exit');
   let errors = ''; expectValue(child.stderr).on('data', b => { errors += b; });

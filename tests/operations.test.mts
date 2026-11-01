@@ -92,7 +92,7 @@ for(const engine of ['SQLite',...(process.env.D1_POSTGRES==='1'?['Postgres']:[])
   });
   test(`Operations MCP and conversation preserve exact arguments and approval-only content (${engine})`,async()=>{
     const f=await fixture();try{
-      const calls:unknown[]=[],sender=createOperationSender({api:async()=>{throw Error('wrong channel');},mcp:async(url,params)=>{calls.push([url,params]);return {content:[{type:'text',text:'done'}]};},conversation:async(request,message)=>{calls.push([request,message]);}}),client=f.make({send:sender});
+      const calls:unknown[]=[],sender=createOperationSender({api:async()=>{throw Error('wrong channel');},mcp:async(url,params,_signal,context)=>{assert.deepEqual(context,initial);calls.push([url,params]);return {content:[{type:'text',text:'done'}]};},conversation:async(request,message,_signal,context)=>{assert.deepEqual(context,initial);calls.push([request,message]);}}),client=f.make({send:sender});
       await client.receiveMcp('mcp',binding as Extract<OperationRequest,{channel:'mcp'}>,{isError:true,structuredContent:{operation}});await client.requestConsent('mcp');assert.equal((await client.retry('mcp')).phase,'completed');
       assert.deepEqual(calls[0],[binding.channel==='mcp'?binding.url:'', {name:'exchange',arguments:{item:'jacket',amount:'70.00'},_meta:{'personalagentprotocol.org/approval':{operation_id:'exchange_1',revision:'revision_1'}}}]);
       const conversation={channel:'conversation',endpoint:'https://company.example/conversations',conversationId:'conversation'} as const;
@@ -111,7 +111,7 @@ for(const engine of ['SQLite',...(process.env.D1_POSTGRES==='1'?['Postgres']:[])
   });
   test(`Operations API202 stays uncertain and late reconciliation cannot overwrite completion (${engine})`,async()=>{
     const f=await fixture();try{
-      const sender=createOperationSender({api:async()=>Response.json({queued:true},{status:202,headers:{'Retry-After':'2'}}),mcp:async()=>({}),conversation:async()=>{}}),client=f.make({send:sender});
+      const sender=createOperationSender({api:async(_request,context)=>{assert.deepEqual(context,initial);return Response.json({queued:true},{status:202,headers:{'Retry-After':'2'}});},mcp:async()=>({}),conversation:async()=>{}}),client=f.make({send:sender});
       await client.receiveApi('action',new Request('https://company.example/action',{method:'POST',body:'exact'}),Response.json({error:'approval_required',operation},{status:403}));
       await client.requestConsent('action');assert.equal((await client.retry('action')).phase,'uncertain');
       await assert.rejects(client.retry('action'),fail('retry_later'));

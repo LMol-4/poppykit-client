@@ -194,22 +194,22 @@ export function approvedConversationMessage(attempt: BusinessAttempt, approval: 
 }
 /** Adapters must use verified SDK channel targets and current authorization; a conversation acceptance is still pending work. */
 export function createOperationSender(channels: {
-  api(request: Request): Promise<Response>;
-  mcp(url: string, params: JsonObject, signal: AbortSignal): Promise<JsonObject>;
-  conversation(request: Extract<OperationRequest, { channel: 'conversation' }>, message: Message, signal: AbortSignal): Promise<void>;
+  api(request: Request, context: BusinessClientContext): Promise<Response>;
+  mcp(url: string, params: JsonObject, signal: AbortSignal, context: BusinessClientContext): Promise<JsonObject>;
+  conversation(request: Extract<OperationRequest, { channel: 'conversation' }>, message: Message, signal: AbortSignal, context: BusinessClientContext): Promise<void>;
 }) {
   return async (attempt: Readonly<BusinessAttempt>, approval: OperationApproval, signal: AbortSignal): Promise<OperationDelivery> => {
     if (attempt.request.channel === 'api') {
-      const response = await channels.api(approvedApiRequest(attempt, approval, signal));
+      const response = await channels.api(approvedApiRequest(attempt, approval, signal), attempt.context);
       if (response.status === 202 || !response.ok) { await response.body?.cancel(); return { kind: 'pending', retryAfterMs: retryAfterMilliseconds(response.headers.get('retry-after'), Date.now()) }; }
       return { kind: 'completed', result: { status: response.status, headers: [...response.headers].filter(([name]) => !['set-cookie','authorization','poppy-session','dpop'].includes(name)), body: Buffer.from(await response.arrayBuffer()).toString('base64') } };
     }
     if (attempt.request.channel === 'mcp') {
-      const result = await channels.mcp(attempt.request.url, approvedMcpParams(attempt, approval), signal);
+      const result = await channels.mcp(attempt.request.url, approvedMcpParams(attempt, approval), signal, attempt.context);
       if (result.isError === true) return { kind: 'pending' };
       return { kind: 'completed', result };
     }
-    await channels.conversation(attempt.request, approvedConversationMessage(attempt, approval), signal);
+    await channels.conversation(attempt.request, approvedConversationMessage(attempt, approval), signal, attempt.context);
     return { kind: 'pending' };
   };
 }

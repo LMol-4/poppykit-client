@@ -95,3 +95,5 @@ leaving 30–60 minutes at creation. Host providers may return a different valid
 lifetime within the client's one-hour freshness bound. See [CONFORMANCE.md](CONFORMANCE.md).
 
 Authentication lifecycle OperationRecord/operationId values never approve business operations. OAuth access consent, provider enrollment and mediated credential collection cannot supply business consent. [Operations v2](OPERATIONS.md) binds each actual user answer to the exact revision and request, and rechecks current Session/account authority for execution and protected replay.
+
+For business-operation sends, pass the saved `BusinessClientContext` as the final `expectedContext` argument to `apiFetch`/`authorizedFetch`. Channel sender callbacks receive that context. A changed Company/client/User/account or signed-out Session fails before dispatch; target discovery does not authorize a replacement account. See [Operations](OPERATIONS.md).

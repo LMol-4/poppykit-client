@@ -125,3 +125,5 @@ when to read the metadata. No task-policy engine or alternative executor is supp
 ## Operations v2
 
 [OPERATIONS.md](OPERATIONS.md) defines API403/Poppy-Approval, MCP structuredContent/_meta and conversation operation/approval integration. Publish support only after all interfaces in use have trusted consent and durable effect recovery. Ordinary MCP clients retain their OAuth flow; one unsupported tool returns a tool error. No v1 extension endpoint is added.
+
+For business-operation sends, pass the saved `BusinessClientContext` as the final `expectedContext` argument to `apiFetch`/`authorizedFetch`. Channel sender callbacks receive that context. A changed Company/client/User/account or signed-out Session fails before dispatch; target discovery does not authorize a replacement account. See [Operations](OPERATIONS.md).
