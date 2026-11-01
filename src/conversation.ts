@@ -206,8 +206,9 @@ export function createConversationClient(options: ConversationClientOptions) {
             for await(const frame of parseEventStream(response.body,{signal:opts.signal, operations})){
               if(frame.kind==='delta'){partialBytes+=Buffer.byteLength(frame.text);if(partialBytes>1048576)throw new ConversationError('body_limit');opts.onPartial?.({messageId:frame.messageId,text:frame.text});continue;}
               const event=frame.event,previous=cursor;
+              if(event.type==='message'){partialBytes=0;opts.onPartial?.(null);}
               if(seen.has(event.id))continue;
-              if(seen.size>=10000)throw new ConversationError('too_many_events');seen.add(event.id);if(event.type==='message')opts.onPartial?.(null);if(knownEvents.has(event.type))yield eventAck(event,previous);else await eventAck(event,previous).ack();
+              if(seen.size>=10000)throw new ConversationError('too_many_events');seen.add(event.id);if(knownEvents.has(event.type))yield eventAck(event,previous);else await eventAck(event,previous).ack();
               cursor=event.id;closed=event.type==='state'&&event.status==='closed';
             }
           } else {

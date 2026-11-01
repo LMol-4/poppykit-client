@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — remediation job 2
+
+- Client metadata may omit `redirect_uris`; omission registers no callbacks. The
+  public `ClientMetadata.redirect_uris` type is optional; consumers that inspect it
+  must use `redirect_uris ?? []`. Supplied arrays remain validated, and Direct
+  Sign-In still requires a registered callback.
+- `renew` rejects fragment-bearing and malformed resource URLs before claiming a
+  grant or sending a token request. Abstract absolute identifiers such as `urn:`
+  remain valid inputs; the issuer decides which resources it permits.
+- Streaming releases unfinished-text accounting on completed message events;
+  the 1 MiB unfinished/frame and 16 MiB stream limits still apply.
+
+No schema, stored-record, configuration or dependency migration. Preserve pending
+operations and credentials; publish and pin the coordinated SDK release before
+consumer deployment. This entry describes local source, not a published version.
+
 Local migration block2 adds Operations v2 codecs, negotiated API/MCP/conversation mechanics and durable trusted-consent attempt storage/recovery. See [OPERATIONS.md](OPERATIONS.md). This is a local SDK checkpoint, not full CLI integration or package publication.
 
 ## 0.6.1 — 2026-11-01

@@ -49,8 +49,8 @@ are bounded (default 4); exhaustion is explicit `reconnect_exhausted`.
 sends `Last-Event-ID`. `onPartial` is display-only: a null value clears unfinished
 text on completion/disconnect; never execute or reason from an incomplete delta.
 Messages are actionable only after a complete `message` event. SSE frames and
-JSON fallback are limited to 1 MiB, streams to 16 MiB, and partial text per stream
-to 1 MiB. UTF-8 fragmentation and CR/LF/CRLF are supported.
+JSON fallback are limited to 1 MiB, streams to 16 MiB, and unfinished partial text
+to 1 MiB, released when a complete message arrives. UTF-8 fragmentation and CR/LF/CRLF are supported.
 
 `cursor_expired` is an explicit history gap. Inform the user, then reset a named
 consumer and reread retained history, or supply `onHistoryGap` returning true.

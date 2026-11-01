@@ -682,3 +682,20 @@ test('unknown OAuth errors remain unknown rather than becoming an errorless acco
   const client=createConversationClient({endpoint:EP,issuer:'https://issuer.example',connectionId:'unknown',store:memoryStore(),clock:{now:()=>0},authorizedRequest:async()=>new Response(null,{status:401,headers:{'www-authenticate':'Bearer error="future_error", scope="orders:read"'}})});
   await assert.rejects(client.read('conv_unknown'),error=>error instanceof ConversationError&&error.code==='http_error');
 });
+
+test('watch releases completed message bytes while enforcing unfinished, frame and stream budgets', async () => {
+  const text = 'x'.repeat(600 * 1024);
+  const delta = (id: string) => 'event: text-delta\ndata: ' + JSON.stringify({message_id:id,text}) + '\n\n';
+  const complete = (id: string) => eventFrame({id:'event_'+id,type:'message',created_at:'2026-10-22T00:00:00Z',message:{id,role:'company',author:{type:'agent'},text}});
+  const closed = eventFrame({...streamEvent('closed'),status:'closed'});
+  const watch = (body: string) => createConversationClient({endpoint:EP,connectionId:'c',issuer:'i',store:memoryStore(),clock:{now:()=>0},authorizedRequest:async()=>streamResponse(body,65536)});
+  const partial: ({messageId:string;text:string}|null)[] = [], events: string[] = [];
+  for await (const item of watch(delta('m1')+complete('m1')+delta('m2')+complete('m2')+closed).watch('c1',{maxReconnects:0,onPartial:value=>partial.push(value)})) events.push(item.event.id);
+  assert.deepEqual(events,['event_m1','event_m2','closed']);
+  assert.deepEqual(partial.filter(value=>value!==null).map(value=>value.messageId),['m1','m2']);
+  assert.equal(partial.at(-1),null);
+  await assert.rejects(async()=>{for await(const _ of watch(delta('m1')+eventFrame(streamEvent('idle'))+delta('m1')).watch('c1')){}},{code:'body_limit'});
+  await assert.rejects(async()=>{for await(const _ of watch('data: '+ 'x'.repeat(1048577)).watch('c1')){}},{field:'sse.frame.size'});
+  // Every message is individually valid; the total encoded response still has a fixed ceiling.
+  await assert.rejects(async()=>{for await(const _ of watch(Array.from({length:14},(_,i)=>delta('m'+i)+complete('m'+i)).join('')+closed).watch('c1')){}},{field:'sse.stream.size'});
+});
