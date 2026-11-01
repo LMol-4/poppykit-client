@@ -99,7 +99,7 @@ but cannot recover another installation's result. Enrollment never accepts calle
 subjects, arbitrary audiences, lifetimes, key IDs, raw bytes or signing claims.
 
 `identity` takes domain and exact issuer; `begin` registers immutable operation,
-issuer/domain, purpose (`client-authentication`, `direct`) and Direct Session Key binding. Company metadata is independently
+issuer/domain, purpose (`client-authentication`, `direct`) and the Direct OAuth DPoP thumbprint (or explicit null for an unbound Bearer code). Company metadata is independently
 resolved and enrollment company policy checked. `assert` takes operation/purpose
 only and constructs a 60-second assertion with fresh 256-bit jti. New Sessions use `delegate({operationId,jwk})`: an enrollment restricted to one
 Company can obtain a cnf-only ES256 delegation with coarse half-hour issuance and a one-hour signed lifetime for a public P-256 key.
