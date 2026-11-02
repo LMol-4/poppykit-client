@@ -1,11 +1,15 @@
 # Changelog
 
-## Unreleased — remediation job 4
+## 0.6.2 — 2026-11-02
+
+Reject reflected company credentials before persistence and exposure; preserve owner-scoped recovery and uncertainty.
+
+### Consent and approval
 
 - Verify same-account additional consent using advertised OAuth introspection; refuse mismatches or unavailable continuity evidence without replacing old authority.
 - Export exact structured operation comparison with explicit semantic limits.
 
-## Unreleased — remediation job 2
+### Correctness and interoperability
 
 - Client metadata may omit `redirect_uris`; omission registers no callbacks. The
   public `ClientMetadata.redirect_uris` type is optional; consumers that inspect it

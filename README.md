@@ -6,7 +6,7 @@ Discover companies, authenticate and manage conversations. [MIT](LICENSE).
 ## Install
 
 ```sh
-npm install @poppykit/client
+pnpm add @poppykit/client
 ```
 
 ## Discover a company
