@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.2 — 2026-11-02
+## 0.6.3 — 2026-11-02
 
 Reject reflected company credentials before persistence and exposure; preserve owner-scoped recovery and uncertainty.
 

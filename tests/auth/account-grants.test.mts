@@ -17,29 +17,33 @@ async function peer(options:{mediated?:boolean;codeRequired?:boolean;input?:Trus
   const clientId='https://agent.example/client.json',issuer='https://auth.shop.example',endpoint=options.endpoint??'https://shop.example/conversations',redirect='https://agent.example/callback';
   const root=await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},true,['sign','verify']),rootJwk=await publicEcJwk(root.publicKey);
   let state=initialClientAuthState(),tokenCount=0,at=1790900000000,deny=false,lose=false;let resourceReply:((request:Request)=>Response)|undefined,beforeRefresh:(()=>Promise<void>)|undefined;
-  const vault=new Map<string,string>(),forms:URLSearchParams[]=[],resourceRequests:Request[]=[],revoked:string[]=[],jti=new Set<string>();
+  const vault=new Map<string,string>(),forms:URLSearchParams[]=[],resourceRequests:Request[]=[],revoked:string[]=[],jti=new Set<string>(),refreshTokens=new Set<string>();
   const memory:AuthStore={async read(){return structuredClone(state);},async transaction(_selection,change){const draft=structuredClone(state),result=change(draft);state=draft;return structuredClone(result);},async pendingOperations(){return Object.values(state.operations).filter(row=>row.phase!=='terminal').map(row=>row.id);}};
   const backing=options.store??memory;
   const store:AuthStore={async read(selection){const value=await backing.read(selection);state=value;return value;},async transaction(selection,change){const result=await backing.transaction(selection,change);state=await backing.read({list:true});return result;},pendingOperations:(after,limit)=>backing.pendingOperations(after,limit)};
   const transport={async fetch(request:Request){
     if(request.url==='https://shop.example/.well-known/poppy.json')return Response.json({protocol_version:'0.3',organization:{name:'Independent OAuth Company',domain:'shop.example'},agent:{protocols:[{type:'poppy',endpoint}]},...(options.mediated?{extensions:{'mediated-sign-in':{version:'1',fields:[{name:'password',label:'Password',secret:true}],scopes:['orders:read']}}}:{})});
     if(request.url==='https://shop.example/.well-known/oauth-protected-resource')return Response.json({resource:'https://shop.example',authorization_servers:[issuer]});
-    if(request.url===issuer+'/.well-known/oauth-authorization-server')return Response.json({issuer,token_endpoint:issuer+'/token',revocation_endpoint:issuer+'/revoke',authorization_endpoint:issuer+'/authorize',protected_resources:['https://shop.example'],grant_types_supported:['refresh_token','authorization_code',...(options.mediated?['https://personalagentprotocol.org/grant/mediated-sign-in']:[])]});
+    if(request.url===issuer+'/.well-known/oauth-authorization-server')return Response.json({issuer,token_endpoint:issuer+'/token',revocation_endpoint:issuer+'/revoke',introspection_endpoint:issuer+'/introspect',authorization_endpoint:issuer+'/authorize',protected_resources:['https://shop.example'],grant_types_supported:['refresh_token','authorization_code',...(options.mediated?['https://personalagentprotocol.org/grant/mediated-sign-in']:[])]});
     if(request.url.includes('/.well-known/oauth-protected-resource/'))return options.resourceMetadata?.(request)??new Response(null,{status:404});
-    if(request.url===issuer+'/token'){
+    if(request.url===issuer+'/token'||request.url===issuer+'/introspect'){
       assert.equal(request.headers.get('poppy-session'),null);assert.equal(request.headers.get('dpop'),null,'Bearer-only issuer does not advertise DPoP');
-      const form=new URLSearchParams(await request.text());forms.push(form);tokenCount++;if(form.get('grant_type')==='refresh_token')await beforeRefresh?.();
+      const form=new URLSearchParams(await request.text());
+      if(request.url===issuer+'/token'){forms.push(form);tokenCount++;if(form.get('grant_type')==='refresh_token')await beforeRefresh?.();}
       const assertion=form.get('client_assertion');assert.ok(assertion);await compactVerify(assertion,await importJWK(rootJwk,'ES256'),{algorithms:['ES256']});
       const claims=decodeJwt(assertion);assert.equal(claims.iss,clientId);assert.equal(claims.sub,clientId);assert.equal(claims.aud,issuer);assert.equal(jti.has(claims.jti!),false);jti.add(claims.jti!);
+      if(request.url===issuer+'/introspect')return Response.json(refreshTokens.has(form.get('token')!)?{active:true,sub:'independent-stable-account',client_id:clientId,scope:'orders:read'}:{active:false});
       if(deny)return Response.json({error:'invalid_grant'},{status:400});
       if(form.get('grant_type')==='https://personalagentprotocol.org/grant/mediated-sign-in'){
         if(!form.has('sign_in_id')){assert.equal(form.get('password'),options.password??'private-password');assert.equal(form.get('scope'),'orders:read');if(options.codeRequired)return Response.json({error:'code_required',sign_in_id:'signin_1',sent_to:options.sentTo??'Your phone',expires_in:60},{status:400});}
         else{assert.equal(form.get('sign_in_id'),'signin_1');assert.equal(form.get('one_time_code'),'123456');assert.equal(form.has('scope'),false);assert.equal(form.has('password'),false);}
       }
       if(lose)throw new Error('synthetic lost token response');
+      if(form.get('grant_type')==='refresh_token')refreshTokens.delete(form.get('refresh_token')!);
+      refreshTokens.add('refresh-'+tokenCount);
       return Response.json({access_token:'access-'+tokenCount,token_type:'Bearer',refresh_token:'refresh-'+tokenCount,scope:'orders:read'});
     }
-    if(request.url===issuer+'/revoke'){revoked.push(new URLSearchParams(await request.text()).get('token')!);return new Response(null,{status:200});}
+    if(request.url===issuer+'/revoke'){const token=new URLSearchParams(await request.text()).get('token')!;revoked.push(token);refreshTokens.delete(token);return new Response(null,{status:200});}
     assert.equal(request.url,endpoint);const authorization=request.headers.get('authorization');if(authorization)assert.ok(authorization.startsWith('Bearer access-'));assert.equal(request.headers.get('dpop'),null);
     const jwt=request.headers.get('poppy-session');assert.ok(jwt);const header=decodeProtectedHeader(jwt),delegation=decodeJwt(header.pap_dlg as string);await compactVerify(header.pap_dlg as string,await importJWK(rootJwk,'ES256'));
     const key=(delegation.cnf as {jwk:Record<string,string>}).jwk;await compactVerify(jwt,await importJWK(key,'ES256'));
