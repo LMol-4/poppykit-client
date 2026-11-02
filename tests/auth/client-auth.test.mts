@@ -298,7 +298,7 @@ test('an identity signer that reuses the DPoP key is refused', async () => {
 test("token endpoint nonce retries use fresh client assertions and proofs without Session assertions", async () => {
 
   const {auth,company}=await setup();const started=await auth.start(company.domain);company.behavior.requireNonce=true;
-  assert.equal((await signIn(auth,company,started.connection.id)).status,'completed');assert.equal(company.proofs.length,2);assert.equal(company.proofs[0].payload.nonce,undefined);assert.equal(company.proofs[1].payload.nonce,company.nonce);assert.notEqual(company.proofs[0].payload.jti,company.proofs[1].payload.jti);assert.equal(new Set(company.assertions.map(row=>row.payload.jti)).size,2);assert.ok(company.assertions.every(row=>row.kind==='client'));
+  assert.equal((await signIn(auth,company,started.connection.id)).status,'completed');assert.equal(company.proofs.length,2);assert.equal(company.proofs[0].payload.nonce,undefined);assert.equal(company.proofs[1].payload.nonce,company.nonce);assert.notEqual(company.proofs[0].payload.jti,company.proofs[1].payload.jti);assert.equal(new Set(company.assertions.map(row=>row.payload.jti)).size,3);assert.ok(company.assertions.every(row=>row.kind==='client'));
   const stubborn=await setup(),connection=(await stubborn.auth.start(stubborn.company.domain)).connection;stubborn.company.behavior.requireNonce=true;stubborn.company.behavior.rotateNonceEveryTime=true;
   assert.equal((await signIn(stubborn.auth,stubborn.company,connection.id)).error,'use_dpop_nonce');assert.equal(exchanges(stubborn.company),2);
 
@@ -534,17 +534,17 @@ test('Direct Sign-In after the Session idle-expired binds to a replacement Sessi
   assert.equal((await (await auth.authorizedFetch(connection.id, conversations(company), target)).json()).account, 'acct_1');
 });
 
-test('Direct Sign-In after both the Session and the Account Token ended binds to a new signed-out Session', async () => {
-  const { auth, company, store, clock, id, sessionId } = await signedIn();
-  clock.t += 25 * 3600_000;
-  for (const grant of company.grants.values()) grant.revoked = true;
-  const forms = tokenForms(company);
-  const outcome = await signIn(auth, company, id, { scopes: ['orders:read', 'orders:write'] });
-  assert.deepEqual([outcome.status, outcome.connection.status], ['completed', 'signed_in']);
-  const current = store.raw.connections[id].sessionId;
-  assert.notEqual(current, sessionId);
-  assert.deepEqual(forms.map(form => [form.get('grant_type'), form.get('session_id')]), [
-    ['authorization_code', null]]);
+test('re-consent after expired and cleaned Session uses issuer account evidence, never the old sid', async () => {
+  const f=await signedIn(),oldSid=f.sessionId;
+  f.clock.t += 25 * 3600_000;f.company.sessions.delete(oldSid);
+  const same=await signIn(f.auth,f.company,f.id,{scopes:['orders:read','orders:write']});
+  assert.equal(same.status,'completed');assert.notEqual(same.connection.sessionId,oldSid);
+  assert.equal((await f.auth.authorizedFetch(f.id,conversations(f.company),f.target)).status,200);
+  const before=(await f.auth.get(f.id))!,grant=f.store.raw.connections[f.id].grantId;
+  f.company.sessions.clear();
+  const different=await signIn(f.auth,f.company,f.id,{account:'acct_b',scopes:['orders:read','orders:write']});
+  assert.deepEqual([different.status,different.error],['failed','account_mismatch']);
+  assert.equal(different.connection.sessionId,before.sessionId);assert.equal(f.store.raw.connections[f.id].grantId,grant);
 });
 
 test('the authorization request and code exchange carry PKCE, state, issuer and session', async () => {
@@ -702,13 +702,28 @@ test('a scope upgrade replaces the grant and parks the old one; old slots stop b
   assert.ok(oldSlots.every(ref => !secrets.map.has(ref)));
 });
 
-test("successful account replacement changes sid and failed replacement preserves its current account", async () => {
-
+test('re-consent compares account subjects, preserves denial and fences old business authority', async () => {
   const f=await signedIn(),oldSid=(await f.auth.get(f.id))!.sessionId;
-  const replacement=await signIn(f.auth,f.company,f.id,{account:'acct_b',scopes:['orders:read','orders:write']});assert.equal(replacement.status,'completed');assert.notEqual(replacement.connection.sessionId,oldSid);
-  const read=async()=>(await(await f.auth.authorizedFetch(f.id,conversations(f.company),f.target)).json()).account;assert.equal(await read(),'acct_b');
-  const denied=await signIn(f.auth,f.company,f.id,{account:'acct_c',deny:true});assert.equal(denied.status,'denied');assert.equal((await f.auth.get(f.id))!.sessionId,replacement.connection.sessionId);assert.equal(await read(),'acct_b');assert.equal(f.company.sessions.get(oldSid)!.account,'acct_1','old Session account was not rewritten');
+  const context={companyId:f.company.issuer,companyName:'Fake company',clientId:CLIENT_ID,userId:f.store.raw.connections[f.id].userId,authority:'grant:'+f.store.raw.connections[f.id].grantId,operations:true};
+  const same=await signIn(f.auth,f.company,f.id,{scopes:['orders:read','orders:write']});
+  assert.equal(same.status,'completed');assert.notEqual(same.connection.sessionId,oldSid);
+  await assert.rejects(f.auth.authorizedFetch(f.id,conversations(f.company),f.target,[],context),code('business_owner_changed'));
+  const current=same.connection.sessionId;
+  const denied=await signIn(f.auth,f.company,f.id,{account:'acct_b',deny:true});
+  assert.equal(denied.status,'denied');assert.equal(denied.connection.sessionId,current);
+  const replacement=await signIn(f.auth,f.company,f.id,{account:'acct_b',scopes:['orders:read','orders:write']});
+  assert.deepEqual([replacement.status,replacement.error,replacement.connection.sessionId],['failed','account_mismatch',current]);
+  assert.equal((await f.auth.authorizedFetch(f.id,conversations(f.company),f.target)).status,200);
+});
 
+test('additional consent without trustworthy introspection fails closed and retains old grant',async()=>{
+  const f=await setup(),resolve=f.options.metadata.resolveCompany;
+  f.options.metadata.resolveCompany=async domain=>{const found=await resolve(domain),authorization={...found.authorization!};delete authorization.introspection_endpoint;return {...found,authorization};};
+  const connection=(await f.auth.start(f.company.domain)).connection;
+  assert.equal((await signIn(f.auth,f.company,connection.id)).status,'completed','initial sign-in does not require introspection');
+  const before=structuredClone(f.store.raw.connections[connection.id]),codes=f.company.codes.size;
+  await assert.rejects(f.auth.beginSignIn(connection.id,{scopes:['orders:read','orders:write'],force:true,redirectUri:REDIRECT,browserBinding:BROWSER}),code('account_continuity_unavailable'));
+  assert.equal(f.store.raw.connections[connection.id].grantId,before.grantId);assert.equal(f.company.codes.size,codes);
 });
 
 test('token responses that are not a usable signed-in grant fail and park any Account Token', async () => {
@@ -1419,7 +1434,7 @@ for (const method of ['direct', 'device', 'mediated'] as const) test(`${method} 
   const stage = env.secrets.stage;
   env.secrets.stage = async secret => {
     const ref = await stage(secret);
-    if (env.company.grants.has(secret)) { assert.deepEqual(await createClientAuth(env.options).recover(), [], 'live owner remains alive through secret staging'); env.store.crashIn = 2; }
+    if (env.company.grants.has(secret)) { assert.deepEqual(await createClientAuth(env.options).recover(), [], 'live owner remains alive through secret staging'); env.store.crashIn = 3; }
     return ref;
   };
   await assert.rejects(complete(), /crash/);
@@ -1564,7 +1579,7 @@ test('provider freshness tolerates bounded clock skew and classifies failures in
       assert.ok(result && 'status' in result);
       assert.equal(result.status, row.expected ? 'failed' : 'completed');
       assert.equal(result.error, row.expected);
-      assert.equal(assertionCalls, 1);
+      assert.equal(assertionCalls, row.expected ? 1 : 2);
     }
     if (path === 'browser') { assert.equal(posted, true); assert.equal(assertionCalls, 0, 'browser joins never ask the provider to sign'); }
   });
@@ -1879,4 +1894,28 @@ test('renew rejects fragmented resources before claiming work and preserves exac
     assert.equal(grantOf(store, id).operationId, null);
   }
   assert.equal(forms.length, 3);
+});
+
+
+test('legacy saved metadata adopts newly advertised introspection and establishes an old-grant account anchor',async()=>{
+  const f=await signedIn(),oldHash=grantOf(f.store,f.id).accountSubjectHash;
+  delete f.store.raw.connections[f.id].metadata.authorization!.introspection_endpoint;
+  delete grantOf(f.store,f.id).accountSubjectHash;
+  const restart=createClientAuth(f.options);await restart.recover();
+  const before=f.company.requests.filter(row=>row.url===f.company.issuer+'/introspect').length;
+  assert.equal((await signIn(restart,f.company,f.id,{scopes:['orders:read','orders:write']})).status,'completed');
+  assert.equal(grantOf(f.store,f.id).accountSubjectHash,oldHash);
+  assert.equal(f.company.requests.filter(row=>row.url===f.company.issuer+'/introspect').length,before+2,'old and replacement refresh grants supply the same issuer subject');
+  assert.equal(f.store.raw.connections[f.id].metadata.authorization!.introspection_endpoint,f.company.issuer+'/introspect');
+  const resolve=f.options.metadata.resolveCompany;
+  f.options.metadata.resolveCompany=async domain=>{const value=await resolve(domain);return {...value,authorization:{...value.authorization!,introspection_endpoint:f.company.issuer+'/different'}};};
+  await assert.rejects(restart.target(f.id),code('metadata_changed'));
+});
+
+test('an inactive legacy refresh grant cannot establish continuity or start additional authorization',async()=>{
+  const f=await signedIn();delete grantOf(f.store,f.id).accountSubjectHash;
+  const token=f.secrets.map.get(grantOf(f.store,f.id).secretRef)!;f.company.grants.get(token)!.revoked=true;
+  const before=Object.keys(f.store.raw.operations).length,grant=f.store.raw.connections[f.id].grantId;
+  await assert.rejects(f.auth.beginSignIn(f.id,{scopes:['orders:read','orders:write'],force:true,redirectUri:REDIRECT,browserBinding:BROWSER}),code('account_continuity_unavailable'));
+  assert.equal(Object.keys(f.store.raw.operations).length,before);assert.equal(f.store.raw.connections[f.id].grantId,grant);
 });

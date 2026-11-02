@@ -14,7 +14,7 @@ import { parseJson, parseProtocolError, parseTokenResponse, retryAfterMillisecon
 import type { JsonObject, TokenResponse } from '../protocol/wire.js';
 import { validateClientId, signInMethods, companyIdentifier, mediatedSignIn, MEDIATED_GRANT } from '../network/discovery.js';
 import type { CompanyMetadata, MetadataResolver } from '../network/discovery.js';
-import type { HttpTransport } from '../network/transport.js';
+import { secureUrl, type HttpTransport } from '../network/transport.js';
 import { dpopChallenge, schemeChallenge } from './challenge.js';
 import { resolveApiTarget, serviceAuthorization, browserDestination, validateFeedback } from '../integrations.js';
 import type { ApiTarget, AgentBrowserController, FeedbackReport } from '../integrations.js';
@@ -133,7 +133,7 @@ export interface ConnectionRecord {
   signingCleanup?: string[];
 }
 export interface GrantRecord {
-  id: string; issuer: string; userId: string; secretRef: string;
+  id: string; issuer: string; userId: string; secretRef: string; accountSubjectHash?: string;
   scopes: string[]; expiresAt: number | null; generation: number;
   status: 'active' | 'uncertain' | 'revoking' | 'revoked';
   operationId: string | null;
@@ -152,12 +152,14 @@ export interface OperationRecord {
   // Sign-in activates in one transaction with its result; only refresh records staged refs first.
   direct: DirectRecord | null; staged: StagedRefresh | null;
   result: AuthOutcome | null;
+  accountSubjectHash?: string;
   method?: SignInMethod; requiredExistingScopes?: string[]; signInSessionId?: string; signInSessionKey?: string;
   device?: { codeRef: string; intervalMs: number; nextPollAt: number };
   mediated?: { challengeId: string; sentTo: string };
   cancelRequested?: boolean;
 }
 export interface StagedRefresh {
+  accountSubjectHash?: string;
   tokenType?: 'DPoP' | 'Bearer';
   accessRef: string; refreshRef: string | null; sessionId: string; scopes: string[];
   signedIn: boolean; expiresAt: number; refreshExpiresAt: number | null;
@@ -308,22 +310,26 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     if (!found) throw new AuthFailure('unknown_connection');
     return found;
   }
-  function destinations(metadata: CompanyMetadata): string {
+  function destinations(metadata: CompanyMetadata, includeIntrospection = true): string {
     const auth = metadata.authorization;
-    return JSON.stringify([auth?.issuer, auth?.token_endpoint, auth?.revocation_endpoint, auth?.authorization_endpoint, auth?.device_authorization_endpoint,
+    return JSON.stringify([auth?.issuer, auth?.token_endpoint, auth?.revocation_endpoint, includeIntrospection ? auth?.introspection_endpoint : null, auth?.authorization_endpoint, auth?.device_authorization_endpoint,
       metadata.document.extensions?.['mediated-sign-in'], metadata.document.agent?.protocols, metadata.document.apis, metadata.document.web, metadata.document.feedback]);
+  }
+  function sameDestinations(stored: CompanyMetadata, fresh: CompanyMetadata) {
+    const pinned = stored.authorization?.introspection_endpoint !== undefined;
+    return destinations(stored, pinned) === destinations(fresh, pinned);
   }
   async function verified(metadata: CompanyMetadata): Promise<CompanyMetadata> {
     let fresh: CompanyMetadata;
     try { fresh = await options.metadata.resolveCompany(new URL(metadata.url).host); } catch { throw new AuthFailure('discovery_failed'); }
-    if (destinations(fresh) !== destinations(metadata)) throw new AuthFailure('metadata_changed');
+    if (!sameDestinations(metadata, fresh)) throw new AuthFailure('metadata_changed');
     return fresh;
   }
   async function currentConnection(id: string): Promise<ConnectionRecord> {
     const found = await record(id), metadata = await verified(found.metadata);
     return await transaction({ connectionId: id }, state => {
       const current = own(state.connections, id)!;
-      if (destinations(current.metadata) !== destinations(metadata)) throw new AuthFailure('state_changed', id);
+      if (!sameDestinations(current.metadata, metadata)) throw new AuthFailure('state_changed', id);
       current.metadata = metadata; return current;
     });
   }
@@ -477,6 +483,25 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       current.credentialFingerprints = [...retained.values()];
     });
   }
+  async function accountSubject(connection: ConnectionRecord, token: string): Promise<string | null> {
+      const authorization = (await verified(connection.metadata)).authorization;
+      const endpoint = authorization?.introspection_endpoint;
+      if (typeof endpoint !== 'string') return null;
+      secureUrl(endpoint);
+      const assertionValue = await assertion('client-authentication', connection.issuer, await loadDpopKey(connection.dpopKeyRef));
+      await rememberEcho(connection.id, [token, assertionValue], now() + 10 * 60_000);
+    try {
+      const response = await transport.fetch(new Request(endpoint, { method: 'POST', redirect: 'error', body: new URLSearchParams({
+        token, token_type_hint: 'refresh_token', client_id: clientId, client_assertion_type: CLIENT_ASSERTION, client_assertion: assertionValue,
+      }) }));
+      if (response.status !== 200) { await response.body?.cancel(); return null; }
+      const value = parseJson(await response.text()) as Record<string, unknown>;
+      echo.check(value);
+      if (value.active !== true || value.client_id !== clientId || typeof value.sub !== 'string' || !value.sub || value.sub.length > 1024) return null;
+      return sha256(JSON.stringify([connection.issuer, clientId, value.sub]));
+    } catch { return null; }
+  }
+
   async function tokenRequest(connectionId: string, metadata: CompanyMetadata, dpopKeyRef: string, fields: Record<string, string>, operationId?: string): Promise<AcquiredToken> {
     const authorization = (await verified(metadata)).authorization!;
     const endpoint = authorization.token_endpoint;
@@ -893,6 +918,8 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     const granted = staged.scopes, missingScopes = operation.scopes.filter(scope => !granted.includes(scope));
     const previous = target.grantId === null ? undefined : own(state.grants, target.grantId);
     const problem = operation.cancelRequested ? 'cancelled' : target.generation !== operation.connectionGeneration || target.sessionId !== operation.signInSessionId ? 'state_changed'
+      : previous && (!operation.accountSubjectHash || !staged.accountSubjectHash) ? 'account_continuity_unavailable'
+      : previous && operation.accountSubjectHash !== staged.accountSubjectHash ? 'account_mismatch'
       : previous && !(operation.requiredExistingScopes ?? previous.scopes).every(scope => granted.includes(scope)) ? 'replacement_rejected' : null;
     drop.push(...privateRefs(operation));
     if (problem) {
@@ -902,7 +929,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
     if (previous && !Object.values(state.connections).some(row => row.id !== target.id && row.grantId === previous.id)) { retire(state, `cln_${previous.id}`, target, previous.secretRef); delete state.grants[previous.id]; }
     const grantId = randomId('grt_');
     state.grants[grantId] = { id: grantId, issuer: target.issuer, userId: target.userId, secretRef: staged.refreshRef!, scopes: granted,
-      expiresAt: staged.refreshExpiresAt, generation: 1, status: 'active', operationId: null };
+      expiresAt: staged.refreshExpiresAt, generation: 1, status: 'active', operationId: null, ...(staged.accountSubjectHash ? { accountSubjectHash: staged.accountSubjectHash } : {}) };
     switchSession(target, staged.sessionId, drop);
     target.grantId = grantId; target.status = 'signed_in'; target.generation++;
     drop.push(...Object.values(target.slots).map(slot => slot.secretRef));
@@ -924,8 +951,9 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         drop.push(...privateRefs(current)); return current.phase === 'terminal' ? outcomeOf(state, current) : finish(state, current, 'failed', { error: 'invalid_response' });
       });
     }
+    const subject = await accountSubject(own(snapshot.connections, operation.connectionId)!, token.refresh_token!);
     const accessRef = await stageSessionToken(token.access_token);
-    const staged: StagedRefresh = { accessRef, refreshRef, tokenType: token.token_type, sessionId: randomId('ses_'), scopes: granted, signedIn: true,
+    const staged: StagedRefresh = { accessRef, refreshRef, tokenType: token.token_type, sessionId: randomId('ses_'), scopes: granted, signedIn: true, ...(subject ? { accountSubjectHash: subject } : {}),
       expiresAt: issuedAt + (token.expires_in ?? 60) * 1000, refreshExpiresAt: token.refresh_token_expires_in === undefined ? null : issuedAt + token.refresh_token_expires_in * 1000 };
     // Stage before activation: recovery can finish locally without exchanging a consumed credential again.
     const recorded = await transaction({ operationId }, state => {
@@ -1238,7 +1266,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       checkCooldown(found);
       if (method === 'mediated' && !options.trustedInput) throw new AuthFailure('trusted_input_required', connectionId);
       if (method === 'direct' && (typeof redirectUri !== 'string' || !registeredRedirect(redirectUri, options.redirectUris, clientId) || CALLBACK_PARAMS.some(name => new URL(redirectUri).searchParams.has(name)))) throw new AuthFailure('invalid_redirect', connectionId);
-      // The host derives this from its authenticated browser session; a short value would be guessable.
+      // The host establishes this secret in the browser before starting authorization.
       if (method === 'direct' && (typeof browserBinding !== 'string' || browserBinding.length < 22)) throw new AuthFailure('invalid_binding', connectionId);
       // Service metadata, rather than an obsolete discovery field, selects narrower tokens.
       const conversation = found.metadata.document.agent?.protocols.find(protocol => protocol.type === 'poppy');
@@ -1250,6 +1278,9 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
       const verifier = b64(crypto.getRandomValues(new Uint8Array(32)));
       const sessionKey = (await loadDpopKey(connection.dpopKeyRef)).thumbprint;
       const proofBound = method === 'direct' && await resourceScheme(found.metadata, resource) === 'DPoP';
+      const prior = connection.grantId ? own((await load({ connectionId })).grants, connection.grantId) : undefined;
+      const accountSubjectHash = prior ? prior.accountSubjectHash ?? await accountSubject(connection, (await secrets.read(prior.secretRef)) ?? '') : null;
+      if (prior && !accountSubjectHash) throw new AuthFailure('account_continuity_unavailable', connectionId);
       const verifierRef = method === 'direct' ? await secrets.stage(verifier) : null;
       const createdAt = now(), operationId = randomId('op_');
       const outcome = await commit({ connectionId, history: true }, [verifierRef], draft => {
@@ -1259,6 +1290,7 @@ export function createClientAuth(options: ClientAuthOptions): ClientAuth {
         const operation: OperationRecord = draft.operations[operationId] = {
           epoch: draft.epoch, id: operationId, kind: 'sign_in', connectionId, connectionGeneration: current.generation, grantId: current.grantId, grantGeneration: null,
           phase: 'prepared', status: 'pending', createdAt, expiresAt: createdAt + SIGN_IN_MS, resource, scopes: [...scopes],
+          ...(accountSubjectHash ? { accountSubjectHash } : {}),
           method, signInSessionId: connection.sessionId!, signInSessionKey: sessionKey, requiredExistingScopes: requiredExistingScopes ?? requirement.grantedScopes,
           direct: method === 'direct' ? { stateHash: sha256(state), verifierRef: verifierRef!, browserHash: sha256(browserBinding!), redirectUri: redirectUri!, issuer: current.issuer, clientId, sessionId: connection.sessionId! } : null,
           staged: null, result: null,

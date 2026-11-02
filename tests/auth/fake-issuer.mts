@@ -270,13 +270,19 @@ export function createFakeCompany({ name = 'shop', jwks, clientId, now, issuerPa
       if (url.href === `https://${domain}/.well-known/oauth-protected-resource`) return json(200, { resource: `https://${domain}`, authorization_servers: [issuer] });
       if (url.pathname.startsWith('/.well-known/oauth-protected-resource')) return conversationResource ? json(200,{resource:conversationResource,authorization_servers:[issuer]}) : new Response(null,{status:404});
       if (url.href === `https://${domain}/.well-known/poppy.json`) return json(200, { protocol_version: '0.3', organization: { name, domain }, ...(method==='mediated'?{extensions:{'mediated-sign-in':{version:'1',scopes:directScopes,fields:[{name:'password',label:'Password',secret:true}]}}}:{}), auth: { issuer, scopes: Object.fromEntries(directScopes.map(scope => [scope, `Company permission ${scope}`])),  }, agent: { protocols: [{ type: 'other', endpoint: `https://api.${domain}/other` }, { type: 'poppy', endpoint, ...(conversationResource ? { resource: conversationResource } : {}) }] } });
-      if (url.href === `https://auth.${domain}/.well-known/oauth-authorization-server${issuerPath}`) return json(200, { issuer, token_endpoint: tokenEndpoint, revocation_endpoint: `${issuer}/revoke`, ...(method === 'direct' ? { authorization_endpoint: authorizationEndpoint } : {}), ...(method === 'device' ? { device_authorization_endpoint: `${issuer}/device` } : {}), protected_resources: [`https://${domain}`], dpop_signing_alg_values_supported:['ES256'],grant_types_supported: ['refresh_token',...(method==='mediated'?['https://personalagentprotocol.org/grant/mediated-sign-in']:[]), ...(method === 'direct' ? ['authorization_code'] : []), ...(method === 'device' ? ['urn:ietf:params:oauth:grant-type:device_code'] : [])], scopes_supported: directScopes });
+      if (url.href === `https://auth.${domain}/.well-known/oauth-authorization-server${issuerPath}`) return json(200, { issuer, token_endpoint: tokenEndpoint, revocation_endpoint: `${issuer}/revoke`, introspection_endpoint: `${issuer}/introspect`, ...(method === 'direct' ? { authorization_endpoint: authorizationEndpoint } : {}), ...(method === 'device' ? { device_authorization_endpoint: `${issuer}/device` } : {}), protected_resources: [`https://${domain}`], dpop_signing_alg_values_supported:['ES256'],grant_types_supported: ['refresh_token',...(method==='mediated'?['https://personalagentprotocol.org/grant/mediated-sign-in']:[]), ...(method === 'direct' ? ['authorization_code'] : []), ...(method === 'device' ? ['urn:ietf:params:oauth:grant-type:device_code'] : [])], scopes_supported: directScopes });
       if (url.href === `${issuer}/device`) {
         const form = new URLSearchParams(await request.text()); await company.verifyAssertion(form.get('client_assertion'), 'client');
         const code = randomUUID(); company.devices.set(code, { scopes: expectValue(form.get('scope')).split(' '), used: false });
         return json(200, { device_code: code, user_code: 'ABCD-EFGH', verification_uri: `${issuer}/approve`, expires_in: 600, interval: 5 });
       }
       if (url.href === tokenEndpoint && request.method === 'POST') return await token(request);
+      if (url.href === `${issuer}/introspect` && request.method === 'POST') {
+        const form = new URLSearchParams(await request.text());
+        await company.verifyAssertion(form.get('client_assertion'), 'client');
+        const grant = company.grants.get(form.get('token'));
+        return json(200, grant && !grant.revoked && !grant.rotated ? { active:true,client_id:clientId,sub:grant.account,scope:grant.scopes.join(' ') } : {active:false});
+      }
       if (url.href === `${issuer}/revoke` && request.method === 'POST') return await revoke(request);
       if (url.origin === `https://api.${domain}`) return await resource(request);
       return json(404, { error: 'not_found' });

@@ -46,8 +46,19 @@ Continuation sends `sign_in_id` and `one_time_code`, without original credential
 or scope. `TrustedInput` runs outside model tools and must not retain/log values.
 The SDK clears supplied credential/code objects on exit and persists neither.
 
-Successful fresh sign-in activates a new sid, preventing account mixing even after
-sign-out. Failed replacement preserves the previous sid and grant. Partial grants
+Initial sign-in works without account introspection. Additional consent requires
+an issuer-authenticated subject from an advertised RFC7662 introspection endpoint
+that allows this client to inspect its own refresh grants. The SDK stores only a
+hash bound to issuer/client/subject. Before activating a replacement it compares
+the new grant's subject with the old one. Different accounts fail account_mismatch;
+missing/inactive/unavailable evidence fails account_continuity_unavailable. The
+old grant and Session remain authoritative, and the rejected grant is parked for
+revocation. Legacy grants can establish their anchor by introspecting the current
+refresh token before beginning additional consent. If that is unavailable, use
+explicit disconnect/reconnect. Token text, Session IDs and HTTP success never prove
+account identity. Successful same-account replacement creates a fresh Session and
+new grant authority; old business approvals/uncertain work never adopt it.
+Partial grants
 report granted/missing scopes. Replacement preserves old required scopes unless
 `requiredExistingScopes` explicitly narrows that requirement; grants are not unioned.
 An old refresh grant is retired when no other local Session still references it.
@@ -56,7 +67,7 @@ Accepting a newer grant does not expand a browser cookie's approved scopes.
 Access requests use the response's Bearer or DPoP scheme. Missing `expires_in` uses
 a conservative local 60-second lifetime. Missing rotated `refresh_token` retains
 the existing one. Resource metadata selects narrower API/conversation/MCP tokens;
-see [INTEGRATIONS.md](INTEGRATIONS.md). A repeated `invalid_session` restarts once
+see [INTEGRATIONS.md](INTEGRATIONS.md). A definite `invalid_session` restarts once
 with a new sid and fresh signatures, then stops. Feedback replaces a definitely
 ended sid but returns the failed POST without replay; an explicit later report
 uses the new Session. Browser authorization can restart once before one code-only
@@ -97,3 +108,10 @@ lifetime within the client's one-hour freshness bound. See [CONFORMANCE.md](CONF
 Authentication lifecycle OperationRecord/operationId values never approve business operations. OAuth access consent, provider enrollment and mediated credential collection cannot supply business consent. [Operations v2](OPERATIONS.md) binds each actual user answer to the exact revision and request, and rechecks current Session/account authority for execution and protected replay.
 
 For business-operation sends, pass the saved `BusinessClientContext` as the final `expectedContext` argument to `apiFetch`/`authorizedFetch`. Channel sender callbacks receive that context. A changed Company/client/User/account or signed-out Session fails before dispatch; target discovery does not authorize a replacement account. See [Operations](OPERATIONS.md).
+
+A cross-browser host must prepare its owner-scoped capability separately, then
+establish an unguessable browser secret in the human browser before calling
+beginSignIn. Supply that same browser secret to completeSignIn; never replace the
+check with a callback state lookup or bind it to the agent's different browser.
+The host owns expiry, single-use capability, cancellation and initiating-owner
+checks. The SDK continues to enforce PKCE, state, exact issuer and redirect.
