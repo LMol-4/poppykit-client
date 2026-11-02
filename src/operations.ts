@@ -214,3 +214,28 @@ export function createOperationSender(channels: {
   };
 }
 export { supportsOperations };
+
+/** Exact JSON paths only: no prose inference, unit conversion, or independent verification of company claims. */
+export function compareOperationTerms(request: OperationRequest, operation: BusinessOperation): string[] {
+  const limit = 'Only matching JSON paths are compared; prose, omitted facts, units and business meaning require human review. Company claims are not independently verified.';
+  let facts: unknown;
+  if (facts === undefined && request.channel === 'mcp') facts = request.arguments;
+  if (facts === undefined && request.channel === 'api' && request.body !== null) {
+    try { facts = JSON.parse(Buffer.from(request.body, 'base64').toString('utf8')); } catch { /* Non-JSON bodies have no comparable facts. */ }
+  }
+  if (!facts || typeof facts !== 'object' || Array.isArray(facts)) return ['No structured requested facts are available for comparison.', limit];
+  const results: string[] = [];
+  function compare(expected: Record<string, unknown>, proposed: unknown, path = '', depth = 0) {
+    if (depth > 16 || results.length >= 100) return;
+    const terms = proposed && typeof proposed === 'object' && !Array.isArray(proposed) ? proposed as Record<string, unknown> : {};
+    for (const [key, value] of Object.entries(expected)) {
+      if (results.length >= 100) break;
+      const field = path ? `${path}.${key}` : key;
+      if (!Object.hasOwn(terms, key)) results.push(`Not comparable: ${field} is absent from proposed structured terms.`);
+      else if (value && typeof value === 'object' && !Array.isArray(value)) compare(value as Record<string, unknown>, terms[key], field, depth + 1);
+      else results.push(`${canonical(value) === canonical(terms[key]) ? 'Match' : 'Mismatch'}: ${field}; requested ${canonical(value)}, proposed ${canonical(terms[key])}.`);
+    }
+  }
+  compare(facts as Record<string, unknown>, operation.terms);
+  return [...(results.length ? results : ['No comparable structured facts.']), limit];
+}

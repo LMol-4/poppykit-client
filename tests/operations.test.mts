@@ -4,7 +4,7 @@ import {mkdtemp,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
-import {createOperationClient,createOperationSender,parseBusinessOperation,parseApprovalHeader,approvalHeader,mcpApproval,approvedConversationMessage,operationsV2} from '../dist/index.js';
+import {createOperationClient,compareOperationTerms,createOperationSender,parseBusinessOperation,parseApprovalHeader,approvalHeader,mcpApproval,approvedConversationMessage,operationsV2} from '../dist/index.js';
 import type {BusinessClientContext,BusinessAttemptStore,TrustedOperationConsent,OperationDelivery,OperationRequest,BusinessOperation,BusinessAttempt} from '../dist/index.js';
 import {parseMessage,parseEventPage} from '../dist/protocol/wire.js';
 import {SqliteBusinessAttemptStore} from '../dist/sqlite.js';
@@ -145,4 +145,20 @@ test('Operations independent SSE fixture gates operation-only messages on negoti
   const stream=()=>new ReadableStream<Uint8Array>({start(controller){controller.enqueue(new TextEncoder().encode('id: event\ndata: '+JSON.stringify(event)+'\n\n'));controller.close();}});
   const frames=[];for await(const frame of parseEventStream(stream(),{operations:true}))frames.push(frame);
   assert.deepEqual(frames,[{kind:'event',event}]);await assert.rejects(async()=>{for await(const frame of parseEventStream(stream()))void frame;});
+});
+
+test('structured comparison reports exact matches, mismatches and missing paths without interpreting prose',()=>{
+  const terms={...operation,terms:{amount:'70.00',currency:'USD',quantity:2,address:{city:'Dublin'},extras:['kit']}};
+  const request={...binding,arguments:{amount:'80.00',currency:'USD',quantity:2,address:{city:'Cork'},extras:['kit'],date:'2026-11-03'}};
+  const result=compareOperationTerms(request,terms);
+  assert.ok(result.some(s=>s.startsWith('Mismatch: amount')));
+  assert.ok(result.some(s=>s.startsWith('Mismatch: address.city')));
+  assert.ok(result.some(s=>s.startsWith('Match: currency')));
+  assert.ok(result.some(s=>s.startsWith('Match: extras')));
+  assert.ok(result.some(s=>s.startsWith('Not comparable: date')));
+  assert.match(result.at(-1)!,/not independently verified/);
+  const api:Extract<OperationRequest,{channel:'api'}>={channel:'api',url:'https://company.example/hold',method:'POST',body:Buffer.from(JSON.stringify(request.arguments)).toString('base64')};
+  assert.deepEqual(compareOperationTerms(api,terms),result);
+  assert.match(compareOperationTerms({channel:'conversation',endpoint:'https://company.example/conversations',conversationId:'c'},terms)[0],/No structured requested facts/);
+  assert.match(compareOperationTerms({...api,body:Buffer.from('price under eighty').toString('base64')},terms)[0],/No structured requested facts/);
 });

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased — remediation job 4
+
+- Verify same-account additional consent using advertised OAuth introspection; refuse mismatches or unavailable continuity evidence without replacing old authority.
+- Export exact structured operation comparison with explicit semantic limits.
+
 ## Unreleased — remediation job 2
 
 - Client metadata may omit `redirect_uris`; omission registers no callbacks. The

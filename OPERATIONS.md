@@ -118,3 +118,8 @@ declines without dispatch. Without the flag it asks through a terminal interface
 See tests/operations.test.mts for independent-wire and real persistent cases.
 
 Every sender callback receives the original `BusinessClientContext`. Pass it as the final `expectedContext` argument to `auth.apiFetch` or `auth.authorizedFetch`, including conversation approval dispatch. The authentication lifecycle checks it through metadata/credential waits and retries, so a changed Session/account cannot silently supply replacement authority. Custom MCP transports must pin that same context through their final dispatch.
+
+The standard `compareOperationTerms` helper supplies an honest default for trusted
+review UIs. It compares exact JSON paths and reports absent facts; arbitrary prose,
+renamed fields, currency/unit conversion and independent business verification
+remain outside its scope. It never substitutes for the actual human decision.

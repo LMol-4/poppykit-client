@@ -45,3 +45,10 @@ See [OPERATIONS.md](OPERATIONS.md) for the complete consent/effect contract. Roo
 Client exports `createOperationClient`, `createOperationSender`, `OperationClientError`, the three approved-channel serializers, `BusinessClientContext`, `BusinessAttempt`, `BusinessAttemptStore`, `TrustedOperationConsent` and `OperationDelivery`. `ClientAuth.businessContext` supplies a verified binding. SQLite/PostgreSQL subpaths export `SqliteBusinessAttemptStore`/`PostgresBusinessAttemptStore`. The adapter-contract subpath exports `runBusinessAttemptAdapterContract`. Conversation options accept verified `operations:{client,company}` metadata.
 
 For business-operation sends, pass the saved `BusinessClientContext` as the final `expectedContext` argument to `apiFetch`/`authorizedFetch`. Channel sender callbacks receive that context. A changed Company/client/User/account or signed-out Session fails before dispatch; target discovery does not authorize a replacement account. See [Operations](OPERATIONS.md).
+
+`compareOperationTerms(request, operation)` returns display strings
+for exact structured JSON path matches, mismatches and absent proposed facts. It
+uses API JSON bodies or MCP arguments. Conversation request association is not
+portable, so conversation comparison is explicitly unsupported. It never infers facts from prose,
+converts units or establishes independently verified business agreement. It does
+not approve or send anything. Bound the input through normal protocol validation.
